@@ -12,8 +12,8 @@ Support is an explicit contract per network, operation, token program, wallet, e
 
 | Use case | Current boundary | Required work / acceptance evidence |
 | --- | --- | --- |
-| Node.js Telegram trading bot | SDK can sign intents; public-key authorization API separates bot signing from owner proving | Authenticated onboarding, consent, confirmed state checks, durable encrypted bot-key storage and nonce ledger; end-to-end devnet bot test |
-| Telegram Mini App | Browser primitives exist; no Telegram adapter is shipped | Validate Telegram initData server-side; bind a single-use request to the public bot key and owner-approved pocket; iOS/Android/Desktop wallet handoff tests |
+| Node.js Telegram trading bot | Localnet `@ghostlink/bot` authenticates consent, stores encrypted session keys durably and checks confirmed permissions before signing | Trusted owner UI, durable trade nonce/submission ledger, end-to-end verified devnet deployment and bot test |
+| Telegram Mini App | Backend HMAC/freshness validation and immutable consent request API tested with synthetic Telegram data | Real Telegram iOS/Android/Desktop wallet handoff, trusted origin registry and owner consent display |
 | Existing commercial sniper bots | No named provider integration or endorsement | Operator integration and tests against its supported extension/API model; do not request wallet-key imports as a workaround |
 | Web trading terminal | Devnet product integration exists | Mainnet route, quote validation, supported asset registry, fee budgets, production observability |
 | Liquid-token market swaps | Classic SPL intent settlement tested with development inventory | Jupiter Router or separately reviewed DEX adapter; versioned transaction composition, lookup tables, simulation and confirmation |
@@ -59,12 +59,12 @@ The delegated authorization API accepts Ed25519 only. A bot-supplied P-256 key a
 | Independent security review | Internal review only | External circuit, program, SDK authorization, route composition and operational review; material findings resolved and retested |
 | Deployment identity | Constants are development program IDs | Versioned network manifest with genesis, program IDs, account layout, program-binary hashes and proof hashes; verify executable code and upgrade authority on chain |
 | Upgrade / migration governance | Production decision pending | Document multisig/timelock or immutability decision, authority custody, incident response, old-pocket exit and migration; no accidental upgrades |
-| Bot authorization boundary | Public-key SDK primitive added; hosted broker absent | Origin-enforcing trusted UI, authenticated request ownership, exact consent display, expiry/rotation/revoke, tests against key substitution and cross-user replay |
+| Bot authorization boundary | Public-key SDK and backend request/storage/chain checks locally verified | Trusted owner UI and application registry, real Telegram/device acceptance, on-chain revoke/rotation UX and external review |
 | First-pocket policy authorization | V2 binding locally verified; not deployed or independently reviewed | Circuit/program/SDK substitution tests, local validator evidence, external review and fresh-deployment migration |
 | Trading route | Inventory reference solver only | Reviewed route planner, live mainnet read-only quotes, fork/simulation tests and approved bounded real settlement tests after audit gates |
 | Asset and oracle support | Classic SPL with pinned feeds | Explicit supported mint/feed/decimal list, staleness/confidence rules, unsupported token refusal, Pyth update availability and costs |
 | Submission reliability | Reference legacy transaction flow | Versioned messages/lookup tables, bounded compute/priority/tip fees, blockhash expiry, durable idempotency, chain-confirmed reconciliation; a bundle receipt is not confirmation |
-| Persistent operations | Reference services; not high-availability infrastructure | Single-writer guarantees or transactional datastore, backup/restore drill, restart/replay tests, RPC failover, queue limits, alerts and fee/inventory budgets |
+| Persistent operations | SQLite consent/key transactions survive process exit; trade submission durability absent | Backup/restore drill, key rotation, trade restart/replay tests, RPC failover, queue limits, alerts and fee/inventory budgets; no multi-host availability claim |
 | Distribution | Source and locally packed archives; no registry release implied | Scope ownership, versioned signed/provenance-backed releases, immutable checksums, packed consumer install/type/runtime tests and dependency review |
 | User recovery | Recovery primitives exist; known liveness caveat | Lost-session/device tests, home withdrawal checks, compromised-session race handling, clear owner recovery procedure and support playbook |
 | Pilot acceptance | Not started | Supported wallet/device and strategy matrix, agreed amount/user caps, monitoring, successful exit/revoke and incident rehearsal |
@@ -73,8 +73,8 @@ The delegated authorization API accepts Ed25519 only. A bot-supplied P-256 key a
 
 ## Build order
 
-1. **SDK distribution and delegation foundation:** installable archives, external-consumer tests, public bot-key authorization and candid capability documentation. This change addresses this slice only.
-2. **Trusted onboarding:** isolated owner context, Telegram/backend authentication, one-use request binding, visible permissions, bot-key storage, session rotation and revoke. Keep identity proving local.
+1. **SDK distribution and delegation foundation:** installable SDK/bot companion archives, external-consumer tests, public bot-key authorization and candid capability documentation. Locally verified; registry publication remains gated.
+2. **Trusted onboarding:** backend authentication, immutable requests, encrypted storage and confirmed state checks are implemented in the localnet candidate. The local validator exercised consent, owner proof, activation, backend restart, bot-signed inventory fill and owner sweep. Finish the isolated owner UI, real Telegram/device handoff, visible permissions, rotation and on-chain revocation. Keep identity proving local. See [bot backend contract](../packages/bot/README.md).
 3. **Liquid-token execution:** integrate the current Jupiter Router API behind a planner, add versioned composition and transaction simulation, validate route destinations/authorities, then test failure/expiry recovery. Start with a small supported classic-SPL asset set.
 4. **Bot operations:** durable per-pocket nonce reservations and submission state machine, copy/DCA/conditional triggers, cancellation and strategy-level caps. Pre-authorize before the trading trigger; do not make cold proof generation part of every trade.
 5. **Speculative trading protocol:** decide and implement the bounded oracle-less buy/sell policy and multiple-bot isolation; migrate explicitly. This is a separate audited release, not a config flag.

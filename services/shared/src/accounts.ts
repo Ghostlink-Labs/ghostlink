@@ -8,17 +8,17 @@ const POCKET_DISC = sha256(new TextEncoder().encode("account:Pocket")).subarray(
 export const POCKET_ACCOUNT_SIZE = 2089;
 
 /** A lamport transfer can create a system-owned PDA before its pocket is opened. */
-export function isPocketAccount(info: AccountInfo<Uint8Array> | null, appId: Uint8Array): boolean {
+export function isPocketAccount(info: AccountInfo<Uint8Array> | null, appId: Uint8Array, expectedProgram = POCKET): boolean {
   return Boolean(
-    info && !info.executable && info.owner.equals(POCKET) && info.data.length >= 40 &&
+    info && !info.executable && info.owner.equals(expectedProgram) && info.data.length >= 40 &&
     appId.length === 32 && POCKET_DISC.every((b, i) => info.data[i] === b) &&
     appId.every((b, i) => info.data[8 + i] === b),
   );
 }
 
 /** Decode the Borsh fields, whose offsets depend on policy and pending vectors. */
-export function readPocketAccount(info: AccountInfo<Uint8Array>) {
-  if (!isPocketAccount(info, info.data.subarray(8, 40))) throw new Error("not a Pocket account");
+export function readPocketAccount(info: AccountInfo<Uint8Array>, expectedProgram = POCKET) {
+  if (!isPocketAccount(info, info.data.subarray(8, 40), expectedProgram)) throw new Error("not a Pocket account");
   if (info.data.length !== POCKET_ACCOUNT_SIZE) {
     throw new Error(`unsupported Pocket account size: expected ${POCKET_ACCOUNT_SIZE}, got ${info.data.length}`);
   }

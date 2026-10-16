@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@ghostlink/bot": "workspace:*",
     "@ghostlink/actions": "workspace:*",
     "@ghostlink/common": "workspace:*",
     "@ghostlink/indexer": "workspace:*",

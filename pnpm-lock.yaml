@@ -38,6 +38,31 @@ importers:
         specifier: ^4.1.11
         version: 4.1.11(@types/node@22.20.5)(vite@7.3.7(@types/node@22.20.5)(tsx@4.23.15))
 
+  packages/bot:
+    dependencies:
+      '@ghostlink/common':
+        specifier: workspace:*
+        version: link:../common
+      '@ghostlink/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+      '@ghostlink/service-kit':
+        specifier: workspace:*
+        version: link:../../services/shared
+      '@solana/web3.js':
+        specifier: ^1.98.0
+        version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
+    devDependencies:
+      '@types/node':
+        specifier: ^22
+        version: 22.20.5
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.11
+        version: 4.1.11(@types/node@22.20.5)(vite@7.3.7(@types/node@22.20.5)(tsx@4.23.15))
+
   packages/common:
     dependencies:
       '@noble/curves':
@@ -184,6 +209,9 @@ importers:
       '@ghostlink/actions':
         specifier: workspace:*
         version: link:../actions
+      '@ghostlink/bot':
+        specifier: workspace:*
+        version: link:../../packages/bot
       '@ghostlink/common':
         specifier: workspace:*
         version: link:../../packages/common

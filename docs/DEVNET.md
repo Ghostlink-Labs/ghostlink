@@ -1,6 +1,6 @@
 # Devnet
 
-> V2 candidate notice: this page records the preserved **V1** deployment. The current development branch changes the login proof and session instruction and is localnet-only. Do not send V2 proofs or deploy V2 binaries to these existing IDs. See [ADR 0003](adr/0003-session-authorization-v2.md). The private live app remains on its compatible V1 code.
+> V2 candidate notice: this page records the preserved **V1** deployment. The commands and results below are historical V1 procedures, not runnable V2 release instructions. The current development branch changes the login proof and session instruction and is localnet-only. Both devnet runners refuse to proceed; the local validator runner refuses funded payer keys and public-chain genesis. Do not send V2 proofs or deploy V2 binaries to these existing IDs. See [ADR 0003](adr/0003-session-authorization-v2.md). The private live app remains on its compatible V1 code.
 
 > Updated 2026-10-16: the reviewed Pocket program is deployed at a fresh devnet address. The old program and its seven legacy accounts were preserved. Clients in this release target the new 2,089-byte layout; they do not migrate or reinterpret older accounts. See [ADR 0002](adr/0002-open-source-review.md).
 

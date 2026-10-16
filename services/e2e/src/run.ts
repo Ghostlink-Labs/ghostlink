@@ -33,6 +33,9 @@ import * as snarkjs from "snarkjs";
 
 import {
   bytesToHex,
+  hexToBytes,
+  appId as deriveAppId,
+  domainHash as deriveDomainHash,
   fieldToBytes32,
   hashToField,
   proofToBytes,
@@ -45,7 +48,7 @@ import {
   buildLoginInput,
   buildRegistration,
   deriveIdentity,
-  softwareSession,
+  sessionPublicKey,
   sweepDigest,
   type Prover,
 } from "@ghostlink/sdk";
@@ -67,27 +70,13 @@ import { buildServer as buildRelayer } from "@ghostlink/relayer/server";
 import { buildServer as buildSolver, MockPlanner } from "@ghostlink/solver/server";
 import { buildServer as buildActions } from "@ghostlink/actions/server";
 import { label, priceAccountFor } from "./genesis.js";
+import { startBotFixture } from "./bot-session.js";
 
 const RPC = process.env.RPC_URL ?? "http://127.0.0.1:8899";
 const ROOT = process.env.REPO_ROOT ?? join(process.cwd(), "..", "..");
+let botFixture: Awaited<ReturnType<typeof startBotFixture>> | undefined;
 
 const ok = (step: string) => console.log(`✓ ${step}`);
-
-/** Minimal PriceUpdateV2 read: price, exponent and publish-time age. */
-async function pythRead(connection: Connection, account: PublicKey) {
-  const info = await connection.getAccountInfo(account);
-  if (!info) throw new Error(`price account ${account.toBase58()} missing`);
-  const d = info.data;
-  let off = 8 + 32;
-  off += d[off] === 0 ? 2 : 1; // verification level
-  off += 32; // feed id
-  const price = d.readBigInt64LE(off);
-  off += 8 + 8;
-  const expo = d.readInt32LE(off);
-  off += 4;
-  const publishTime = Number(d.readBigInt64LE(off));
-  return { price, expo, ageSec: Math.floor(Date.now() / 1000) - publishTime };
-}
 
 const keepRunning = process.env.GHOSTLINK_KEEP_RUNNING === "1";
 const demoPortBase = Number(process.env.GHOSTLINK_DEMO_PORT_BASE ?? 8787);
@@ -103,33 +92,28 @@ async function listen(server: Server, demoPort: number): Promise<string> {
 }
 
 async function main() {
+  // This candidate has no verified public deployment. Refuse before loading
+  // any funded key or sending any transaction, even when RPC_URL is mislabeled.
+  if (process.env.PAYER_KEYPAIR) throw new Error("V2 E2E is disposable-localnet only; funded payer keys are not accepted");
+  const rpcHost = new URL(RPC).hostname;
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(rpcHost)) throw new Error("V2 E2E requires a loopback local validator");
   const connection = new Connection(RPC, "confirmed");
+  if (["EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"].includes(await connection.getGenesisHash())) {
+    throw new Error("V2 E2E refuses public-chain genesis");
+  }
 
   // ---- keys and funds ----------------------------------------------------
-  // Localnet: fresh keys + airdrops. Devnet (PAYER_KEYPAIR set): the
-  // funded deployer pays, the wallet is fresh each run (one binding per
-  // wallet is a protocol rule), and the oracle-checked fill is skipped
-  // unless real price accounts are provided (SKIP_FILL=0).
-  const payerPath = process.env.PAYER_KEYPAIR;
-  if (keepRunning && payerPath) throw new Error("persistent demo stack is localnet-only");
-  const skipFill = payerPath ? process.env.SKIP_FILL !== "0" : false;
-  const payer = payerPath
-    ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(payerPath, "utf8"))))
-    : Keypair.generate();
+  // Disposable localnet only: no funded external keys or live price accounts.
+  const payer = Keypair.generate();
   const solverKp = Keypair.generate();
-  const wallet = payerPath ? Keypair.generate() : Keypair.fromSeed(label("e2e wallet seed"));
-  if (!payerPath) {
-    for (const k of [payer, solverKp, wallet]) {
-      const status = await connection.confirmTransaction(
-        await connection.requestAirdrop(k.publicKey, 50_000_000_000),
-        "confirmed",
-      );
-      if (status.value.err) throw new Error(`airdrop failed: ${JSON.stringify(status.value.err)}`);
-    }
-    ok("airdrops");
-  } else {
-    ok(`payer ${payer.publicKey.toBase58()} (${(await connection.getBalance(payer.publicKey)) / 1e9} SOL)`);
+  const wallet = Keypair.fromSeed(label("e2e wallet seed"));
+  for (const k of [payer, solverKp, wallet]) {
+    const status = await connection.confirmTransaction(
+      await connection.requestAirdrop(k.publicKey, 50_000_000_000), "confirmed",
+    );
+    if (status.value.err) throw new Error(`airdrop failed: ${JSON.stringify(status.value.err)}`);
   }
+  ok("airdrops");
 
   const send = async (ixs: TransactionInstruction[], signers: Keypair[]) => {
     const tx = new Transaction().add(...ixs);
@@ -188,39 +172,19 @@ async function main() {
   ok("mints and balances");
 
   // ---- services (in-process, real HTTP) -----------------------------------
-  // The wallet must clear the relayer's spam-control balance check, and
-  // the solver pays its own fill fees and rent (it earns the spread).
-  if (payerPath) {
-    await send(
-      [
-        SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: wallet.publicKey, lamports: 20_000_000 }),
-        SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: solverKp.publicKey, lamports: 60_000_000 }),
-      ],
-      [],
-    );
-  }
-
   const store = new IndexerStore();
   const poller = new Poller(connection, store);
   const indexerUrl = await listen(buildIndexer(store), 8787);
   const relayerUrl = await listen(
-    buildRelayer({ connection, payer, minWalletLamports: payerPath ? undefined : 1n }), 8788,
+    buildRelayer({ connection, payer, minWalletLamports: 1n }), 8788,
   );
-  // Real Pyth mode (devnet): PRICE_ACCT_* name posted PriceUpdateV2
-  // accounts and FEED_*_ID the real feed ids they carry.
+  // Synthetic Pyth accounts loaded by this disposable validator's genesis.
   const priceAccounts = {
-    [usdcMint.publicKey.toBase58()]:
-      process.env.PRICE_ACCT_USDC ?? priceAccountFor("e2e usdc price acct").toBase58(),
-    [solMint.publicKey.toBase58()]:
-      process.env.PRICE_ACCT_SOL ?? priceAccountFor("e2e sol price acct").toBase58(),
+    [usdcMint.publicKey.toBase58()]: priceAccountFor("e2e usdc price acct").toBase58(),
+    [solMint.publicKey.toBase58()]: priceAccountFor("e2e sol price acct").toBase58(),
   };
-  const hexFeed = (s: string | undefined, fallback: Uint8Array): Uint8Array => {
-    if (!s) return fallback;
-    const clean = s.replace(/^0x/, "");
-    return Uint8Array.from(Buffer.from(clean, "hex"));
-  };
-  const usdcFeedId = hexFeed(process.env.FEED_USDC_ID, label("usdc pyth feed"));
-  const solFeedId = hexFeed(process.env.FEED_SOL_ID, label("sol pyth feed"));
+  const usdcFeedId = label("usdc pyth feed");
+  const solFeedId = label("sol pyth feed");
   const solverUrl = await listen(
     buildSolver({ connection, keypair: solverKp, planner: new MockPlanner(), priceAccounts }), 8789,
   );
@@ -299,7 +263,6 @@ async function main() {
   const regPath = await gl.verifiedPath("registry", binding.leafIndex, regLeaf);
   const cenPath = await gl.verifiedPath("census", census.leafIndex, cenLeaf);
 
-  const session = softwareSession();
   const currentSlot = BigInt(await connection.getSlot("confirmed"));
   const expirySlot = currentSlot + 50_000n;
   const minSlot = BigInt(census.slot);
@@ -323,6 +286,12 @@ async function main() {
       { mint: solMint.publicKey.toBytes(), feedId: solFeedId, decimals: 9 },
     ],
   };
+  botFixture = await startBotFixture(connection, origin, policy);
+  const request = { requestKey: "ab".repeat(16), appId: deriveAppId(identity.sField, deriveDomainHash(origin)).toString(),
+    home: home.toBase58(), sessionExpirySlot: expirySlot.toString() };
+  const { consent } = await botFixture.create(request);
+  const session = sessionPublicKey(0, hexToBytes(consent.sessionKeyHex));
+  ok("authenticated bot request created; owner received only the public session key");
   const { input, appId, domainHash } = buildLoginInput({
     identity,
     origin,
@@ -389,6 +358,12 @@ async function main() {
   );
   const pocket = pocketPda(fieldToBytes32(appId));
   ok(`pocket open at ${pocket.toBase58()}`);
+  if ((await botFixture.confirm(consent.id)).state !== "confirmed") throw new Error("bot consent not confirmed");
+  await botFixture.restart();
+  const recovered = await botFixture.create(request);
+  if (recovered.consent.sessionKeyHex !== consent.sessionKeyHex || recovered.state !== "confirmed") throw new Error("bot restart changed consent");
+  await botFixture.confirm(consent.id);
+  ok("bot permissions confirmed on-chain and encrypted session restored after server restart");
 
   // ---- fund through the Blink ----------------------------------------------
   const appIdHex = bytesToHex(fieldToBytes32(appId));
@@ -411,34 +386,13 @@ async function main() {
   ok("pocket funded through the Blink (wallet-signed deposit)");
 
   // ---- fill an intent through the solver ------------------------------------
-  if (!skipFill) {
-    // Real Pyth mode: wait until both pinned feeds are inside the
-    // pocket's 60s staleness window, then size out_min from the exact
-    // SOL price the program will read, with headroom over the 1% floor.
-    if (process.env.PYTH_WAIT === "1" && process.env.PRICE_ACCT_SOL && process.env.PRICE_ACCT_USDC) {
-      const solAcct = new PublicKey(process.env.PRICE_ACCT_SOL);
-      const usdcAcct = new PublicKey(process.env.PRICE_ACCT_USDC);
-      const started = Date.now();
-      for (;;) {
-        const [s, u] = await Promise.all([pythRead(connection, solAcct), pythRead(connection, usdcAcct)]);
-        if (s.ageSec <= 40 && u.ageSec <= 40) {
-          const solUsd = Number(s.price) * 10 ** s.expo;
-          const outMin = Math.floor((25 / solUsd) * 1e9 * 1.004);
-          process.env.OUT_MIN = String(outMin);
-          ok(`feeds fresh (SOL ${s.ageSec}s, USDC ${u.ageSec}s) · SOL/USD $${solUsd.toFixed(2)} · out_min ${outMin}`);
-          break;
-        }
-        if (Date.now() - started > 8 * 60_000) throw new Error("pyth feeds never aligned within 8 minutes");
-        process.stdout.write(`  waiting for fresh feeds (SOL ${s.ageSec}s, USDC ${u.ageSec}s)…\n`);
-        await new Promise((r) => setTimeout(r, 10_000));
-      }
-    }
+  {
     // The pocket's output token account is the app's (or funder's) job,
     // not the solver's: solver-paid rent would flow to the user's home
     // on sweep and could be farmed.
     await send([createAtaIdempotentIx(payer.publicKey, pocket, solMint.publicKey)], []);
     const deadline = BigInt(await connection.getSlot("confirmed")) + 500n;
-    const { tx } = await gl.submitIntent(pocketHandle, session, {
+    const tx = await botFixture.fill(consent, solverUrl, {
       nonce: BigInt(process.env.FILL_NONCE ?? "1"),
       inMint: usdcMint.publicKey.toBytes(),
       inMax: 25_000_000n,
@@ -454,8 +408,6 @@ async function main() {
       throw new Error(`pocket out balance ${outBalance.value.amount}, expected ${expectedOut}`);
     }
     ok(`pocket received ${Number(expectedOut) / 1e9} SOL-token atomically`);
-  } else {
-    ok("fill skipped (no live oracle on this cluster; see docs/DEVNET.md)");
   }
 
   // ---- sweep home with an owner proof ----------------------------------------
@@ -475,14 +427,10 @@ async function main() {
   };
   const ownerProof = await prover.prove("owner", ownerInput as Record<string, string | string[]>);
   const ownerBytes = proofToBytes(ownerProof.proof as SnarkjsProof);
-  // Sweep whatever the pocket holds: the swap output on localnet, the
-  // untouched USDC deposit when the fill was skipped.
-  const sweepMint = skipFill ? usdcMint.publicKey : solMint.publicKey;
+  const sweepMint = solMint.publicKey;
   const pocketSweepAta = ataAddress(pocket, sweepMint);
-  const expectHome = skipFill ? "150000000" : process.env.OUT_MIN ?? "160000000";
-  const homeLabel = skipFill
-    ? "25 USDC back (150 total)"
-    : `${Number(expectHome) / 1e9} SOL-token`;
+  const expectHome = process.env.OUT_MIN ?? "160000000";
+  const homeLabel = `${Number(expectHome) / 1e9} SOL-token`;
   await send([createAtaIdempotentIx(payer.publicKey, wallet.publicKey, sweepMint)], []);
   const sweepRes = await fetch(`${relayerUrl}/owner-action`, {
     method: "POST",
@@ -514,7 +462,7 @@ async function main() {
   ok(`swept home: ${homeLabel} landed at the wallet`);
 
   console.log(
-    `\nE2E PASSED — register, snapshot, prove, verify, open, fund${skipFill ? "" : ", fill"}, sweep.`,
+    "\nE2E PASSED — register, snapshot, bot consent, prove, verify, open, confirm, restart, fund, bot-signed fill, sweep.",
   );
   if (keepRunning) {
     console.log(`Local demo stack running: indexer ${indexerUrl}, relayer ${relayerUrl}, solver ${solverUrl}, actions ${actionsUrl}. Stop with Ctrl+C.`);
@@ -523,10 +471,13 @@ async function main() {
       await poller.tick().catch((error) => console.error("indexer poll:", error));
     }
   }
-  process.exit(0);
 }
 
-main().catch((e) => {
+main().then(async () => {
+  await botFixture?.close();
+  process.exit(0);
+}).catch(async (e) => {
   console.error("E2E FAILED:", e);
+  await botFixture?.close().catch(() => {});
   process.exit(1);
 });

@@ -42,6 +42,10 @@ services/e2e/.genesis/
 .env.*
 !.env.example
 *.keypair.json
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
 keys/
 # circuits/keys holds PUBLIC verifying keys and fixture proofs that the
 # TypeScript, Rust and LiteSVM suites read; the dev zkeys stay ignored above.

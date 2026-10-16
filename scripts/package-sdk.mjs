@@ -13,12 +13,14 @@ const pnpm = process.env.npm_execpath;
 if (!pnpm || !/pnpm/i.test(pnpm)) throw new Error("Run through pnpm: pnpm pack:sdk or pnpm test:package");
 const run = (args, cwd = root) => execFileSync(process.execPath, [pnpm, ...args], { cwd, stdio: "inherit" });
 mkdirSync(destination, { recursive: true });
-const tarballs = [];
-for (const name of ["common", "sdk"]) {
-  const folder = join(root, "packages", name);
+const includeBot = process.argv.includes("--bot");
+const folders = ["packages/common", "packages/sdk", ...(includeBot ? ["services/shared", "packages/bot"] : [])];
+const tarballs = [], packageOverrides = {};
+for (const relative of folders) {
+  const folder = join(root, relative);
   const pkg = JSON.parse(readFileSync(join(folder, "package.json"), "utf8"));
   run(["pack", "--pack-destination", destination], folder);
-  const tarball = join(destination, `ghostlink-${name}-${pkg.version}.tgz`);
+  const tarball = join(destination, `${pkg.name.replace(/^@/, "").replace("/", "-")}-${pkg.version}.tgz`);
   // pnpm's allowlisted package contents must not accidentally ship workspace files.
   const files = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" }).trim().split(/\r?\n/);
   for (const file of files) {
@@ -27,6 +29,7 @@ for (const name of ["common", "sdk"]) {
     }
   }
   tarballs.push(tarball);
+  packageOverrides[pkg.name] = `file:${tarball.replaceAll("\\", "/")}`;
 }
 writeFileSync(join(destination, "SHA256SUMS"), tarballs.map(path => `${createHash("sha256").update(readFileSync(path)).digest("hex")}  ${path.split(/[\\/]/).pop()}`).join("\n") + "\n");
 
@@ -36,7 +39,7 @@ if (process.argv.includes("--test")) {
   // to the reviewed companion archive, including under pnpm's strict resolver.
   writeFileSync(join(consumer, "package.json"), JSON.stringify({
     name: "ghostlink-install-check", private: true, type: "module",
-    pnpm: { overrides: { "@ghostlink/common": `file:${tarballs[0].replaceAll("\\", "/")}` } },
+    pnpm: { overrides: { ...JSON.parse(readFileSync(join(root, "package.json"), "utf8")).pnpm.overrides, ...packageOverrides } },
   }));
   run(["add", "--ignore-scripts", ...tarballs], consumer);
   writeFileSync(join(consumer, "check.mjs"), `
@@ -60,6 +63,27 @@ await assert.rejects(GhostLink.init({ cluster: 'mainnet-beta', indexer: 'https:/
 console.log('Installed SDK: ESM import, public delegation and real intent signature verified. No network transaction sent.');
 `);
   execFileSync(process.execPath, [join(consumer, "check.mjs")], { cwd: consumer, stdio: "inherit" });
+  if (includeBot) {
+    writeFileSync(join(consumer, "bot.mjs"), `
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { join } from 'node:path';
+import { BotKeyStore, BotOnboarding, createBotAuthorizationServer, verifyTelegramInitData } from '@ghostlink/bot';
+const key = randomBytes(32);
+const path = join(process.cwd(), 'consumer.sqlite');
+const store = new BotKeyStore(path, key);
+store.close();
+const reopened = new BotKeyStore(path, key);
+assert.equal(JSON.stringify(reopened), '{}');
+reopened.close(); key.fill(0);
+assert.equal(typeof BotOnboarding, 'function');
+assert.equal(typeof createBotAuthorizationServer, 'function');
+assert.throws(() => verifyTelegramInitData('forged', '12345:' + 'a'.repeat(32)));
+console.log('Installed bot package: dependencies, encrypted database restart and authentication boundary verified.');
+`);
+    execFileSync(process.execPath, [join(consumer, "bot.mjs")], { cwd: consumer, stdio: "inherit" });
+    execFileSync(process.execPath, ["-e", "import('@ghostlink/bot').then(bot => { if (typeof bot.BotKeyStore !== 'function') process.exit(1); });"], { cwd: consumer, stdio: "inherit" });
+  }
   writeFileSync(join(consumer, "check.cjs"), "import('@ghostlink/sdk').then(sdk => { if (typeof sdk.GhostLink !== 'function') process.exit(1); console.log('CommonJS dynamic import verified'); });\n");
   execFileSync(process.execPath, [join(consumer, "check.cjs")], { cwd: consumer, stdio: "inherit" });
   writeFileSync(join(consumer, "check.mts"), `
@@ -67,6 +91,7 @@ import { GhostLink, sessionPublicKey, type SessionAuthorizationParams, type Sess
 const authorize = (client: GhostLink, params: SessionAuthorizationParams) => client.authorizeSession(params);
 const key: SessionPublicKey = sessionPublicKey(0, new Uint8Array(32));
 void authorize; void key;
+${includeBot ? "import { BotOnboarding, type BotOnboardingOptions, type BotConsent } from '@ghostlink/bot';\nconst initBot = (options: BotOnboardingOptions) => new BotOnboarding(options);\nconst publicKey = (c: BotConsent): string => c.sessionKeyHex;\nvoid initBot; void publicKey;" : ""}
 `);
   const require = createRequire(join(root, "packages", "sdk", "package.json"));
   execFileSync(process.execPath, [require.resolve("typescript/bin/tsc"), "--noEmit", "--strict", "--skipLibCheck", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext", "check.mts"], { cwd: consumer, stdio: "inherit" });

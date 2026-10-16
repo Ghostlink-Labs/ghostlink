@@ -2,6 +2,8 @@
 
 Experimental TypeScript/JavaScript SDK for Solana identity proofs and policy-controlled pockets. Node.js bot backends and browser applications can use the same intent format. **V2 candidate: localnet only; not deployed.** This is not an integration with any named trading bot, and installing it does not grant a bot permission to trade.
 
+For Telegram backend authentication, encrypted session storage and confirmed consent checks, see the separate [`@ghostlink/bot` package](../bot/README.md). It uses this SDK without sharing owner identity secrets with the bot.
+
 ## Install from reviewed source
 
 Use Node 22 and pnpm 10.33.2. From a reviewed checkout of `Ghostlink-Labs/ghostlink`:

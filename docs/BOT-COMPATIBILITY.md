@@ -19,7 +19,7 @@ The absence of a documented adapter in this review is not proof that a provider 
 
 ## Implementation priorities
 
-The localnet candidate now includes [`@ghostlink/bot`](../packages/bot/README.md): Telegram authentication, encrypted persistent session keys, idempotent consent requests, confirmed permission checks and a bot-signed reference fill. Its full local-validator test uses synthetic Telegram authentication and an inventory route. No named provider, real Telegram device, Jupiter route or mainnet deployment is validated by that test. Trade nonce/submission durability remains to be implemented.
+The localnet candidate now includes [`@ghostlink/bot`](../packages/bot/README.md): Telegram authentication, encrypted session keys/orders, idempotent consent, durable nonce allocation and confirmed permission checks. The validator test recovers the same signed order after bot restart and confirms one solver transaction after a lost acknowledgment and solver restart. It uses synthetic Telegram authentication and an inventory route. No named provider, real Telegram device, Jupiter route or mainnet deployment is validated by that test. Strategy scheduling, coordinated restore and live route validation remain open.
 
 1. Ship a generic Node.js reference bot and Telegram Mini App onboarding contract. Owners approve a public bot key, exact policy, recovery wallet and expiry in a trusted local proving context. The bot never receives the owner's wallet key or identity secret.
 2. Implement Jupiter composition for a small classic-SPL asset set, with both buy and sell tests, quote expiry, bounded fees, transaction simulation and chain-confirmed reconciliation.

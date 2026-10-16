@@ -67,14 +67,15 @@ import { IndexerStore } from "@ghostlink/indexer/store";
 import { buildServer as buildIndexer } from "@ghostlink/indexer/server";
 import { Poller } from "@ghostlink/indexer/poller";
 import { buildServer as buildRelayer } from "@ghostlink/relayer/server";
-import { buildServer as buildSolver, MockPlanner } from "@ghostlink/solver/server";
 import { buildServer as buildActions } from "@ghostlink/actions/server";
 import { label, priceAccountFor } from "./genesis.js";
 import { startBotFixture } from "./bot-session.js";
+import { startSolverFixture } from "./solver-session.js";
 
 const RPC = process.env.RPC_URL ?? "http://127.0.0.1:8899";
 const ROOT = process.env.REPO_ROOT ?? join(process.cwd(), "..", "..");
 let botFixture: Awaited<ReturnType<typeof startBotFixture>> | undefined;
+let solverFixture: Awaited<ReturnType<typeof startSolverFixture>> | undefined;
 
 const ok = (step: string) => console.log(`✓ ${step}`);
 
@@ -185,9 +186,8 @@ async function main() {
   };
   const usdcFeedId = label("usdc pyth feed");
   const solFeedId = label("sol pyth feed");
-  const solverUrl = await listen(
-    buildSolver({ connection, keypair: solverKp, planner: new MockPlanner(), priceAccounts }), 8789,
-  );
+  solverFixture = await startSolverFixture(connection, solverKp, priceAccounts, keepRunning ? demoPortBase + 2 : 0);
+  const solverUrl = solverFixture.url;
   const actionsUrl = await listen(buildActions({ connection, baseUrl: keepRunning ? `http://127.0.0.1:${demoPortBase + 3}` : "http://e2e.local" }), 8790);
   ok(`services up (indexer ${indexerUrl})`);
 
@@ -399,8 +399,9 @@ async function main() {
       outMint: solMint.publicKey.toBytes(),
       outMin: BigInt(process.env.OUT_MIN ?? "160000000"),
       deadlineSlot: deadline,
-    });
-    ok(`intent filled: ${tx.signature.slice(0, 16)}…`);
+    }, () => solverFixture!.restart());
+    solverFixture.assertSingleTransaction();
+    ok(`intent filled after lost acknowledgment and solver restart: ${tx.signature.slice(0, 16)}…`);
 
     const expectedOut = process.env.OUT_MIN ?? "160000000";
     const outBalance = await connection.getTokenAccountBalance(ataAddress(pocket, solMint.publicKey));
@@ -475,9 +476,11 @@ async function main() {
 
 main().then(async () => {
   await botFixture?.close();
+  await solverFixture?.close();
   process.exit(0);
 }).catch(async (e) => {
   console.error("E2E FAILED:", e);
   await botFixture?.close().catch(() => {});
+  await solverFixture?.close().catch(() => {});
   process.exit(1);
 });

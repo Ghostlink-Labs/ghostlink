@@ -74,6 +74,8 @@ An authorization contains no signing function. `authorizeSession` accepts only E
 
 ## Current limits
 
+Trade submission returns explicit states. Inspect `tx.state`; `pending`, `preparing` and `unknown` are not successful settlement. Persist a signed intent before sending with `client.submitSignedIntent(signed, publicSession)`, and poll with `client.intentStatus(intentHashHex)` after a timeout. Retrying the identical intent reuses the solver's persisted transaction. Never allocate a fresh nonce simply because an HTTP call failed. See [the recovery contract](../../docs/TRANSACTION-RECOVERY.md).
+
 - The facade refuses devnet and mainnet because V2 has no verified live deployment. The existing devnet app uses the preserved V1 deployment. This is a configuration guard, not an RPC genesis check or a sandbox around low-level functions.
 - Only classic SPL Token swaps are supported. Token-2022 transfers and native SOL swap legs need explicit implementations.
 - Input tokens require a pinned fresh price feed. Software sessions cannot buy unpriced output tokens. Unattended new-token sniping is not supported.

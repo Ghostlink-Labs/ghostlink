@@ -6,3 +6,4 @@ export * from "./pocket.js";
 export * from "./ghostlink.js";
 export * from "./wallet-standard.js";
 export * from "./domains.js";
+export type { IntentSubmission } from "@ghostlink/common";

@@ -7,6 +7,15 @@ const POCKET_DISC = sha256(new TextEncoder().encode("account:Pocket")).subarray(
 /** Discriminator plus current Pocket::INIT_SPACE, including owner_action_nonce. */
 export const POCKET_ACCOUNT_SIZE = 2089;
 
+/** Same circular 2048-bit window as programs/pocket/src/state.rs. */
+export function isPocketNonceUsed(account: { nonceBase: bigint; nonceBitmap: Uint8Array }, nonce: bigint): boolean {
+  if (nonce < 0n || nonce > (1n << 64n) - 1n || account.nonceBitmap.length !== 256) throw new Error("invalid nonce window");
+  if (nonce < account.nonceBase) return true;
+  if (nonce - account.nonceBase >= 2048n) return false;
+  const bit = Number(nonce % 2048n);
+  return ((account.nonceBitmap[Math.floor(bit / 8)]! >> (bit % 8)) & 1) === 1;
+}
+
 /** A lamport transfer can create a system-owned PDA before its pocket is opened. */
 export function isPocketAccount(info: AccountInfo<Uint8Array> | null, appId: Uint8Array, expectedProgram = POCKET): boolean {
   return Boolean(

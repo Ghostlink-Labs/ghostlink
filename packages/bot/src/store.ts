@@ -1,73 +1,28 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { EncryptedSqlite } from "@ghostlink/service-kit/storage";
 import type { BotConsent, ConsentStatus } from "./types.js";
 
 /** Local-disk SQLite; transactional across processes on the same machine. */
 export class BotKeyStore {
-  #db: DatabaseSync;
-  #key: Buffer;
+  #storage: EncryptedSqlite;
+  get #db() { return this.#storage.db; }
 
   constructor(path: string, encryptionKey: Uint8Array) {
-    if (encryptionKey.length !== 32) throw new Error("bot storage requires a 32-byte encryption key");
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.#key = Buffer.from(encryptionKey);
-    this.#db = new DatabaseSync(path, { allowExtension: false });
+    this.#storage = new EncryptedSqlite(path, encryptionKey, "ghostlink:bot-store");
     try {
-      if (path !== ":memory:") chmodSync(path, 0o600);
-      this.#db.exec(`
-        PRAGMA busy_timeout=5000;
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=FULL;
-        CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value BLOB NOT NULL) STRICT;
-        CREATE TABLE IF NOT EXISTS consent (
-          id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, user_id TEXT NOT NULL,
-          request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, payload TEXT NOT NULL,
-          encrypted_key BLOB, state TEXT NOT NULL CHECK(state IN ('pending','confirmed','cancelled','expired')),
-          expires_at INTEGER NOT NULL, confirmed_slot INTEGER,
-          UNIQUE(bot_id, user_id, request_key)
-        ) STRICT;
-      `);
-      this.#transaction(() => {
-        const row = this.#db.prepare("SELECT value FROM metadata WHERE name='key-check-v1'").get();
-        if (row) {
-          const check = this.#decrypt(row.value as Uint8Array, "ghostlink:bot-store:key-check:v1");
-          if (check.toString() !== "ghostlink:bot-store:v1") throw new Error("invalid bot database key");
-          check.fill(0);
-        } else {
-          this.#db.prepare("INSERT INTO metadata VALUES ('key-check-v1', ?)").run(
-            this.#encrypt(Buffer.from("ghostlink:bot-store:v1"), "ghostlink:bot-store:key-check:v1"),
-          );
-        }
-      });
-    } catch (error) { this.#db.close(); this.#key.fill(0); throw error; }
+      this.#db.exec(`CREATE TABLE IF NOT EXISTS consent (
+        id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, user_id TEXT NOT NULL,
+        request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, payload TEXT NOT NULL,
+        encrypted_key BLOB, state TEXT NOT NULL CHECK(state IN ('pending','confirmed','cancelled','expired')),
+        expires_at INTEGER NOT NULL, confirmed_slot INTEGER,
+        UNIQUE(bot_id, user_id, request_key)
+      ) STRICT;`);
+    } catch (error) { this.#storage.close(); throw error; }
   }
 
-  close(): void { this.#db.close(); this.#key.fill(0); }
-
-  #transaction<T>(fn: () => T): T {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try { const result = fn(); this.#db.exec("COMMIT"); return result; }
-    catch (error) { this.#db.exec("ROLLBACK"); throw error; }
-  }
-
-  #encrypt(secret: Uint8Array, aad: string): Buffer {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv("aes-256-gcm", this.#key, iv);
-    cipher.setAAD(Buffer.from(aad));
-    const bytes = Buffer.concat([cipher.update(secret), cipher.final()]);
-    return Buffer.concat([iv, cipher.getAuthTag(), bytes]);
-  }
-
-  #decrypt(value: Uint8Array, aad: string): Buffer {
-    const bytes = Buffer.from(value);
-    if (bytes.length < 28) throw new Error("invalid encrypted bot key");
-    const decipher = createDecipheriv("aes-256-gcm", this.#key, bytes.subarray(0, 12));
-    decipher.setAAD(Buffer.from(aad));
-    decipher.setAuthTag(bytes.subarray(12, 28));
-    return Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]);
-  }
+  close(): void { this.#storage.close(); }
+  #transaction<T>(fn: () => T): T { return this.#storage.transaction(fn); }
+  #encrypt(value: Uint8Array, aad: string): Buffer { return this.#storage.seal(value, aad); }
+  #decrypt(value: Uint8Array, aad: string): Buffer { return this.#storage.open(value, aad); }
 
   #expire(now: number): void {
     this.#db.prepare("UPDATE consent SET state='expired', encrypted_key=NULL WHERE state='pending' AND expires_at<=?").run(now);

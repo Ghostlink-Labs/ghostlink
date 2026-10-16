@@ -1,12 +1,11 @@
 /**
  * The reference solver. Fill shape (build plan 4.4):
  *   [precompile over SHA-256(intent)] [fill_begin] [route] [fill_end]
- * all in one transaction — the route either delivers out_min or the
- * whole thing reverts, solver fee included.
+ * all in one transaction — token movements revert together if out_min
+ * is not delivered. Solana network fees can still be charged on failure.
  *
  * Routing is pluggable. The mock planner transfers from the solver's own
- * inventory (localnet/devnet, where DEX liquidity is thin — accepted by
- * the M2 gate); a Jupiter planner belongs here when mainnet routing
+ * inventory on the local validator; a Jupiter planner belongs here when mainnet routing
  * lands (docs/adr/0001). Whatever the planner, the server values both
  * legs first and refuses to overpay (economics.ts).
  */
@@ -25,7 +24,6 @@ import {
   HttpError,
   RateLimiter,
   Router,
-  Semaphore,
   ataAddress,
   clientIp,
   createAtaIdempotentIx,
@@ -37,6 +35,8 @@ import {
 } from "@ghostlink/service-kit";
 import { validateIntent, type ValidatedIntent } from "./validate.js";
 import { PriceReader, checkEconomics } from "./economics.js";
+import { NonceConflictError, SubmissionJournal } from "./journal.js";
+import { IntentAuthorizationError, SubmissionCoordinator } from "./submission.js";
 
 export interface RoutePlan {
   instructions: TransactionInstruction[];
@@ -63,6 +63,7 @@ export interface SolverDeps {
   connection: Connection;
   keypair: Keypair;
   planner: RoutePlanner;
+  journal: SubmissionJournal;
   /** mint base58 -> Pyth price update account base58 (user-pinned feeds). */
   priceAccounts: Record<string, string>;
   /** How much more than the input's value the solver will deliver; default 100 bps. */
@@ -79,15 +80,26 @@ export interface SolverDeps {
 }
 
 export function buildServer(deps: SolverDeps): Server {
-  const router = new Router();
+  const router = new Router({ exposeErrors: false, onError: () => console.error("solver request failed") });
   const solver = deps.keypair.publicKey;
+  if (deps.journal.scope.solver !== solver.toBase58()) throw new Error("solver identity does not match journal");
+  const submissions = new SubmissionCoordinator(deps.connection, deps.journal);
   const prices = new PriceReader(deps.connection, deps.priceAccounts);
   const ipLimiter = new RateLimiter(30, 60_000);
   const pocketLimiter = new RateLimiter(10, 60_000);
-  const inFlight = new Semaphore(8);
-  const locked = new Set<string>();
+  let inFlight = 0;
 
   router.get("/health", async () => ({ json: { ok: true, solver: solver.toBase58() } }));
+
+  router.get("/intents/:id", async ({ params, raw }) => {
+    if (!ipLimiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
+    if (!/^[0-9a-f]{64}$/.test(params.id ?? "")) throw new HttpError(400, "invalid intent hash");
+    if (!deps.journal.get(params.id!)) throw new HttpError(404, "intent not found");
+    if (inFlight >= 8) throw new HttpError(503, "solver busy");
+    inFlight += 1;
+    try { return { json: await submissions.status(params.id!), headers: { "cache-control": "no-store" } }; }
+    finally { inFlight -= 1; }
+  });
 
   router.post("/intent", async ({ body, raw }) => {
     if (!ipLimiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
@@ -104,32 +116,29 @@ export function buildServer(deps: SolverDeps): Server {
     const outMint = new PublicKey(v.intent.outMint);
     if (!pocketLimiter.allow(pocket.toBase58())) throw new HttpError(429, "rate limited for this pocket");
 
-    const inPrice = await prices.priceFor(inMint);
-    if (!inPrice) {
-      return { status: 400, json: { error: `no price account configured for ${inMint.toBase58()}` } };
-    }
-    const outPrice = await prices.priceFor(outMint);
-    const economics = checkEconomics(
-      v.intent,
-      { in: inPrice, out: outPrice },
-      deps.maxQuoteSpreadBps ?? 100,
-      deps.allowUnpriced ?? false,
-    );
-    if (!economics.ok) return { status: 400, json: { error: economics.reason } };
-
-    // One attempt per (pocket, nonce) at a time: a second request would
-    // only burn a fee racing the first.
-    const lockKey = `${pocket.toBase58()}:${v.intent.nonce}`;
-    if (locked.has(lockKey)) throw new HttpError(409, "this intent is already being filled");
-    locked.add(lockKey);
+    if (inFlight >= 8) throw new HttpError(503, "solver busy; retry the same signed intent");
+    inFlight += 1;
     try {
-      return await inFlight.run(() => fill(v, pocket, inMint, outMint));
-    } finally {
-      locked.delete(lockKey);
-    }
+      const result = await submissions.submit(v, async minimumSlot => {
+        const inPrice = await prices.priceFor(inMint);
+        if (!inPrice) throw new HttpError(400, "input mint has no configured price account");
+        const outPrice = await prices.priceFor(outMint);
+        const economics = checkEconomics(v.intent, { in: inPrice, out: outPrice },
+          deps.maxQuoteSpreadBps ?? 100, deps.allowUnpriced ?? false);
+        if (!economics.ok) throw new HttpError(400, economics.reason ?? "quote refused");
+        return prepare(v, pocket, inMint, outMint, minimumSlot);
+      });
+      return { status: ["preparing", "pending", "unknown"].includes(result.state) ? 202 : 200,
+        json: result, headers: { "cache-control": "no-store" } };
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      if (error instanceof NonceConflictError) throw new HttpError(409, error.message);
+      if (error instanceof IntentAuthorizationError) throw new HttpError(403, "intent is not authorized by the current pocket");
+      throw new HttpError(503, "intent preparation unavailable; retry the identical signed intent");
+    } finally { inFlight -= 1; }
   });
 
-  async function fill(v: ValidatedIntent, pocket: PublicKey, inMint: PublicKey, outMint: PublicKey) {
+  async function prepare(v: ValidatedIntent, pocket: PublicKey, inMint: PublicKey, outMint: PublicKey, minimumSlot: number) {
     const pre =
       v.sessionKind === 0
         ? ed25519Ix(v.sessionKey, v.signature, v.hash)
@@ -173,19 +182,12 @@ export function buildServer(deps: SolverDeps): Server {
 
     const tx = new Transaction().add(...setup, pre, begin, ...route.instructions, end);
     tx.feePayer = solver;
-    const { blockhash, lastValidBlockHeight } = await deps.connection.getLatestBlockhash();
+    const latest = await deps.connection.getLatestBlockhashAndContext({ commitment: "confirmed", minContextSlot: minimumSlot });
+    const { blockhash, lastValidBlockHeight } = latest.value;
     tx.recentBlockhash = blockhash;
     tx.sign(deps.keypair);
-    try {
-      const signature = await deps.connection.sendRawTransaction(tx.serialize());
-      const status = await deps.connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
-      if (status.value.err) {
-        return { status: 502, json: { error: `fill failed on-chain: ${JSON.stringify(status.value.err)}`, signature } };
-      }
-      return { json: { signature } };
-    } catch (e) {
-      return { status: 502, json: { error: e instanceof Error ? e.message : String(e) } };
-    }
+    return { rawBase64: tx.serialize().toString("base64"), signature: bs58.encode(tx.signature!),
+      blockhash, lastValidBlockHeight, minContextSlot: latest.context.slot };
   }
 
   return router.server();

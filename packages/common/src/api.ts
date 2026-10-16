@@ -116,6 +116,17 @@ export interface TxResponse {
   signature: string;
 }
 
+/** Submission is not settlement. Only confirmed/finalized states establish success. */
+export interface IntentSubmission {
+  intentHashHex: string;
+  state: "preparing" | "pending" | "confirmed" | "finalized" | "failed" | "expired" | "unknown";
+  signature?: string;
+  slot?: number;
+  confirmationStatus?: "confirmed" | "finalized";
+  reason?: string;
+  chainError?: unknown;
+}
+
 /** Owner-proof-authorized relayer calls (sweep, changes, revoke). */
 export interface OwnerActionRequest {
   pocket: string; // base58

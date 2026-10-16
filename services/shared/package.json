@@ -10,7 +10,8 @@
   "files": ["dist"],
   "exports": {
     ".": "./dist/index.js",
-    "./accounts": "./dist/accounts.js"
+    "./accounts": "./dist/accounts.js",
+    "./storage": "./dist/storage.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

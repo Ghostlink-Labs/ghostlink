@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import type { Connection } from "@solana/web3.js";
-import { bytesToHex, CENSUS_PROGRAM_ID, POCKET_PROGRAM_ID, REGISTRY_PROGRAM_ID, toBase58, type Policy } from "@ghostlink/common";
+import { bytesToHex, CENSUS_PROGRAM_ID, POCKET_PROGRAM_ID, REGISTRY_PROGRAM_ID, toBase58, type IntentSubmission, type Policy } from "@ghostlink/common";
 import { BotKeyStore, BotOnboarding, createBotAuthorizationServer, type BotConsent, type ConsentStatus, type CreateConsent } from "@ghostlink/bot";
 import type { IntentParams } from "@ghostlink/sdk";
 
@@ -54,15 +54,30 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
       server = createBotAuthorizationServer(manager, ownerOrigin);
       await listen();
     },
-    async fill(consent: BotConsent, solverUrl: string, params: IntentParams): Promise<{ signature: string }> {
+    async fill(consent: BotConsent, solverUrl: string, params: IntentParams, restartSolver: () => Promise<string>): Promise<{ signature: string }> {
       const signed = await manager.signIntent(consent.id, { botId: "12345", userId: "42" }, params);
       const i = signed.intent;
-      const response = await fetch(`${solverUrl}/intent`, { method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ pocket: consent.pocket, nonce: i.nonce.toString(), inMint: toBase58(i.inMint), inMax: i.inMax.toString(),
+      const body = JSON.stringify({ pocket: consent.pocket, nonce: i.nonce.toString(), inMint: toBase58(i.inMint), inMax: i.inMax.toString(),
           outMint: toBase58(i.outMint), outMin: i.outMin.toString(), deadlineSlot: i.deadlineSlot.toString(), policyHashHex: bytesToHex(i.policyHash),
-          sessionKind: 0, signatureHex: bytesToHex(signed.signature.signature), sessionKeyHex: consent.sessionKeyHex }) });
-      if (!response.ok) throw new Error(`bot fill: ${await response.text()}`);
-      return response.json() as Promise<{ signature: string }>;
+          sessionKind: 0, signatureHex: bytesToHex(signed.signature.signature), sessionKeyHex: consent.sessionKeyHex });
+      const send = async (base: string): Promise<IntentSubmission> => {
+        const response = await fetch(`${base}/intent`, { method: "POST", headers: { "content-type": "application/json" }, body });
+        if (!response.ok) throw new Error(`bot fill: ${await response.text()}`);
+        return response.json() as Promise<IntentSubmission>;
+      };
+      const first = await send(solverUrl);
+      if (!first.signature) throw new Error("expected durably prepared transaction identity");
+      const restartedUrl = await restartSolver();
+      let result = await send(restartedUrl);
+      const deadline = Date.now() + 20_000;
+      while (!["confirmed", "finalized", "failed", "expired"].includes(result.state) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const status = await fetch(`${restartedUrl}/intents/${result.intentHashHex}`);
+        if (!status.ok) throw new Error("solver status unavailable");
+        result = await status.json() as IntentSubmission;
+      }
+      if (result.signature !== first.signature || !["confirmed", "finalized"].includes(result.state)) throw new Error(`restarted trade not confirmed: ${result.state}`);
+      return { signature: first.signature };
     },
     async close() { await stop(); store.close(); key.fill(0); rmSync(dir, { recursive: true, force: true }); },
   };

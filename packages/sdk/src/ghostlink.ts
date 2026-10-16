@@ -15,10 +15,12 @@ import {
   fieldToBytes32,
   hexToBytes,
   homeHash,
+  intentHash,
   pocketAuthorizationContext,
   toBase58,
   type CensusLatestResponse,
   type IntentRequest,
+  type IntentSubmission,
   type LeavesResponse,
   type OpenSessionRequest,
   type PathResponse,
@@ -374,11 +376,21 @@ export class GhostLink {
     pocket: PocketHandle,
     session: SessionSigner,
     params: IntentParams,
-  ): Promise<{ signed: SignedIntent; tx: TxResponse }> {
+  ): Promise<{ signed: SignedIntent; tx: IntentSubmission }> {
     if (!this.config.solver) throw new Error("no solver configured");
+    const publicKey = copySessionPublicKey(session);
     const signed = await signIntent(pocket, session, params);
+    return { signed, tx: await this.submitSignedIntent(signed, publicKey) };
+  }
+
+  /** Retry an already-signed intent without changing its nonce or prompting the signer again. */
+  async submitSignedIntent(signed: SignedIntent, session: SessionPublicKey): Promise<IntentSubmission> {
+    if (!this.config.solver) throw new Error("no solver configured");
+    const key = copySessionPublicKey(session);
+    const expectedHash = bytesToHex(intentHash(signed.intent));
+    if (expectedHash !== bytesToHex(signed.hash)) throw new Error("signed intent was mutated");
     const req: IntentRequest = {
-      pocket: toBase58(pocket.address),
+      pocket: toBase58(signed.intent.pocket),
       nonce: signed.intent.nonce.toString(),
       inMint: toBase58(signed.intent.inMint),
       inMax: signed.intent.inMax.toString(),
@@ -386,9 +398,9 @@ export class GhostLink {
       outMin: signed.intent.outMin.toString(),
       deadlineSlot: signed.intent.deadlineSlot.toString(),
       policyHashHex: bytesToHex(signed.intent.policyHash),
-      sessionKind: session.kind,
+      sessionKind: key.kind,
       signatureHex: bytesToHex(signed.signature.signature),
-      sessionKeyHex: bytesToHex(session.kind === 0 ? session.key32 : session.key33),
+      sessionKeyHex: bytesToHex(key.kind === 0 ? key.key32 : key.key33),
       webauthn: signed.signature.webauthn
         ? {
             authenticatorDataHex: bytesToHex(signed.signature.webauthn.authenticatorData),
@@ -396,8 +408,29 @@ export class GhostLink {
           }
         : undefined,
     };
-    const tx = await this.postJson<TxResponse>(this.config.solver, "/intent", req);
-    return { signed, tx };
+    const tx = await this.postJson<IntentSubmission>(this.config.solver, "/intent", req);
+    return this.checkedIntentStatus(tx, expectedHash);
+  }
+
+  /** Poll the exact intent; a submission receipt is not confirmation. */
+  async intentStatus(intentHashHex: string): Promise<IntentSubmission> {
+    if (!this.config.solver) throw new Error("no solver configured");
+    if (!/^[0-9a-f]{64}$/.test(intentHashHex)) throw new Error("invalid intent hash");
+    const response = await this.fetchFn(`${this.config.solver}/intents/${intentHashHex}`);
+    if (!response.ok) throw new Error(`solver status: HTTP ${response.status}`);
+    return this.checkedIntentStatus(await response.json(), intentHashHex);
+  }
+
+  private checkedIntentStatus(value: unknown, expectedHash: string): IntentSubmission {
+    const v = value as IntentSubmission;
+    if (!v || v.intentHashHex !== expectedHash || !["preparing", "pending", "confirmed", "finalized", "failed", "expired", "unknown"].includes(v.state)) {
+      throw new Error("invalid solver submission receipt");
+    }
+    if (!["preparing", "unknown"].includes(v.state) && (typeof v.signature !== "string" || !/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(v.signature))) throw new Error("missing transaction identity");
+    if (["confirmed", "finalized", "failed"].includes(v.state) && (!Number.isSafeInteger(v.slot) || v.slot! < 0 ||
+      !["confirmed", "finalized"].includes(v.confirmationStatus ?? ""))) throw new Error("missing confirmation evidence");
+    if ((v.state === "confirmed" || v.state === "finalized") && v.confirmationStatus !== v.state) throw new Error("inconsistent confirmation evidence");
+    return v;
   }
 }
 

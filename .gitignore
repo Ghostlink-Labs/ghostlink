@@ -42,6 +42,10 @@ services/e2e/.genesis/
 .env.*
 !.env.example
 *.keypair.json
+*.key
+*.pem
+*.p12
+*.pfx
 *.sqlite
 *.sqlite-*
 *.db

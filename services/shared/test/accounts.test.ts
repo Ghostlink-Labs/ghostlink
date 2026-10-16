@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { sha256 } from "@noble/hashes/sha256";
 import { SystemProgram } from "@solana/web3.js";
-import { BorshWriter, POCKET, POCKET_ACCOUNT_SIZE, isPocketAccount, readPocketAccount, writePolicy } from "../src/index.js";
+import { BorshWriter, POCKET, POCKET_ACCOUNT_SIZE, isPocketAccount, isPocketNonceUsed, readPocketAccount, writePolicy } from "../src/index.js";
 import type { Policy } from "@ghostlink/common";
 
 const appId = new Uint8Array(32).fill(3);
@@ -10,6 +10,16 @@ const policy: Policy = { dailyCapUsdE6: 1n, maxSlippageBps: 100, bigActionThresh
   oracleFeeds: [{ mint: new Uint8Array(32).fill(5), feedId: new Uint8Array(32).fill(6), decimals: 9 }] };
 
 describe("Pocket account decoding", () => {
+  it("interprets wrapped nonce bits and never reuses values below the on-chain window", () => {
+    const a = { nonceBase: 3000n, nonceBitmap: new Uint8Array(256) };
+    a.nonceBitmap[0] = 128; // circular bit 7 belongs to 4103 in this window.
+    expect(isPocketNonceUsed(a, 7n)).toBe(true);
+    expect(isPocketNonceUsed(a, 2999n)).toBe(true);
+    expect(isPocketNonceUsed(a, 3000n)).toBe(false);
+    expect(isPocketNonceUsed(a, 4103n)).toBe(true);
+    expect(isPocketNonceUsed(a, 6151n)).toBe(false); // same bit, beyond this window.
+    expect(() => isPocketNonceUsed(a, 1n << 64n)).toThrow();
+  });
   it("finds the owner nonce after dynamic policy and pending-change layouts", () => {
     for (const pending of [undefined, "home", "policy"]) {
       const w = new BorshWriter().fixed(sha256(new TextEncoder().encode("account:Pocket")).subarray(0, 8))

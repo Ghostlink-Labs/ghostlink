@@ -8,6 +8,7 @@
  * compressed public key.
  */
 import { ed25519 } from "@noble/curves/ed25519";
+import { p256 } from "@noble/curves/p256";
 import { sha256 } from "@noble/hashes/sha256";
 import { FieldElement, sessionCommitment } from "@ghostlink/common";
 
@@ -15,14 +16,52 @@ export const SESSION_KIND_ED25519 = 0 as const;
 export const SESSION_KIND_P256 = 1 as const;
 export type SessionKind = typeof SESSION_KIND_ED25519 | typeof SESSION_KIND_P256;
 
-export interface SessionSigner {
+export interface SessionPublicKey {
   kind: SessionKind;
   /** 33 bytes as stored on-chain (ed25519 key + zero byte, or compressed P-256). */
   key33: Uint8Array;
   /** The 32 bytes entering Poseidon for the session commitment. */
   key32: Uint8Array;
+}
+
+export interface SessionSigner extends SessionPublicKey {
   /** Signs a 32-byte digest; for passkeys this triggers the platform prompt. */
   sign(digest: Uint8Array): Promise<SessionSignature>;
+}
+
+/** Public authorization material only; never accepts a session private key. */
+export function sessionPublicKey(kind: SessionKind, publicKey: Uint8Array): SessionPublicKey {
+  if (!(publicKey instanceof Uint8Array)) throw new Error("expected session public key bytes");
+  if (kind === SESSION_KIND_ED25519) {
+    if (publicKey.length !== 32) throw new Error("expected 32-byte Ed25519 public key");
+    const point = ed25519.ExtendedPoint.fromHex(publicKey);
+    if (point.isSmallOrder() || !point.isTorsionFree()) throw new Error("invalid Ed25519 session public key");
+    const key33 = new Uint8Array(33);
+    key33.set(publicKey);
+    return { kind, key32: publicKey.slice(), key33 };
+  }
+  if (kind === SESSION_KIND_P256) {
+    if (publicKey.length !== 33 || (publicKey[0] !== 2 && publicKey[0] !== 3)) {
+      throw new Error("expected compressed P-256 public key");
+    }
+    p256.ProjectivePoint.fromHex(publicKey).assertValidity();
+    return { kind, key32: sha256(publicKey), key33: publicKey.slice() };
+  }
+  throw new Error("unsupported session kind");
+}
+
+/** Check and snapshot a descriptor before asynchronous proof generation. */
+export function copySessionPublicKey(session: SessionPublicKey): SessionPublicKey {
+  if (!session || !(session.key33 instanceof Uint8Array) || session.key33.length !== 33 ||
+      !(session.key32 instanceof Uint8Array) || session.key32.length !== 32 ||
+      (session.kind === SESSION_KIND_ED25519 && session.key33[32] !== 0)) {
+    throw new Error("invalid session public key descriptor");
+  }
+  const copy = sessionPublicKey(session.kind, session.kind === SESSION_KIND_ED25519 ? session.key33.subarray(0, 32) : session.key33);
+  if (copy.key32.some((value, index) => value !== session.key32[index])) {
+    throw new Error("session public keys do not match");
+  }
+  return copy;
 }
 
 export interface SessionSignature {

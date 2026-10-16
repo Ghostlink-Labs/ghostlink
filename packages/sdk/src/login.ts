@@ -22,7 +22,7 @@ import {
   type ProofBytes,
 } from "@ghostlink/common";
 import type { DerivedIdentity } from "./identity.js";
-import { sessionCommitmentFor, type SessionSigner } from "./session.js";
+import { sessionCommitmentFor, type SessionPublicKey } from "./session.js";
 
 /** What apps may claim. V1 ships holdsAtLeast; more claims are additive. */
 export interface HoldsAtLeastClaim {
@@ -90,7 +90,7 @@ export function buildLoginInput(params: {
   minSlot?: bigint;
   /** The chain's current slot, needed to derive `min_slot` for a claim. */
   currentSlot?: bigint;
-  session: SessionSigner;
+  session: SessionPublicKey;
   expirySlot: bigint;
   home: Uint8Array;
   witness: LoginWitnessData;

@@ -34,7 +34,7 @@ import {
   type LoginWitnessData,
   type Prover,
 } from "./login.js";
-import { softwareSession, type SessionSigner } from "./session.js";
+import { copySessionPublicKey, softwareSession, type SessionPublicKey, type SessionSigner } from "./session.js";
 import {
   derivePocket,
   fundingOptions,
@@ -46,6 +46,7 @@ import {
 } from "./pocket.js";
 
 export interface GhostLinkConfig {
+  /** This development release refuses mainnet; deployment IDs and setup keys are not production-ready. */
   cluster: Cluster;
   indexer: string;
   relayer?: string;
@@ -60,12 +61,29 @@ export interface GhostLinkConfig {
   fetchFn?: typeof fetch;
 }
 
-export interface GhostLinkSession {
+export interface GhostLinkAuthorization {
   appId: FieldElement;
   appIdBase58: string;
   proof: LoginProof;
-  signer: SessionSigner;
+  /** Public key descriptor, with no signing function or private key. */
+  signer: SessionPublicKey;
   expirySlot: bigint;
+}
+
+export interface GhostLinkSession extends GhostLinkAuthorization {
+  signer: SessionSigner;
+}
+
+export interface SessionAuthorizationParams {
+  identity: DerivedIdentity;
+  claim?: Claim;
+  minSlot?: bigint;
+  currentSlot?: bigint;
+  witness: LoginWitnessData;
+  session: SessionPublicKey;
+  /** Must exceed every previous session expiry for this pocket. */
+  expirySlot: bigint;
+  home: Uint8Array;
 }
 
 export class GhostLink {
@@ -78,6 +96,9 @@ export class GhostLink {
   }
 
   static async init(config: GhostLinkConfig): Promise<GhostLink> {
+    if (config.cluster !== "devnet" && config.cluster !== "localnet") {
+      throw new Error("This development SDK has no verified mainnet deployment; use devnet or localnet");
+    }
     return new GhostLink(config);
   }
 
@@ -222,6 +243,27 @@ export class GhostLink {
   }): Promise<GhostLinkSession> {
     if (!this.config.prover) throw new Error("no prover configured");
     const signer = params.session ?? softwareSession();
+    const authorization = await this.prepareAuthorization({ ...params, session: signer });
+    return { ...authorization, signer };
+  }
+
+  /**
+   * Run on the user's trusted device to authorize a bot's PUBLIC session key.
+   * The bot keeps its session secret; the user's identity and proof inputs
+   * never go to the bot. This prepares a proof, not an on-chain activation:
+   * openSession must confirm before the bot trades. Show the user the bot,
+   * home, policy and expiry, and authenticate the key handoff first.
+   */
+  async authorizeSession(params: SessionAuthorizationParams): Promise<GhostLinkAuthorization> {
+    // A remote P-256 key does not establish that a hardware authenticator
+    // created it. Never classify a bot-supplied key as passkey-held authority.
+    if (params.session?.kind !== 0) throw new Error("Delegated bots require an Ed25519 session public key");
+    return this.prepareAuthorization(params);
+  }
+
+  private async prepareAuthorization(params: SessionAuthorizationParams): Promise<GhostLinkAuthorization> {
+    if (!this.config.prover) throw new Error("no prover configured");
+    const signer = copySessionPublicKey(params.session);
     const { input, appId } = buildLoginInput({
       identity: params.identity,
       origin: this.origin(),
@@ -245,7 +287,7 @@ export class GhostLink {
 
   // ---- pocket -------------------------------------------------------------
 
-  pocketFor(session: GhostLinkSession, home: Uint8Array, policy?: Policy): PocketHandle {
+  pocketFor(session: GhostLinkAuthorization, home: Uint8Array, policy?: Policy): PocketHandle {
     return derivePocket(session.appId, home, policy ?? conservativePolicy());
   }
 
@@ -274,7 +316,7 @@ export class GhostLink {
    * never disagree with what was proved.
    */
   async openSession(
-    session: GhostLinkSession,
+    session: GhostLinkAuthorization,
     pocket: PocketHandle,
     claimFields: { mint: Uint8Array; threshold: bigint; minSlot: bigint; claim: boolean },
     roots?: { registry: FieldElement; census: FieldElement },

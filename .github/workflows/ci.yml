@@ -39,6 +39,7 @@ jobs:
       - run: pnpm -r build
       - run: pnpm -r typecheck
       - run: pnpm -r test
+      - run: pnpm test:package
       - run: pnpm audit --prod --audit-level=high
 
   circuits:

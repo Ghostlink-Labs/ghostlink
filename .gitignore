@@ -4,6 +4,7 @@ dist/
 .next/
 *.tsbuildinfo
 coverage/
+/artifacts/sdk/
 
 # Rust / Solana
 target/

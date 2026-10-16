@@ -21,6 +21,8 @@ Pocket state, home addresses, deposits, withdrawals and transactions are public.
 
 ## Develop
 
+Integration work is tracked in [mainnet readiness and the compatibility matrix](docs/MAINNET-READINESS.md). For bot/public-key authorization, see [integration boundaries](docs/INTEGRATIONS.md) and [SDK installation](packages/sdk/README.md). This development SDK refuses mainnet configuration; it does not yet support unattended new-token sniping or Token-2022 settlement.
+
 Use Node 22 and the pnpm version in `package.json`:
 
 ```bash

@@ -3,7 +3,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { bytesToHex, policyHash, type IntentSubmission } from "@ghostlink/common";
 import { POCKET, isPocketNonceUsed, pocketPda, readPocketAccount } from "@ghostlink/service-kit";
 import bs58 from "bs58";
-import { SubmissionJournal, type Attempt, type IntentIdentity, type PreparedTransaction } from "./journal.js";
+import { SubmissionJournal, type Attempt, type IntentIdentity, type PreparedTransaction, type RecoverySession } from "./journal.js";
 import type { ValidatedIntent } from "./validate.js";
 
 export type SubmissionChain = Pick<Connection, "getGenesisHash" | "getSlot" | "getAccountInfoAndContext" |
@@ -44,6 +44,49 @@ export class SubmissionCoordinator {
     if (!Number.isSafeInteger(value) || value < minimum) throw new Error("RPC context is stale");
   }
 
+  async #recovery(pocket: PublicKey) {
+    const recoveryId = this.#journal.recoveryId;
+    if (!recoveryId) return;
+    await this.#genesis();
+    const head = await this.#rpc(this.#chain.getSlot("finalized")); this.#context(head, 0);
+    const floor = this.#journal.recoverySlot(pocket.toBase58());
+    if (floor === undefined) throw new IntentAuthorizationError("restored journal requires a fresh owner session recovery plan");
+    const minimum = Math.max(head, floor);
+    const response = await this.#rpc(this.#chain.getAccountInfoAndContext(pocket, { commitment: "finalized", minContextSlot: minimum }));
+    this.#context(response.context.slot, minimum);
+    if (!response.value) throw new IntentAuthorizationError("recovery pocket not found");
+    const account = readPocketAccount(response.value);
+    if (!pocketPda(account.appId).equals(pocket)) throw new IntentAuthorizationError();
+    const rotated = this.#journal.recoveredAuthority(pocket.toBase58(), {
+      sessionKind: account.sessionKind, sessionKeyHex: bytesToHex(account.sessionKey),
+      maxSessionExpirySlot: account.maxSessionExpirySlot.toString(), slot: response.context.slot,
+    });
+    return { recoveryId, account, slot: response.context.slot,
+      rotationRequired: !rotated || account.sessionExpirySlot <= BigInt(response.context.slot) };
+  }
+
+  /** Trusted operator only: pin a newly generated key before owner installation; omit it to poll finalization. */
+  async prepareRecovery(pocket: string, expected?: RecoverySession): Promise<{ recoveryId?: string; rotationRequired: boolean; slot?: number }> {
+    expected = expected ? structuredClone(expected) : undefined;
+    const address = new PublicKey(pocket);
+    if (expected) {
+      await this.#genesis();
+      const head = await this.#rpc(this.#chain.getSlot("confirmed")); this.#context(head, 0);
+      const minimum = Math.max(head, this.#journal.authorizationSlot(pocket));
+      const response = await this.#rpc(this.#chain.getAccountInfoAndContext(address, { commitment: "confirmed", minContextSlot: minimum }));
+      this.#context(response.context.slot, minimum);
+      if (!response.value) throw new IntentAuthorizationError("recovery pocket not found");
+      const account = readPocketAccount(response.value);
+      if (!pocketPda(account.appId).equals(address)) throw new IntentAuthorizationError();
+      this.#journal.prepareRecovery(pocket, { sessionKind: account.sessionKind, sessionKeyHex: bytesToHex(account.sessionKey),
+        maxSessionExpirySlot: account.maxSessionExpirySlot.toString(), slot: response.context.slot }, expected);
+      // The durable plan is ready; wait for owner installation before polling finalized state.
+      return { recoveryId: this.#journal.recoveryId, rotationRequired: true, slot: response.context.slot };
+    }
+    const state = await this.#recovery(address);
+    return state ? { recoveryId: state.recoveryId, rotationRequired: state.rotationRequired, slot: state.slot } : { rotationRequired: false };
+  }
+
   /** On-chain authority is checked before creating any durable nonce claim or preparing fees. */
   async authorize(v: ValidatedIntent, minimumSlot = 0): Promise<number> {
     const id = bytesToHex(v.hash), prior = this.#journal.get(id);
@@ -59,12 +102,20 @@ export class SubmissionCoordinator {
     const a = readPocketAccount(response.value);
     if (!pocketPda(a.appId).equals(pocket)) throw new IntentAuthorizationError();
     this.#journal.observePocketContext(pocket.toBase58(), response.context.slot);
+    const recovery = await this.#recovery(pocket);
+    if (recovery && (recovery.rotationRequired || recovery.account.sessionKind !== a.sessionKind ||
+      !Buffer.from(recovery.account.sessionKey).equals(Buffer.from(a.sessionKey)))) {
+      throw new IntentAuthorizationError("restored journal requires a fresh owner session finalized after the recovery baseline");
+    }
+    const authorizationSlot = Math.max(response.context.slot, recovery?.slot ?? 0);
     const key = new Uint8Array(33); key.set(v.sessionKey);
-    if (a.sessionKind !== v.sessionKind ||
-      !Buffer.from(a.sessionKey).equals(Buffer.from(key)) || !Buffer.from(policyHash(a.policy)).equals(Buffer.from(v.intent.policyHash)) ||
-      a.sessionExpirySlot <= BigInt(response.context.slot) || v.intent.deadlineSlot < BigInt(response.context.slot) ||
-      isPocketNonceUsed(a, v.intent.nonce)) throw new IntentAuthorizationError();
-    return response.context.slot;
+    for (const account of recovery ? [a, recovery.account] : [a]) {
+      if (account.sessionKind !== v.sessionKind ||
+        !Buffer.from(account.sessionKey).equals(Buffer.from(key)) || !Buffer.from(policyHash(account.policy)).equals(Buffer.from(v.intent.policyHash)) ||
+        account.sessionExpirySlot <= BigInt(authorizationSlot) || v.intent.deadlineSlot < BigInt(authorizationSlot) ||
+        isPocketNonceUsed(account, v.intent.nonce)) throw new IntentAuthorizationError();
+    }
+    return authorizationSlot;
   }
 
   #validatePrepared(p: PreparedTransaction, minSlot: number): void {

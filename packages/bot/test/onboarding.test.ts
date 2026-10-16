@@ -18,7 +18,7 @@ function world() {
   const key = randomBytes(32);
   const stores: BotKeyStore[] = [];
   cleanup.push(() => { for (const s of stores) s.close(); });
-  const store = () => { const s = new BotKeyStore(path, key); stores.push(s); return s; };
+  const store = (file = path) => { const s = new BotKeyStore(file, key); stores.push(s); return s; };
   let now = NOW;
   let head = 100;
   let context = 100;
@@ -48,6 +48,36 @@ function world() {
 }
 
 describe("durable bot authorization", () => {
+  it("retires restored keys, preserves order reservations, and requires fresh owner consent after a real backup", async () => {
+    const w = world(), store = w.store(), manager = w.manager(store);
+    const { consent: old } = await manager.create(initData(), w.input);
+    w.activate(old); await manager.confirm(initData(), old.id);
+    await manager.signIntent(old.id, USER, w.intent);
+    const archive = w.path + ".enc"; await store.backupTo(archive);
+    // This still-valid signature exists outside the backup and the chain's unused nonce bitmap.
+    await manager.signIntent(old.id, USER, { ...w.intent, nonce: 8n });
+    const restoredPath = BotKeyStore.restoreBackup(archive, w.path + "-restored", w.key);
+    const restored = w.manager(w.store(restoredPath));
+    expect(restored.status(initData(), old.id).state).toBe("cancelled");
+    await expect(restored.signIntent(old.id, USER, w.intent)).rejects.toThrow(/not active/);
+    await expect(restored.confirm(initData(), old.id)).rejects.toThrow(/no longer pending/);
+    const { consent: fresh } = await restored.create(initData(), { ...w.input, requestKey: "dc".repeat(16), sessionExpirySlot: "1100" });
+    expect(fresh.sessionKeyHex).not.toBe(old.sessionKeyHex);
+    await expect(restored.confirm(initData(), fresh.id)).rejects.toThrow(/permissions/);
+    w.activate(fresh); await restored.confirm(initData(), fresh.id);
+    await expect(restored.signIntent(fresh.id, USER, w.intent)).rejects.toThrow(/nonce/);
+    const signed = await restored.signIntent(fresh.id, USER, { ...w.intent, nonce: 8n });
+    const publicKey = createPublicKey({ format: "der", type: "spki", key: Buffer.concat([
+      Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(fresh.sessionKeyHex, "hex"),
+    ]) });
+    expect(verify(null, intentHash(signed.intent), publicKey, signed.signature.signature)).toBe(true);
+    // Ordinary restart does not cancel newly installed consent; another RESTORE must do so.
+    expect(w.manager(w.store(restoredPath)).status(initData(), fresh.id).state).toBe("confirmed");
+    const againArchive = w.path + ".again.enc"; await w.store(restoredPath).backupTo(againArchive);
+    const again = BotKeyStore.restoreBackup(againArchive, w.path + "-again", w.key);
+    expect(w.manager(w.store(again)).status(initData(), fresh.id).state).toBe("cancelled");
+  });
+
   it("keeps one encrypted key across duplicate requests and process-style restart, then signs only after chain confirmation", async () => {
     const w = world(); const manager = w.manager();
     const a = await manager.create(initData(), w.input);

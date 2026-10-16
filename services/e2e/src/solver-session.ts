@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { once } from "node:events";
 import { AddressLookupTableProgram, PublicKey, Transaction, VersionedTransaction, type Connection, type Keypair } from "@solana/web3.js";
 import { POCKET_PROGRAM_ID } from "@ghostlink/common";
-import { SubmissionJournal } from "@ghostlink/solver/journal";
+import { SubmissionJournal, type RecoverySession } from "@ghostlink/solver/journal";
+import { SubmissionCoordinator } from "@ghostlink/solver/submission";
 import { buildServer, MockPlanner, type RoutePlanner } from "@ghostlink/solver/server";
 import { ataAddress } from "@ghostlink/service-kit";
 
@@ -26,7 +27,7 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
   const setupResult = await connection.confirmTransaction({ signature: setupSignature, ...lifetime }, "finalized");
   if (setupResult.value.err) throw new Error("lookup-table fixture setup failed");
   const dir = mkdtempSync(join(tmpdir(), "ghostlink-solver-e2e-"));
-  const path = join(dir, "solver.sqlite"), key = randomBytes(32);
+  let path = join(dir, "solver.sqlite"); const key = randomBytes(32);
   const scope = { genesisHash: await connection.getGenesisHash(), pocketProgram: POCKET_PROGRAM_ID, solver: keypair.publicKey.toBase58() };
   let journal = new SubmissionJournal(path, key, scope);
   let first = true, plans = 0, simulations = 0, feeChecks = 0;
@@ -77,6 +78,16 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
   const stop = () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   await listen();
   return { get url() { return url; },
+    backup: () => journal.backupTo(join(dir, "backup.enc")),
+    async restore() {
+      await stop(); journal.close();
+      path = SubmissionJournal.restoreBackup(join(dir, "backup.enc"), join(dir, "restored"), key, scope);
+      journal = new SubmissionJournal(path, key, scope); server = build(); return listen();
+    },
+    prepareRecovery: (pocket: string, expected?: RecoverySession) => new SubmissionCoordinator(connection, journal).prepareRecovery(pocket, expected),
+    assertNoTransactions() {
+      if (plans || packets.size) throw new Error("quarantined solver prepared or broadcast a transaction");
+    },
     async restart() {
       if (first) throw new Error("fixture never reached the lost-acknowledgment boundary", { cause: broadcastFailure });
       await stop(); journal.close(); journal = new SubmissionJournal(path, key, scope); server = build(); return listen();

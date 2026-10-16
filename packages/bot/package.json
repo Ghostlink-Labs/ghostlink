@@ -4,7 +4,7 @@
   "description": "Localnet candidate for authenticated Telegram bot onboarding and encrypted delegated session storage.",
   "license": "Apache-2.0",
   "type": "module",
-  "engines": { "node": "^22.13.0 || ^24.0.0" },
+  "engines": { "node": "^22.16.0 || ^24.0.0" },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": { ".": "./dist/index.js" },

@@ -1,10 +1,10 @@
 # Transaction recovery for the V2 solver
 
-Status: localnet candidate. The bot allocates and persists an immutable signed intent; the solver simulates a version-0 message, records the signed transaction before broadcasting it, then reconciles that exact signature. It still uses an inventory route. Jupiter route validation, strategy jobs, aggregate spending budgets, production deployment and independent review remain open release gates.
+Status: localnet candidate. The bot allocates and persists an immutable signed intent; the solver simulates a version-0 message, records the signed transaction before broadcasting it, then reconciles that exact signature. Inventory and a restricted Jupiter/Raydium CP route are available for local verification. Actual provider-response coverage, strategy jobs, aggregate spending budgets, production deployment and independent review remain open release gates.
 
 ## Operator configuration
 
-The solver requires Node 22.13+ within the 22 release line, or Node 24, and these operator-supplied values:
+The solver requires Node 22.16+ within the 22 release line, or Node 24, and these operator-supplied values:
 
 | Variable | Meaning |
 | --- | --- |
@@ -20,7 +20,7 @@ The solver requires Node 22.13+ within the 22 release line, or Node 24, and thes
 
 The journal is bound to genesis, Pocket program and solver public key. A different identity or encryption key cannot reopen it. Known devnet/mainnet genesis hashes are refused for this incompatible V2 candidate. Bot consent and solver journals use separate files and namespaces. Use service-account-only file permissions (explicit ACLs on Windows), local disks, and protected backups. Never store key files beside public source or log request credentials. Signed but unbroadcast transactions are sensitive authorization material.
 
-Records, transaction bytes, preparation leases and observations are encrypted with AES-256-GCM. Lookup columns contain the intent hash, pocket and nonce in plaintext; treat the entire database and WAL as sensitive. SQLite WAL with FULL synchronization commits before broadcast. This provides local transactional persistence, not a multi-host database or proof of a successful backup/restore drill. Restoring an old journal without reconciling outstanding transactions can lose idempotency history and is not a supported automatic recovery procedure.
+Records, transaction bytes, preparation leases and observations are encrypted with AES-256-GCM. Lookup columns contain the intent hash, pocket and nonce in plaintext; treat the entire database and WAL as sensitive. SQLite WAL with FULL synchronization commits before broadcast. The [backup/restore procedure](BACKUP-RESTORE.md) adds authenticated whole-database snapshots, retirement of restored bot keys and explicit finalized owner rotation for restored solvers. A real local validator drill passes. Multi-host cutover and automatic business-history reconciliation remain unsupported; an old journal must never simply reopen for trading.
 
 ## Request and status contract
 

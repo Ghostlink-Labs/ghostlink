@@ -27,26 +27,30 @@ function world() {
   const stores: SubmissionJournal[] = [];
   cleanup.push(() => { for (const s of stores) s.close(); key.fill(0); });
   let now = 1_800_000_000_000;
-  const journal = () => { const j = new SubmissionJournal(path, key, scope, () => now); stores.push(j); return j; };
+  const journal = (file = path) => { const j = new SubmissionJournal(file, key, scope, () => now); stores.push(j); return j; };
   const policy = conservativePolicy(), pocket = pocketPda(fieldToBytes32(23n));
   const intent = { pocket: pocket.toBytes(), nonce: 7n, inMint: randomBytes(32), inMax: 10n,
     outMint: randomBytes(32), outMin: 9n, deadlineSlot: 900n, policyHash: policyHash(policy) };
   const v: ValidatedIntent = { intent, hash: intentHash(intent), sessionKind: 0, sessionKey: session.publicKey.toBytes(), signature: ed25519.sign(intentHash(intent), session.secretKey.subarray(0, 32)) };
+  let currentSession = session, maximumExpiry = 1000n;
   let used = false, expiry = 1000n, head = 100, context = 100, genesis = scope.genesisHash, height = 200, finalizedHeight = 200;
   let status: SignatureStatus | null = null, validHash = true, accountContext = 100;
+  let finalizedContext: number | undefined;
   const account = () => {
     const w = new BorshWriter().fixed(createHash("sha256").update("account:PocketV3").digest().subarray(0, 8))
       .fixed(fieldToBytes32(23n)).fixed(fieldToBytes32(domainHash("https://bot.example.com"))).fixed(solver.publicKey.toBytes())
-      .u8(0).fixed(Buffer.concat([session.publicKey.toBuffer(), Buffer.alloc(1)])).u64(expiry);
+      .u8(0).fixed(Buffer.concat([currentSession.publicKey.toBuffer(), Buffer.alloc(1)])).u64(expiry);
     writePolicy(w, policy); w.u8(0).u64(0n).u64(0n);
     const bitmap = new Uint8Array(256); if (used) bitmap[0] = 128;
-    w.fixed(bitmap).u8(PublicKey.findProgramAddressSync([Buffer.from("pocket"), Buffer.from(fieldToBytes32(23n))], POCKET)[1]).u64(1000n).u64(0n).u64(0n);
+    w.fixed(bitmap).u8(PublicKey.findProgramAddressSync([Buffer.from("pocket"), Buffer.from(fieldToBytes32(23n))], POCKET)[1]).u64(maximumExpiry).u64(0n).u64(0n);
     const data = Buffer.alloc(3293); data.set(w.out());
     return { data, owner: POCKET, executable: false, lamports: 1 };
   };
   const chain = {
-    getGenesisHash: vi.fn(async () => genesis), getSlot: vi.fn(async () => head),
-    getAccountInfoAndContext: vi.fn(async () => ({ context: { slot: accountContext }, value: account() })),
+    getGenesisHash: vi.fn(async () => genesis), getSlot: vi.fn(async (commitment?: string) => commitment === "finalized" ? finalizedContext ?? head : head),
+    getAccountInfoAndContext: vi.fn(async (_key?: PublicKey, config?: { commitment?: string }) => ({
+      context: { slot: config?.commitment === "finalized" ? finalizedContext ?? accountContext : accountContext }, value: account(),
+    })),
     getSignatureStatuses: vi.fn(async () => ({ context: { slot: context }, value: [status] })),
     getBlockHeight: vi.fn(async (config: { commitment?: string }) => config.commitment === "finalized" ? finalizedHeight : height),
     isBlockhashValid: vi.fn(async () => ({ context: { slot: accountContext }, value: validHash })),
@@ -63,6 +67,13 @@ function world() {
   });
   const manager = (j = journal()) => new SubmissionCoordinator(chain as unknown as SubmissionChain, j, 1000);
   return { dir, path, key, scope, v, prepare, journal, manager, chain,
+    rotate: (newExpiry = 1100n, replaceKey: boolean | Keypair = true) => {
+      if (replaceKey) currentSession = typeof replaceKey === "boolean" ? Keypair.generate() : replaceKey;
+      expiry = maximumExpiry = newExpiry;
+      const next = { ...intent, nonce: 8n }, hash = intentHash(next);
+      return { ...v, intent: next, hash, sessionKey: currentSession.publicKey.toBytes(),
+        signature: ed25519.sign(hash, currentSession.secretKey.subarray(0, 32)) };
+    },
     intentAt: (nonce: bigint): ValidatedIntent => {
       const next = { ...intent, nonce }, hash = intentHash(next);
       return { ...v, intent: next, hash, signature: ed25519.sign(hash, session.secretKey.subarray(0, 32)) };
@@ -71,10 +82,59 @@ function world() {
     setStatus: (s: SignatureStatus | null) => { status = s; }, setContext: (s: number) => { context = s; },
     setGenesis: (g: string) => { genesis = g; }, setExpiry: () => { height = finalizedHeight = 501; validHash = false; context = accountContext = head = 700; },
     bank: (h: number, c = h) => { head = h; accountContext = c; }, restoreAuthority: () => { expiry = 1000n; },
+    finalizedBank: (slot: number) => { finalizedContext = slot; },
   };
 }
 
 describe("durable submission and reconciliation", () => {
+  it("quarantines a restored journal, including unseen pockets, until a finalized fresh owner session", async () => {
+    const w = world(), original = w.journal();
+    const archive = join(w.dir, "before-trades.enc"); await original.backupTo(archive);
+    await w.manager(original).submit(w.v, w.prepare); // Missing from backup, may still land on chain.
+    const restoredPath = SubmissionJournal.restoreBackup(archive, join(w.dir, "restored"), w.key, w.scope);
+    const restored = w.journal(restoredPath), manager = w.manager(restored);
+    await expect(manager.submit(w.v, w.prepare)).rejects.toThrow(/fresh owner session/);
+    expect(restored.get(identityFor(w.v).intentHashHex)).toBeUndefined();
+    expect(w.prepare).toHaveBeenCalledTimes(1); expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(1);
+    const newKey = Keypair.generate(), expected = { sessionKind: 0 as const, sessionKeyHex: newKey.publicKey.toBuffer().toString("hex") + "00" };
+    expect(await manager.prepareRecovery(identityFor(w.v).pocket, expected)).toMatchObject({ rotationRequired: true });
+    // Restart shares the same baseline, and a longer expiry alone is insufficient.
+    w.bank(110); w.setContext(110); const reusedKey = w.rotate(1100n, false);
+    await expect(w.manager(w.journal(restoredPath)).submit(reusedKey, w.prepare)).rejects.toThrow(/fresh owner session/);
+    const notNewer = w.rotate(1000n); await expect(manager.submit(notNewer, w.prepare)).rejects.toThrow(/fresh owner session/);
+    const delayedOldRotation = w.rotate(1200n);
+    await expect(manager.submit(delayedOldRotation, w.prepare)).rejects.toThrow(/fresh owner session/);
+    const fresh = w.rotate(1300n, newKey);
+    expect(await manager.prepareRecovery(identityFor(fresh).pocket)).toMatchObject({ rotationRequired: false });
+    // Confirmed head normally leads finalized. Separate monotonic floors must permit this.
+    w.bank(140); w.setContext(140); w.finalizedBank(110);
+    await manager.submit(fresh, w.prepare);
+    expect(w.prepare).toHaveBeenCalledTimes(2); expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(2);
+    expect(w.chain.getAccountInfoAndContext).toHaveBeenCalledWith(expect.any(PublicKey), { commitment: "finalized", minContextSlot: 110 });
+    w.finalizedBank(109);
+    await expect(manager.authorize(fresh)).rejects.toThrow(/stale/);
+    w.finalizedBank(110);
+    await expect(manager.submit(w.v, w.prepare)).rejects.toThrow(/authorized/);
+    const again = join(w.dir, "again.enc"); await restored.backupTo(again);
+    const twice = w.journal(SubmissionJournal.restoreBackup(again, join(w.dir, "twice"), w.key, w.scope));
+    await expect(w.manager(twice).prepareRecovery(identityFor(fresh).pocket)).rejects.toThrow(/recovery plan/);
+  });
+
+  it("retains exact restored transaction identities for reconciliation but refuses rebroadcast without rotation", async () => {
+    const w = world(), original = w.journal(); await w.manager(original).submit(w.v, w.prepare);
+    const before = original.get(identityFor(w.v).intentHashHex)!;
+    const archive = join(w.dir, "pending.enc"); await original.backupTo(archive);
+    const restored = w.journal(SubmissionJournal.restoreBackup(archive, join(w.dir, "restored"), w.key, w.scope));
+    const manager = w.manager(restored);
+    await manager.submit(w.v, w.prepare);
+    expect(w.prepare).toHaveBeenCalledTimes(1); expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(restored.get(identityFor(w.v).intentHashHex)?.transaction).toEqual(before.transaction);
+    w.setStatus({ slot: 100, confirmations: 0, err: null, confirmationStatus: "confirmed" });
+    expect(await manager.status(identityFor(w.v).intentHashHex)).toMatchObject({ state: "confirmed", signature: before.transaction!.signature });
+    expect(() => SubmissionJournal.restoreBackup(archive, join(w.dir, "wrong"), w.key,
+      { ...w.scope, solver: Keypair.generate().publicKey.toBase58() })).toThrow();
+  });
+
   it("shares refused authorization context across intents without allocating a trade, and migrates prior account floors", async () => {
     const w = world(), first = w.manager(); await first.submit(w.v, w.prepare);
     const other = w.intentAt(8n); w.bank(200); w.revoke();

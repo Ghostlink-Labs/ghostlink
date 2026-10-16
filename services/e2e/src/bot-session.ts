@@ -22,7 +22,7 @@ function initData() {
 export async function startBotFixture(connection: Connection, appOrigin: string, policy: Policy) {
   const dir = mkdtempSync(join(tmpdir(), "ghostlink-bot-e2e-"));
   const key = randomBytes(32);
-  const path = join(dir, "bot.sqlite");
+  let path = join(dir, "bot.sqlite");
   let store = new BotKeyStore(path, key);
   const options = { botToken: TOKEN, chain: connection, appOrigin, policy,
     deployment: { cluster: "localnet" as const, genesisHash: await connection.getGenesisHash(),
@@ -67,6 +67,13 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
     create: (input: CreateConsent) => post("/requests", input),
     confirm: (id: string) => post(`/requests/${id}/confirm`, {}),
     restart,
+    backup: () => store.backupTo(join(dir, "backup.enc")),
+    async restore() {
+      await stop(); store.close();
+      path = BotKeyStore.restoreBackup(join(dir, "backup.enc"), join(dir, "restored"), key);
+      store = new BotKeyStore(path, key); manager = new BotOnboarding({ ...options, store });
+      server = createBotAuthorizationServer(manager, ownerOrigin); await listen();
+    },
     prepare,
     async fill(consent: BotConsent, solverUrl: string, params: BotIntentParams, restartSolver: () => Promise<string>): Promise<{ signature: string; nonce: bigint }> {
       const { body, who, requestKey, signed } = await prepare(consent, params);

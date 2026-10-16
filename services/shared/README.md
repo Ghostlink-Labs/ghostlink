@@ -4,4 +4,6 @@ Shared protocol encoders, account readers, token helpers and HTTP primitives for
 
 This companion library is packed with `pnpm pack:bot`; a registry release is not implied. Its archive contains compiled code, declarations and license only. See the [bot backend guide](../../packages/bot/README.md) for installing the reviewed companion archives and their dependency overrides.
 
-The optional `@ghostlink/service-kit/storage` subpath provides Node-only encrypted SQLite storage shared by bot consent and solver journals. It requires Node 22.13+ within the 22 release line, or Node 24. SQLite transaction callbacks must be synchronous. It is not exported from the general entry point and must never enter a browser bundle.
+The optional `@ghostlink/service-kit/storage` subpath provides Node-only encrypted SQLite storage shared by bot consent and solver journals. It requires Node 22.16+ within the 22 release line, or Node 24. SQLite transaction callbacks must be synchronous. It is not exported from the general entry point and must never enter a browser bundle.
+
+Storage backups use SQLite's backup API and authenticate the complete snapshot. Restores create a new recovery epoch; bot and solver wrappers enforce different authority restrictions before resuming. Follow the [operator runbook](../../docs/BACKUP-RESTORE.md), rather than copying live database files or treating a restore as an ordinary restart.

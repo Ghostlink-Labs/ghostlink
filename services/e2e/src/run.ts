@@ -206,7 +206,7 @@ async function main() {
   const solFeedId = label("sol pyth feed");
   solverFixture = await startSolverFixture(connection, solverKp, priceAccounts, keepRunning ? demoPortBase + 2 : 0,
     { planner: forkPlanner, lookupAddresses: forkPlanner?.lookupAddresses, allowUnpriced: speculative });
-  const solverUrl = solverFixture.url;
+  let solverUrl = solverFixture.url;
   const actionsUrl = await listen(buildActions({ connection, baseUrl: keepRunning ? `http://127.0.0.1:${demoPortBase + 3}` : "http://e2e.local" }), 8790);
   ok(`services up (indexer ${indexerUrl})`);
 
@@ -313,16 +313,16 @@ async function main() {
   botFixture = await startBotFixture(connection, origin, policy);
   const request = { requestKey: "ab".repeat(16), appId: deriveAppId(identity.sField, deriveDomainHash(origin)).toString(),
     home: home.toBase58(), sessionExpirySlot: expirySlot.toString() };
-  const { consent } = await botFixture.create(request);
+  let { consent } = await botFixture.create(request);
   const session = sessionPublicKey(0, hexToBytes(consent.sessionKeyHex));
   ok("authenticated bot request created; owner received only the public session key");
-  const { input, appId, domainHash } = buildLoginInput({
+  const loginInputFor = (signer: typeof session, expires: bigint) => buildLoginInput({
     identity,
     origin,
     claim,
     minSlot,
-    session,
-    expirySlot,
+    session: signer,
+    expirySlot: expires,
     home: home.toBytes(),
     policy,
     witness: {
@@ -341,6 +341,7 @@ async function main() {
       },
     },
   });
+  const { input, appId, domainHash } = loginInputFor(session, expirySlot);
   const rawLogin = await prover.prove("login", input);
   const loginProof = {
     appId,
@@ -435,6 +436,45 @@ async function main() {
     // not the solver's: solver-paid rent would flow to the user's home
     // on sweep and could be farmed.
     await send([createAtaIdempotentIx(payer.publicKey, pocket, outputMint)], []);
+    if (process.env.RESTORE_DRILL === "1") {
+      // The fixtures have no concurrent producers here. Snapshots deliberately predate a released signature.
+      await botFixture.backup(); await solverFixture.backup();
+      const oldConsent = consent;
+      const params = { inMint: inputMint.toBytes(), inMax: 25_000_000n, outMint: outputMint.toBytes(),
+        outMin: BigInt(process.env.OUT_MIN ?? "160000000"), deadlineSlot: BigInt(await connection.getSlot("confirmed")) + 1500n };
+      const lostOrder = await botFixture.prepare(oldConsent, params);
+      await botFixture.restore(); solverUrl = await solverFixture.restore();
+      let refused = false;
+      try { await botFixture.prepare(oldConsent, params); } catch { refused = true; }
+      if (!refused) throw new Error("restored bot reused its old signing key");
+      const submitOld = () => fetch(`${solverUrl}/intent`, { method: "POST", headers: { "content-type": "application/json" }, body: lostOrder.body });
+      if ((await submitOld()).ok) throw new Error("unconfigured restored solver accepted a trade");
+      solverFixture.assertNoTransactions();
+      const nextExpiry = expirySlot + 1000n;
+      const next = await botFixture.create({ ...request, requestKey: "dc".repeat(16), sessionExpirySlot: nextExpiry.toString() });
+      if (next.consent.sessionKeyHex === oldConsent.sessionKeyHex) throw new Error("recovery reused a session key");
+      await solverFixture.prepareRecovery(pocket.toBase58(), { sessionKind: 0, sessionKeyHex: next.consent.sessionKeyHex + "00" });
+      if ((await submitOld()).ok) throw new Error("restored solver traded before owner rotation");
+      solverFixture.assertNoTransactions();
+      const nextSigner = sessionPublicKey(0, hexToBytes(next.consent.sessionKeyHex));
+      const nextRaw = await prover.prove("login", loginInputFor(nextSigner, nextExpiry).input);
+      const nextSession = { ...glSession, signer: nextSigner, expirySlot: nextExpiry,
+        proof: { ...loginProof, proof: proofToBytes(nextRaw.proof as SnarkjsProof), snarkjsProof: nextRaw.proof as object,
+          publicSignals: nextRaw.publicSignals, publicInputBytes: publicSignalsToBytes(nextRaw.publicSignals) } };
+      await gl.openSession(nextSession, gl.pocketFor(nextSession, home.toBytes(), policy),
+        { mint: inputMint.toBytes(), threshold: claim.amount, minSlot, claim: true }, { registry: regPath.root, census: cenPath.root }, domainHash);
+      const until = Date.now() + 60_000;
+      for (;;) {
+        try { if (!(await solverFixture.prepareRecovery(pocket.toBase58())).rotationRequired) break; }
+        catch (error) { if (Date.now() >= until) throw error; }
+        if (Date.now() >= until) throw new Error("owner recovery rotation did not finalize");
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      await botFixture.confirm(next.consent.id); consent = next.consent;
+      if ((await submitOld()).ok) throw new Error("pre-backup authority still accepted after recovery");
+      solverFixture.assertNoTransactions();
+      ok("encrypted bot and solver backups restored; old signature refused before and after finalized owner rotation");
+    }
     const deadline = BigInt(await connection.getSlot("confirmed")) + 500n;
     const tx = await botFixture.fill(consent, solverUrl, {
       inMint: inputMint.toBytes(),

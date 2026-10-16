@@ -40,10 +40,26 @@ export class BotKeyStore {
           this.#advanceContext(consent, Math.max(slot, this.authorizationSlot(consent)));
         }
       }
+      const recoveryId = this.#storage.recoveryId;
+      if (recoveryId) {
+        const aad = "ghostlink:bot-store:restore-applied:v1";
+        const row = this.#db.prepare("SELECT value FROM metadata WHERE name='bot-restore-applied-v1'").get();
+        const applied = row ? this.#openJson<string>(row.value as Uint8Array, aad) : undefined;
+        if (applied !== recoveryId) {
+          // A snapshot can omit signatures issued later. Never reactivate any restored signing key.
+          this.#db.exec("UPDATE consent SET encrypted_key=NULL, state=CASE WHEN state IN ('pending','confirmed') THEN 'cancelled' ELSE state END");
+          this.#db.prepare("INSERT INTO metadata VALUES ('bot-restore-applied-v1', ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value")
+            .run(this.#sealJson(recoveryId, aad));
+        }
+      }
     }); } catch (error) { this.#storage.close(); throw error; }
   }
 
   close(): void { this.#storage.close(); }
+  backupTo(destination: string): Promise<void> { return this.#storage.backupTo(destination); }
+  static restoreBackup(archive: string, newDirectory: string, key: Uint8Array): string {
+    return EncryptedSqlite.restoreBackup(archive, newDirectory, key, "ghostlink:bot-store");
+  }
   #transaction<T>(fn: () => T): T { return this.#storage.transaction(fn); }
   #encrypt(value: Uint8Array, aad: string): Buffer { return this.#storage.seal(value, aad); }
   #decrypt(value: Uint8Array, aad: string): Buffer { return this.#storage.open(value, aad); }

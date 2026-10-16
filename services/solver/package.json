@@ -5,7 +5,7 @@
   "description": "Localnet reference solver with encrypted transaction persistence, explicit confirmation states and atomic bounded-intent settlement.",
   "license": "Apache-2.0",
   "type": "module",
-  "engines": { "node": "^22.13.0 || ^24.0.0" },
+  "engines": { "node": "^22.16.0 || ^24.0.0" },
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js",
@@ -13,7 +13,8 @@
     "./validate": "./dist/validate.js",
     "./jupiter": "./dist/jupiter.js",
     "./raydium": "./dist/raydium.js",
-    "./journal": "./dist/journal.js"
+    "./journal": "./dist/journal.js",
+    "./submission": "./dist/submission.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

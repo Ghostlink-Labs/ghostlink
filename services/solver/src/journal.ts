@@ -4,6 +4,17 @@ import { EncryptedSqlite } from "@ghostlink/service-kit/storage";
 import type { IntentSubmission } from "@ghostlink/common";
 
 export interface JournalScope { genesisHash: string; pocketProgram: string; solver: string }
+export interface RecoveryAuthority { sessionKind: number; sessionKeyHex: string; maxSessionExpirySlot: string; slot: number }
+export interface RecoverySession { sessionKind: 0 | 1; /** Account encoding: Ed25519 key + 00, or 33-byte P256 key. */ sessionKeyHex: string }
+interface RecoveryPlan { baseline: RecoveryAuthority; expected: RecoverySession; finalizedSlot: number }
+function journalNamespace(scope: JournalScope): string {
+  for (const id of [scope.genesisHash, scope.pocketProgram, scope.solver]) {
+    if (new PublicKey(id).toBase58() !== id) throw new Error("invalid journal deployment identity");
+  }
+  return "ghostlink:solver-journal:" + createHash("sha256").update(JSON.stringify({
+    genesisHash: scope.genesisHash, pocketProgram: scope.pocketProgram, solver: scope.solver,
+  })).digest("hex");
+}
 export interface IntentIdentity { intentHashHex: string; pocket: string; nonce: string; sessionKind: 0 | 1; sessionKeyHex: string }
 export interface PreparedTransaction {
   rawBase64: string; signature: string; blockhash: string;
@@ -31,16 +42,13 @@ export class SubmissionJournal {
   get scope(): Readonly<JournalScope> { return this.#scope; }
 
   constructor(path: string, key: Uint8Array, scope: JournalScope, clock = Date.now) {
-    for (const id of [scope.genesisHash, scope.pocketProgram, scope.solver]) {
-      if (new PublicKey(id).toBase58() !== id) throw new Error("invalid journal deployment identity");
-    }
     this.#scope = Object.freeze({ genesisHash: scope.genesisHash, pocketProgram: scope.pocketProgram, solver: scope.solver });
-    const binding = createHash("sha256").update(JSON.stringify(this.#scope)).digest("hex");
-    this.#storage = new EncryptedSqlite(path, key, "ghostlink:solver-journal:" + binding);
+    this.#storage = new EncryptedSqlite(path, key, journalNamespace(this.#scope));
     this.#clock = clock;
     try { this.#storage.transaction(() => {
       const hasContexts = this.#storage.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pocket_contexts'").get();
-      this.#storage.db.exec(`CREATE TABLE IF NOT EXISTS pocket_contexts (pocket TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;
+      this.#storage.db.exec(`CREATE TABLE IF NOT EXISTS pocket_recovery (epoch TEXT NOT NULL, pocket TEXT NOT NULL, record BLOB NOT NULL, PRIMARY KEY(epoch,pocket)) STRICT;
+      CREATE TABLE IF NOT EXISTS pocket_contexts (pocket TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS attempts (
       id TEXT PRIMARY KEY, pocket TEXT NOT NULL, nonce TEXT NOT NULL, record BLOB NOT NULL,
       UNIQUE(pocket, nonce)
@@ -54,6 +62,59 @@ export class SubmissionJournal {
   }
 
   close(): void { this.#storage.close(); }
+  backupTo(destination: string): Promise<void> { return this.#storage.backupTo(destination); }
+  static restoreBackup(archive: string, newDirectory: string, key: Uint8Array, scope: JournalScope): string {
+    return EncryptedSqlite.restoreBackup(archive, newDirectory, key, journalNamespace(scope));
+  }
+  get recoveryId(): string | undefined { return this.#storage.recoveryId; }
+
+  #validateAuthority(authority: RecoveryAuthority): void {
+    if (![0, 1].includes(authority.sessionKind) || !/^[0-9a-f]{66}$/.test(authority.sessionKeyHex) ||
+      !/^(0|[1-9][0-9]{0,19})$/.test(authority.maxSessionExpirySlot) ||
+      BigInt(authority.maxSessionExpirySlot) > 0xffffffffffffffffn || !Number.isSafeInteger(authority.slot) || authority.slot < 0) throw new Error("invalid recovery authority");
+  }
+  #recoveryAad(pocket: string): string { return JSON.stringify([this.#scope, "recovery-plan:v1", this.recoveryId, pocket]); }
+  #recoveryPlan(pocket: string): RecoveryPlan | undefined {
+    const row = this.#storage.db.prepare("SELECT record FROM pocket_recovery WHERE epoch=? AND pocket=?").get(this.recoveryId ?? "", pocket);
+    if (!row) return;
+    const plain = this.#storage.open(row.record as Uint8Array, this.#recoveryAad(pocket));
+    try { return JSON.parse(plain.toString()) as RecoveryPlan; } finally { plain.fill(0); }
+  }
+  #saveRecovery(pocket: string, plan: RecoveryPlan): void {
+    this.#storage.db.prepare("INSERT INTO pocket_recovery VALUES (?,?,?) ON CONFLICT(epoch,pocket) DO UPDATE SET record=excluded.record")
+      .run(this.recoveryId!, pocket, this.#storage.seal(Buffer.from(JSON.stringify(plan)), this.#recoveryAad(pocket)));
+  }
+  recoverySlot(pocket: string): number | undefined {
+    const plan = this.#recoveryPlan(pocket);
+    return plan ? Math.max(plan.baseline.slot, plan.finalizedSlot) : undefined;
+  }
+  /** Trusted operator API: pin a freshly generated key BEFORE its owner installs it on chain. */
+  prepareRecovery(pocket: string, authority: RecoveryAuthority, expected: RecoverySession): void {
+    if (!this.recoveryId) throw new Error("journal was not restored");
+    this.#validateAuthority(authority);
+    if (![0, 1].includes(expected.sessionKind) || !/^[0-9a-f]{66}$/.test(expected.sessionKeyHex) ||
+      (expected.sessionKind === 0 && !expected.sessionKeyHex.endsWith("00"))) throw new Error("invalid expected recovery key");
+    this.#storage.transaction(() => {
+      this.#advanceContext(pocket, authority.slot);
+      const prior = this.#recoveryPlan(pocket);
+      if (prior?.expected.sessionKind === expected.sessionKind && prior.expected.sessionKeyHex === expected.sessionKeyHex) return;
+      if (authority.sessionKind === expected.sessionKind && authority.sessionKeyHex === expected.sessionKeyHex) throw new Error("recovery requires a different freshly generated key");
+      this.#saveRecovery(pocket, { baseline: structuredClone(authority), expected: structuredClone(expected), finalizedSlot: prior?.finalizedSlot ?? 0 });
+    });
+  }
+  /** Caller must verify finalized account ownership, layout, PDA and RPC genesis first. */
+  recoveredAuthority(pocket: string, authority: RecoveryAuthority): boolean {
+    if (!this.recoveryId) return true;
+    this.#validateAuthority(authority);
+    return this.#storage.transaction(() => {
+      const plan = this.#recoveryPlan(pocket);
+      if (!plan) return false;
+      if (authority.slot < Math.max(plan.baseline.slot, plan.finalizedSlot)) throw new Error("finalized recovery context is stale");
+      plan.finalizedSlot = authority.slot; this.#saveRecovery(pocket, plan);
+      return authority.slot > plan.baseline.slot && BigInt(authority.maxSessionExpirySlot) > BigInt(plan.baseline.maxSessionExpirySlot) &&
+        authority.sessionKind === plan.expected.sessionKind && authority.sessionKeyHex === plan.expected.sessionKeyHex;
+    });
+  }
   #contextAad(pocket: string): string { return JSON.stringify([this.#scope, "pocket-authority:v1", pocket]); }
   authorizationSlot(pocket: string): number {
     const row = this.#storage.db.prepare("SELECT record FROM pocket_contexts WHERE pocket=?").get(pocket);

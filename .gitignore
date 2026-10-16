@@ -50,6 +50,7 @@ services/e2e/.genesis/
 *.sqlite-*
 *.db
 *.db-*
+*.enc
 keys/
 # circuits/keys holds PUBLIC verifying keys and fixture proofs that the
 # TypeScript, Rust and LiteSVM suites read; the dev zkeys stay ignored above.

@@ -48,3 +48,5 @@ GhostLink limits what a pocket session can authorize; it does not make a page sa
 - A bounty scoped to programs, circuits and SDK is planned for M4; do not present that plan as an active program without published launch terms.
 
 PocketV3 speculative accounting, loss-taking semantics, policy transitions and remaining review gates are specified in [ADR 0004](adr/0004-bounded-speculative-trading.md). Acquisition-cost exposure is not mark-to-market risk.
+
+Recovery also handles token accounts transferred to the pocket while retaining a foreign close authority. New fills refuse such output accounts. A sweep still transfers their entire token balance home and leaves the empty account for its close authority; failure to reclaim rent cannot block token recovery. Two real SPL `SetAuthority` regressions reproduce the original withdrawal failure and verify the fix.

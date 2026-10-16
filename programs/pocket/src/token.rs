@@ -15,6 +15,13 @@ pub struct ParsedTokenAccount {
     pub mint: Pubkey,
     pub owner: Pubkey,
     pub amount: u64,
+    pub close_authority: Option<Pubkey>,
+}
+
+impl ParsedTokenAccount {
+    pub fn can_close(&self, owner: &Pubkey) -> bool {
+        self.close_authority.map_or(true, |authority| authority == *owner)
+    }
 }
 
 /// Parses an SPL token account, verifying it is owned by the SPL Token
@@ -25,10 +32,16 @@ pub fn parse_token_account(info: &AccountInfo) -> Result<ParsedTokenAccount> {
     let data = info.try_borrow_data()?;
     require!(data.len() == 165, PocketError::BadTokenAccount);
     require!(data[108] == 1, PocketError::BadTokenAccount); // initialized, not frozen
+    let close_authority = match &data[129..133] {
+        [0, 0, 0, 0] => None,
+        [1, 0, 0, 0] => Some(Pubkey::try_from(&data[133..165]).unwrap()),
+        _ => return err!(PocketError::BadTokenAccount),
+    };
     Ok(ParsedTokenAccount {
         mint: Pubkey::try_from(&data[0..32]).unwrap(),
         owner: Pubkey::try_from(&data[32..64]).unwrap(),
         amount: u64::from_le_bytes(data[64..72].try_into().unwrap()),
+        close_authority,
     })
 }
 

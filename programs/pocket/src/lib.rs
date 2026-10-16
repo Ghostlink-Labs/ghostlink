@@ -327,7 +327,7 @@ pub mod ghostlink_pocket {
         require!(solver_in.mint == args.in_mint, PocketError::BadTokenAccount);
         let pocket_out = parse_token_account(&ctx.accounts.pocket_out_account)?;
         require!(
-            pocket_out.owner == pocket_key && pocket_out.mint == args.out_mint,
+            pocket_out.owner == pocket_key && pocket_out.mint == args.out_mint && pocket_out.can_close(&pocket_key),
             PocketError::BadTokenAccount
         );
 
@@ -426,7 +426,7 @@ pub mod ghostlink_pocket {
 
         let pocket_out = parse_token_account(&ctx.accounts.pocket_out_account)?;
         require!(
-            pocket_out.owner == pocket_key && pocket_out.mint == args.out_mint,
+            pocket_out.owner == pocket_key && pocket_out.mint == args.out_mint && pocket_out.can_close(&pocket_key),
             PocketError::BadTokenAccount
         );
         let received = pocket_out
@@ -534,13 +534,17 @@ pub mod ghostlink_pocket {
                     seeds,
                 )?;
             }
-            close_pocket_account(
-                src_info,
-                &ctx.accounts.home.to_account_info(),
-                &pocket.to_account_info(),
-                &ctx.accounts.token_program.to_account_info(),
-                seeds,
-            )?;
+            // A foreign close authority can survive an SPL owner change.
+            // It must not make an otherwise authorized withdrawal revert.
+            if src.can_close(&pocket_key) {
+                close_pocket_account(
+                    src_info,
+                    &ctx.accounts.home.to_account_info(),
+                    &pocket.to_account_info(),
+                    &ctx.accounts.token_program.to_account_info(),
+                    seeds,
+                )?;
+            }
             pocket.speculative_ledger.swept(src_info.key());
         }
 

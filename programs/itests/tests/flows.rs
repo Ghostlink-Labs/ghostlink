@@ -12,6 +12,8 @@
 mod common;
 #[path = "common/speculative_flows.rs"]
 mod speculative_flows;
+#[path = "common/recovery_flows.rs"]
+mod recovery_flows;
 
 use common::*;
 use solana_clock::Clock;
@@ -587,7 +589,6 @@ fn fill_flow_and_refusals() {
     let solver_nft = Pubkey::new_unique();
     w.ctx.h.svm.set_account(solver_nft, token_account(&nft, &solver_pk, 5)).unwrap();
     let saved_out = w.pocket_out;
-    let priced_output = w.pocket_out;
     w.pocket_out = pocket_nft;
     // Include a matching fill_end so the begin/end pairing check passes
     // and the refusal is specifically the no-oracle policy.

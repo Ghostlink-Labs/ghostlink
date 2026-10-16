@@ -32,6 +32,8 @@ The entire buy/exit, token movement, nonce, budgets and temporary fill account c
 
 Session renewal, rotation and revocation preserve positions and spending. Daily rollover resets only the two daily counters, never exposure. Sweeping a tracked token account home clears its position, including permission to sell subsequently redeposited tokens; sweeping a different account does not clear it. Recovery remains available through an owner proof after session expiry or revocation.
 
+New fills require the pocket to control closure of the output account. Previously deposited accounts may retain a foreign close authority after an SPL ownership transfer. Recovery transfers their tokens home and clears their position without attempting an unauthorized close. Their rent remains in the empty account; ordinary pocket accounts are closed and refund rent as before.
+
 Proposing a policy change immediately blocks new speculative buys. Exits and recovery remain available. Execution requires both the existing 24-hour timelock and no open speculative positions. This prevents changing feeds, bases or permissions beneath an existing position. Canceling a pending change preserves all budgets and positions. Home changes retain their existing owner authorization and timelock.
 
 ## Solver and integration boundary

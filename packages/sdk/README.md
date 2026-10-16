@@ -1,6 +1,6 @@
 # GhostLink SDK
 
-Experimental TypeScript/JavaScript SDK for Solana identity proofs and policy-controlled pockets. Node.js bot backends and browser applications can use the same intent format. **Development networks only.** This is not an integration with any named trading bot, and installing it does not grant a bot permission to trade.
+Experimental TypeScript/JavaScript SDK for Solana identity proofs and policy-controlled pockets. Node.js bot backends and browser applications can use the same intent format. **V2 candidate: localnet only; not deployed.** This is not an integration with any named trading bot, and installing it does not grant a bot permission to trade.
 
 ## Install from reviewed source
 
@@ -55,7 +55,7 @@ On the user's trusted device, after authenticating the handoff and showing the b
 import { sessionPublicKey } from '@ghostlink/sdk';
 
 const authorization = await client.authorizeSession({
-  identity, witness, home, expirySlot,
+  identity, witness, home, expirySlot, policy: approvedPolicy,
   session: sessionPublicKey(0, Uint8Array.from(publicKeyBytes)),
 });
 const pocket = client.pocketFor(authorization, home, approvedPolicy);
@@ -64,19 +64,19 @@ await client.openSession(authorization, pocket, {
 });
 ```
 
-Here `client` is an initialized GhostLink client with a local prover and trusted service endpoints. `identity` and `witness` stay on the user's trusted device. They must not be requested by a bot backend. This API supplies the proof/key boundary; it does **not** supply the hosted handoff, consent UI, Telegram authentication, or isolated origin-enforcing identity broker.
+Here `client` is a GhostLink client initialized with `cluster: "localnet"` with a local prover and trusted service endpoints. `identity` and `witness` stay on the user's trusted device. They must not be requested by a bot backend. This API supplies the proof/key boundary; it does **not** supply the hosted handoff, consent UI, Telegram authentication, or isolated origin-enforcing identity broker.
 
 After confirmed activation, the bot reads the pocket from the correct chain, checks its owner/layout, session key/expiry and policy, reserves a nonce in a durable per-pocket store, and signs an exact swap intent with `signIntent` or `client.submitIntent`. A client-supplied callback or a Telegram message is not evidence of on-chain authorization. On an uncertain submission result, reconcile the same intent and transaction before allocating a replacement nonce.
 
-An authorization contains no signing function. `authorizeSession` accepts only Ed25519 bot keys: a remote P-256 public key is not evidence of a hardware passkey. The existing `client.prove` method still supports locally held software/passkey signers for interactive apps. Existing pockets retain their original policy: passing a new policy to `pocketFor` does not update on-chain permissions.
+An authorization contains no signing function. `authorizeSession` accepts only Ed25519 bot keys: a remote P-256 public key is not evidence of a hardware passkey. The existing `client.prove` method still supports locally held software/passkey signers for interactive apps. `client.prove` without a policy creates a login-only proof that cannot open a pocket. Supply the current confirmed policy for pocket renewal. Existing pockets retain their original policy: passing a new policy to `pocketFor` does not update on-chain permissions.
 
 ## Current limits
 
-- The facade refuses `mainnet-beta` because verified production IDs and ceremony keys are not shipped. This is a configuration guard, not an RPC genesis check or a sandbox around low-level functions.
+- The facade refuses devnet and mainnet because V2 has no verified live deployment. The existing devnet app uses the preserved V1 deployment. This is a configuration guard, not an RPC genesis check or a sandbox around low-level functions.
 - Only classic SPL Token swaps are supported. Token-2022 transfers and native SOL swap legs need explicit implementations.
 - Input tokens require a pinned fresh price feed. Software sessions cannot buy unpriced output tokens. Unattended new-token sniping is not supported.
 - One active session key exists per pocket. A new session replaces the previous one. One bot cannot independently revoke another key in the same pocket because multiple concurrent delegations are not implemented.
-- The initial policy hash is not bound into the current login proof. Verify the confirmed policy on the owner's device before funding development pockets; production requires a circuit/program change that binds the approved policy.
+- V2 binds the exact policy, session kind and deployment in the proof. The `open_session_v2` instruction requires new development proofs/keys and a fresh, reviewed deployment. It must not be deployed over V1.
 - Passkey sessions require user interaction. Backend automation uses Ed25519 sessions under the existing limits.
 - Nonce persistence, quote construction, DEX routing, transaction landing and confirmation reconciliation are integrator/service responsibilities.
 - The SDK does not expose arbitrary wallet transaction signing or unrestricted withdrawals. A pocket is a program account, not an ordinary keypair wallet.

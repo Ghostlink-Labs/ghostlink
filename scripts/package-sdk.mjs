@@ -56,7 +56,7 @@ const key = createPublicKey({ format: 'der', type: 'spki', key: Buffer.concat([
   Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(publicKey.key32),
 ]) });
 assert.equal(verify(null, intentHash(signed.intent), key, signed.signature.signature), true);
-await assert.rejects(GhostLink.init({ cluster: 'mainnet-beta', indexer: 'https://example.invalid' }), /no verified mainnet/);
+await assert.rejects(GhostLink.init({ cluster: 'mainnet-beta', indexer: 'https://example.invalid' }), /no verified devnet or mainnet/);
 console.log('Installed SDK: ESM import, public delegation and real intent signature verified. No network transaction sent.');
 `);
   execFileSync(process.execPath, [join(consumer, "check.mjs")], { cwd: consumer, stdio: "inherit" });

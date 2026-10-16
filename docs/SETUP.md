@@ -2,6 +2,8 @@
 
 The TypeScript workspaces run on Node. Solana binaries and circuit compilation use Linux; Windows developers can use WSL. Use test assets only.
 
+The V2 candidate must run on a disposable local validator. Its login proofs and `open_session_v2` instruction are incompatible with the preserved V1 devnet deployment. Do not upgrade that program or point V2 services at it; a fresh deployment and migration require separate verification ([ADR 0003](adr/0003-session-authorization-v2.md)).
+
 ## Toolchain
 
 | Tool | Version |

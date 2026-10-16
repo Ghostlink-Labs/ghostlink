@@ -12,6 +12,7 @@ import { sha256 } from "@noble/hashes/sha256";
 import { sha512 } from "@noble/hashes/sha512";
 import { ed25519 } from "@noble/curves/ed25519";
 import bs58 from "bs58";
+import { fixturePolicy } from "./fixture-policy.js";
 import {
   bytesToHex,
   hexToBytes,
@@ -169,6 +170,7 @@ describe("login input assembly", () => {
       session,
       expirySlot: BigInt(vectors.identity.expirySlot),
       home: hexToBytes(vectors.identity.homeAddress),
+      policy: fixturePolicy(),
       witness: {
         registry: {
           walletPubkey: hexToBytes(vectors.identity.walletPubkey),

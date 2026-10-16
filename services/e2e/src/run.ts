@@ -240,7 +240,7 @@ async function main() {
   };
   const origin = "https://demo.ghostlink.dev";
   const gl = await GhostLink.init({
-    cluster: "devnet",
+    cluster: "localnet",
     indexer: indexerUrl,
     relayer: relayerUrl,
     solver: solverUrl,
@@ -311,6 +311,18 @@ async function main() {
     amount: 100_000_000n,
     maxAgeSlots: 9_000n,
   };
+  const policy: Policy = {
+    dailyCapUsdE6: 200_000_000n,
+    maxSlippageBps: 100,
+    bigActionThresholdUsdE6: 50_000_000n,
+    noOracleCapUsdE6: 20_000_000n,
+    sessionMaxSlots: 216_000n,
+    allowedOutMints: [],
+    oracleFeeds: [
+      { mint: usdcMint.publicKey.toBytes(), feedId: usdcFeedId, decimals: 6 },
+      { mint: solMint.publicKey.toBytes(), feedId: solFeedId, decimals: 9 },
+    ],
+  };
   const { input, appId, domainHash } = buildLoginInput({
     identity,
     origin,
@@ -319,6 +331,7 @@ async function main() {
     session,
     expirySlot,
     home: home.toBytes(),
+    policy,
     witness: {
       registry: {
         walletPubkey: wallet.publicKey.toBytes(),
@@ -353,24 +366,12 @@ async function main() {
     expectedDomain: origin,
     verificationKey: vk,
     indexer: indexerUrl,
-    expect: { session: { key32: session.key32, expirySlot, currentSlot }, home: home.toBytes() },
+    expect: { pocket: { policy, sessionKind: session.kind }, session: { key32: session.key32, expirySlot, currentSlot }, home: home.toBytes() },
   });
   if (!verdict.ok) throw new Error(`verifyLogin failed: ${verdict.reason}`);
   ok(`server-side verifyLogin ok, appId ${verdict.appId!.slice(0, 12)}…`);
 
   // ---- open the pocket session ---------------------------------------------
-  const policy: Policy = {
-    dailyCapUsdE6: 200_000_000n,
-    maxSlippageBps: 100,
-    bigActionThresholdUsdE6: 50_000_000n,
-    noOracleCapUsdE6: 20_000_000n,
-    sessionMaxSlots: 216_000n,
-    allowedOutMints: [],
-    oracleFeeds: [
-      { mint: usdcMint.publicKey.toBytes(), feedId: usdcFeedId, decimals: 6 },
-      { mint: solMint.publicKey.toBytes(), feedId: solFeedId, decimals: 9 },
-    ],
-  };
   const glSession = {
     appId,
     appIdBase58: bs58.encode(fieldToBytes32(appId)),

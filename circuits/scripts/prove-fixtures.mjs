@@ -121,10 +121,17 @@ const expiry = BigInt(vectors.identity.expirySlot) + 1n;
 const p256Commitment = common.sessionCommitment(key32, expiry);
 
 const loginFx = vectors.circuits.login;
+const fixturePolicy = {
+  ...common.conservativePolicy(),
+  oracleFeeds: vectors.policyWithFeeds.feeds.map((f) => ({
+    mint: common.hexToBytes(f.mint), feedId: common.hexToBytes(f.feedId), decimals: f.decimals,
+  })),
+};
 const p256Input = {
   ...loginFx.public,
   ...loginFx.private,
   session_commitment: p256Commitment.toString(10),
+  authorization_context: common.pocketAuthorizationContext(fixturePolicy, 1).toString(),
 };
 const { proof: p256Proof, publicSignals: p256Signals } = await snarkjs.groth16.fullProve(
   p256Input,
@@ -145,4 +152,21 @@ writeFileSync(
   ) + "\n",
 );
 console.log("p256 login proof verified");
+
+// Real proofs for purpose/deployment refusal tests (not mutated fake proofs).
+const otherDeployment = common.developmentSessionDeployment();
+otherDeployment.pocketProgram = label("other pocket program");
+for (const [name, context] of [
+  ["offchain", 0n],
+  ["other_deployment", common.pocketAuthorizationContext(fixturePolicy, 0, otherDeployment)],
+]) {
+  const input = { ...loginFx.public, ...loginFx.private, authorization_context: context.toString() };
+  const { proof, publicSignals } = await snarkjs.groth16.fullProve(input,
+    join(root, "circuits/build/login_js/login.wasm"), join(root, "circuits/build/login_dev.zkey"));
+  if (!(await snarkjs.groth16.verify(loginVk, publicSignals, proof))) throw new Error(`${name} proof invalid`);
+  const bytes = common.proofToBytes(proof);
+  writeFileSync(join(root, `circuits/keys/login_${name}_proof.json`), JSON.stringify({ proof, publicSignals,
+    bytes: Object.fromEntries(Object.entries(bytes).map(([k, v]) => [k, Buffer.from(v).toString("hex")])) }, null, 2) + "\n");
+  console.log(`${name} login proof verified`);
+}
 process.exit(0);

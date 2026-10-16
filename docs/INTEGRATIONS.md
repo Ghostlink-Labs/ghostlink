@@ -1,6 +1,6 @@
 # Integrating GhostLink with bots and applications
 
-This is an experimental development-network integration contract. See [mainnet readiness](MAINNET-READINESS.md) before planning a real-funds launch and [SDK installation](../packages/sdk/README.md) for local archives. There is no claim of compatibility with a named third-party bot until its operator integrates and verifies the flow.
+This is an experimental V2 localnet integration contract. See [mainnet readiness](MAINNET-READINESS.md) before planning a real-funds launch and [SDK installation](../packages/sdk/README.md) for local archives. There is no claim of compatibility with a named third-party bot until its operator integrates and verifies the flow.
 
 ## Telegram bot and Mini App flow
 
@@ -15,7 +15,9 @@ This is an experimental development-network integration contract. See [mainnet r
 
 The installed SDK provides public-key descriptors, local proof preparation, intent signing and the existing service clients. The hosted authorization service, Telegram identity binding, durable order store, scheduler and live DEX route are not shipped by these primitives. No bot token is needed in the public SDK or browser bundle.
 
-The development protocol does not bind the first pocket's policy hash into its login proof. For development tests, the owner's trusted interface must read back the confirmed policy before funding. A production integration needs the cryptographic policy-binding change listed in the readiness plan; the new SDK helper does not fix this on-chain limitation.
+The V2 candidate binds the approved policy, session kind and program IDs into the login proof and uses `open_session_v2`. A login-only proof cannot activate spending. This is not yet deployed: the existing devnet app remains on V1. See [the protocol/migration decision](adr/0003-session-authorization-v2.md) before integrating.
+
+For named-provider findings and implementation priorities, see [bot compatibility research](BOT-COMPATIBILITY.md).
 
 ## Trading adapters
 

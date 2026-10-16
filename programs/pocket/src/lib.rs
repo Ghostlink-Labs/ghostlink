@@ -124,7 +124,7 @@ pub mod ghostlink_pocket {
     /// Verifies a login proof, then creates the pocket (first time) or
     /// rotates its session (afterwards). Never touches home or policy of
     /// an existing pocket.
-    pub fn open_session(ctx: Context<OpenSession>, args: OpenSessionArgs) -> Result<()> {
+    pub fn open_session_v2(ctx: Context<OpenSession>, args: OpenSessionArgs) -> Result<()> {
         require!(get_stack_height() == 1, PocketError::CpiForbidden);
         let clock = Clock::get()?;
 
@@ -165,11 +165,21 @@ pub mod ghostlink_pocket {
         let created = pocket.app_id == [0u8; 32];
 
         // Session expiry within the governing policy.
-        let session_max = if created {
-            args.policy.as_ref().ok_or(error!(PocketError::PolicyRequired))?.session_max_slots
+        let governing_policy = if created {
+            args.policy.as_ref().ok_or(error!(PocketError::PolicyRequired))?
         } else {
-            pocket.policy.session_max_slots
+            &pocket.policy
         };
+        require!(governing_policy.validate(), PocketError::BadPolicy);
+        let session_max = governing_policy.session_max_slots;
+        // The prover approves the complete policy, not a relayer's choice.
+        // Renewal binds the stored policy; a policy change invalidates an
+        // outstanding authorization made under the previous policy.
+        let authorization_context = reduce_to_field(&hashv(&[
+            b"ghostlink:open-session:v2", ctx.program_id.as_ref(),
+            REGISTRY_PROGRAM_ID.as_ref(), CENSUS_PROGRAM_ID.as_ref(),
+            &governing_policy.hash(), &[args.session_kind],
+        ]).to_bytes());
         require!(
             args.session_expiry_slot > clock.slot
                 && args.session_expiry_slot <= clock.slot.saturating_add(session_max),
@@ -184,7 +194,7 @@ pub mod ghostlink_pocket {
             .map_err(|_| error!(PocketError::HashFailed))?;
 
         let (mint_hi, mint_lo) = split32(&args.mint.to_bytes());
-        let public_inputs: [[u8; 32]; 11] = [
+        let public_inputs: [[u8; 32]; 12] = [
             args.registry_root,
             args.census_root,
             args.domain_hash,
@@ -196,6 +206,7 @@ pub mod ghostlink_pocket {
             session_commitment,
             home_hash,
             if args.claim_holdings { ONE_FE } else { ZERO_FE },
+            authorization_context,
         ];
         verify_login(&args.proof_a, &args.proof_b, &args.proof_c, &public_inputs)
             .map_err(|_| error!(PocketError::ProofInvalid))?;

@@ -31,6 +31,7 @@ import {
   intentHash,
   policyBytes,
   policyHash,
+  pocketAuthorizationContext,
   conservativePolicy,
   registrationMessage,
   frameOffchain,
@@ -160,6 +161,7 @@ const circuits = {
       session_commitment: fe(sess),
       home_hash: fe(hHash),
       claim_holdings: "1",
+      authorization_context: fe(pocketAuthorizationContext(policyFeeds, 0)),
     },
     private: {
       s: fe(sField),
@@ -270,6 +272,7 @@ const vectors = {
     framedHex: hex(frameOffchain(regMsg)),
   },
   policyWithFeeds: {
+    feeds: policyFeeds.oracleFeeds.map((f) => ({ mint: hex(f.mint), feedId: hex(f.feedId), decimals: f.decimals })),
     bytes: hex(policyBytes(policyFeeds)),
     hash: hex(policyHash(policyFeeds)),
   },

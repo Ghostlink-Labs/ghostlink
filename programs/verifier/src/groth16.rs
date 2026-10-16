@@ -8,8 +8,8 @@ use groth16_solana::groth16::Groth16Verifier;
 
 /// login circuit public inputs, in order: registry_root, census_root,
 /// domain_hash, app_id, mint_hi, mint_lo, threshold, min_slot,
-/// session_commitment, home_hash, claim_holdings.
-pub const LOGIN_PUBLIC_INPUTS: usize = 11;
+/// session_commitment, home_hash, claim_holdings, authorization_context (V2).
+pub const LOGIN_PUBLIC_INPUTS: usize = 12;
 
 /// owner circuit public inputs, in order: registry_root, domain_hash,
 /// app_id, action_hash.

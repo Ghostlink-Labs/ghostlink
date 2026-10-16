@@ -15,11 +15,14 @@ import {
   censusLeaf,
   domainHash,
   homeHash,
+  pocketAuthorizationContext,
   proofToBytes,
   publicSignalsToBytes,
   registryLeaf,
   splitBytes32,
   type ProofBytes,
+  type Policy,
+  type SessionDeployment,
 } from "@ghostlink/common";
 import type { DerivedIdentity } from "./identity.js";
 import { sessionCommitmentFor, type SessionPublicKey } from "./session.js";
@@ -94,6 +97,9 @@ export function buildLoginInput(params: {
   expirySlot: bigint;
   home: Uint8Array;
   witness: LoginWitnessData;
+  /** Omit for off-chain login only. Pocket creation/renewal requires the approved policy. */
+  policy?: Policy;
+  deployment?: SessionDeployment;
 }): { input: CircuitInput; appId: FieldElement; domainHash: FieldElement } {
   const { identity, origin, claim, session, expirySlot, home, witness } = params;
   const minSlot = resolveMinSlot(params);
@@ -128,6 +134,8 @@ export function buildLoginInput(params: {
     session_commitment: sessionCommitmentFor(session, expirySlot).toString(),
     home_hash: homeHash(home).toString(),
     claim_holdings: claim ? "1" : "0",
+    authorization_context: params.policy === undefined ? "0"
+      : pocketAuthorizationContext(params.policy, session.kind, params.deployment).toString(),
     s: identity.sField.toString(),
     pk_hi: pk.hi.toString(),
     pk_lo: pk.lo.toString(),

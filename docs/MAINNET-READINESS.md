@@ -49,7 +49,7 @@ V1 has one active key per per-origin pocket. Bots hosted at one origin can other
 
 The delegated authorization API accepts Ed25519 only. A bot-supplied P-256 key and a syntactically valid WebAuthn assertion do not prove that a physical authenticator held the secret. Keep passkey creation/authorization in the trusted owner context, and define the attestation/trust policy before relying on it for stronger mainnet permissions.
 
-**Initial-policy binding is a mainnet blocker.** The current login proof binds the home and session commitment, but does not include the initial policy hash. `open_session` takes a policy separately for a newly created pocket. An actor with a valid opening proof could substitute a different valid initial policy before creation. Existing-pocket renewal preserves the stored policy, but that does not protect first creation. Bind the initial policy (and explicit authorization/deployment context) into the owner-approved cryptographic statement, update the circuit/program together and test front-running/substitution. In development, inspect the confirmed policy on the user's device before funding; a bot's own check is not a substitute for owner approval.
+**Initial-policy binding:** the V2 candidate adds a purpose/deployment/policy/session-kind context to the login proof and requires `open_session_v2`. The program re-derives the context from the submitted initial policy or stored renewal policy. Off-chain login has a separate context. This breaking candidate remains localnet-only; the existing V1 devnet program is preserved. Local circuit, SDK, SBF/LiteSVM and full validator checks passed. Independent review and fresh-deployment verification are still required before closing the gate. See [ADR 0003](adr/0003-session-authorization-v2.md).
 
 ## Mainnet release gates
 
@@ -60,7 +60,7 @@ The delegated authorization API accepts Ed25519 only. A bot-supplied P-256 key a
 | Deployment identity | Constants are development program IDs | Versioned network manifest with genesis, program IDs, account layout, program-binary hashes and proof hashes; verify executable code and upgrade authority on chain |
 | Upgrade / migration governance | Production decision pending | Document multisig/timelock or immutability decision, authority custody, incident response, old-pocket exit and migration; no accidental upgrades |
 | Bot authorization boundary | Public-key SDK primitive added; hosted broker absent | Origin-enforcing trusted UI, authenticated request ownership, exact consent display, expiry/rotation/revoke, tests against key substitution and cross-user replay |
-| First-pocket policy authorization | Initial policy hash is not in login proof | Bind the owner-approved initial policy cryptographically; negative tests for captured-proof creation with altered policy, home, session, domain and deployment |
+| First-pocket policy authorization | V2 binding locally verified; not deployed or independently reviewed | Circuit/program/SDK substitution tests, local validator evidence, external review and fresh-deployment migration |
 | Trading route | Inventory reference solver only | Reviewed route planner, live mainnet read-only quotes, fork/simulation tests and approved bounded real settlement tests after audit gates |
 | Asset and oracle support | Classic SPL with pinned feeds | Explicit supported mint/feed/decimal list, staleness/confidence rules, unsupported token refusal, Pyth update availability and costs |
 | Submission reliability | Reference legacy transaction flow | Versioned messages/lookup tables, bounded compute/priority/tip fees, blockhash expiry, durable idempotency, chain-confirmed reconciliation; a bundle receipt is not confirmation |
@@ -69,7 +69,7 @@ The delegated authorization API accepts Ed25519 only. A bot-supplied P-256 key a
 | User recovery | Recovery primitives exist; known liveness caveat | Lost-session/device tests, home withdrawal checks, compromised-session race handling, clear owner recovery procedure and support playbook |
 | Pilot acceptance | Not started | Supported wallet/device and strategy matrix, agreed amount/user caps, monitoring, successful exit/revoke and incident rehearsal |
 
-`GhostLink.init` now refuses mainnet configuration instead of silently using the development deployment. Removing that check alone does not satisfy any gate. Low-level encoders remain usable for tests and do not themselves verify RPC identity.
+`GhostLink.init` now permits only localnet for the V2 candidate; no V2 devnet/mainnet deployment is verified. Removing that check alone does not satisfy any gate. Low-level encoders remain usable for tests and do not themselves verify RPC identity.
 
 ## Build order
 
@@ -82,6 +82,8 @@ The delegated authorization API accepts Ed25519 only. A bot-supplied P-256 key a
 7. **Production release:** ceremony, external audits, deployment manifest/governance, operations rehearsal, package publication, then a capped mainnet pilot. Expand supported cases only after their acceptance tests pass.
 
 Measure onboarding (cold navigation through confirmed authorization), signing latency, quote latency, submission-to-confirmation p50/p95 and failure/reconciliation rate separately. User approval time and chain congestion must remain visible. No guaranteed first-slot execution, profit, or universal sub-five-second confirmation claim is made.
+
+Named provider findings and priorities: [bot compatibility research](BOT-COMPATIBILITY.md).
 
 ## Current external integration references
 

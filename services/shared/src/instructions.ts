@@ -244,7 +244,7 @@ export function openSessionIx(payer: PublicKey, f: OpenSessionFields) {
       { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
-    data: data("open_session", w.out()),
+    data: data("open_session_v2", w.out()),
   });
 }
 

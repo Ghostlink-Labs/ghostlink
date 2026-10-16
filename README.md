@@ -4,7 +4,7 @@ Experimental zero-knowledge identity and policy-controlled spending pockets for 
 
 GhostLink proves membership in a wallet registry and, optionally, a historical token balance without putting the wallet address in the login proof. A per-origin pocket holds funds separately from the main wallet. Signed intents constrain supported swaps; owner proofs authorize recovery and delayed home/policy changes.
 
-**Development and test networks only.** This repository uses throwaway Groth16 setup keys and has not had an independent security audit. It is not ready for real funds or a mainnet deployment. Read [the threat model](docs/THREAT-MODEL.md) before integrating.
+**V2 candidate: localnet only; not deployed.** This repository uses throwaway Groth16 setup keys and has not had an independent security audit. It is not ready for real funds or a mainnet deployment. Read [the threat model](docs/THREAT-MODEL.md) before integrating.
 
 ## What is implemented
 
@@ -21,7 +21,7 @@ Pocket state, home addresses, deposits, withdrawals and transactions are public.
 
 ## Develop
 
-Integration work is tracked in [mainnet readiness and the compatibility matrix](docs/MAINNET-READINESS.md). For bot/public-key authorization, see [integration boundaries](docs/INTEGRATIONS.md) and [SDK installation](packages/sdk/README.md). This development SDK refuses mainnet configuration; it does not yet support unattended new-token sniping or Token-2022 settlement.
+Integration work is tracked in [mainnet readiness and the compatibility matrix](docs/MAINNET-READINESS.md) and [named-bot research](docs/BOT-COMPATIBILITY.md). For bot/public-key authorization, see [integration boundaries](docs/INTEGRATIONS.md) and [SDK installation](packages/sdk/README.md). This V2 SDK refuses devnet/mainnet configuration until a fresh deployment is verified; it does not yet support unattended new-token sniping or Token-2022 settlement.
 
 Use Node 22 and the pnpm version in `package.json`:
 
@@ -52,6 +52,8 @@ These program tests use committed public fixtures. A fresh local proving setup i
 | `docs/` | Setup, protocol decisions, threat model and benchmarks |
 
 Pocket accounts include an administrative nonce and allocate **2,089 bytes**; the previous 2,081-byte layout is unsupported by the updated clients. No existing deployment has been upgraded by this release. See [the migration decision](docs/adr/0002-open-source-review.md).
+
+V2 also changes the login proof to 12 public signals and replaces `open_session` with `open_session_v2`, binding the exact policy, key kind and deployment. The existing devnet app remains on its preserved V1 deployment. Follow [ADR 0003](docs/adr/0003-session-authorization-v2.md); do not deploy this candidate over the old program.
 
 ## Contribute
 

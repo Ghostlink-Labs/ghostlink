@@ -21,7 +21,7 @@ const load = (name: string) => JSON.parse(readFileSync(join(keys, name), "utf8")
 const INFINITY = (p: string[]) => p[0] === "0" && p[1] === "1" && p[2] === "0";
 
 const circuits = [
-  { name: "login", vk: "login_vk.json", proof: "login_proof.json", publicInputs: 11 },
+  { name: "login", vk: "login_vk.json", proof: "login_proof.json", publicInputs: 12 },
   { name: "owner", vk: "owner_vk.json", proof: "owner_proof.json", publicInputs: 4 },
 ];
 

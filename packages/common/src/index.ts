@@ -8,3 +8,4 @@ export * from "./registration.js";
 export * from "./groth16.js";
 export * from "./api.js";
 export * from "./login.js";
+export * from "./authorization.js";

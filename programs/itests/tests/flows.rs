@@ -228,7 +228,7 @@ fn open_session_ix(ctx: &Ctx, args: &OpenSessionArgs) -> Instruction {
             meta_r(pk(SYSVAR_IX_ID)),
             meta_r(pk(SYSTEM_ID)),
         ],
-        data: ix_data("open_session", args),
+        data: ix_data("open_session_v2", args),
     }
 }
 
@@ -290,6 +290,53 @@ fn identity_flow_and_refusals() {
 }
 
 // ---- fills ---------------------------------------------------------------
+
+#[test]
+fn first_session_binds_policy_purpose_and_deployment() {
+    let mut ctx = setup();
+    register(&mut ctx);
+    snapshot(&mut ctx);
+    set_clock(&mut ctx.h, OPEN_SLOT);
+    let args = open_session_args(&ctx, "circuits/keys/login_proof.json", 0, ed25519_key33(&ctx.session), true);
+
+    // A captured proof must not let its submitter change any policy field.
+    for i in 0..9 {
+        let mut bad = args.clone();
+        let p = bad.policy.as_mut().unwrap();
+        match i {
+            0 => p.daily_cap_usd_e6 += 1,
+            1 => p.max_slippage_bps += 1,
+            2 => p.big_action_threshold_usd_e6 += 1,
+            3 => p.no_oracle_cap_usd_e6 += 1,
+            4 => p.session_max_slots += 1,
+            5 => p.allowed_out_mints.push(ctx.sol),
+            6 => p.oracle_feeds[0].mint = ctx.sol,
+            7 => p.oracle_feeds[0].feed_id[0] ^= 1,
+            _ => p.oracle_feeds[0].decimals += 1,
+        }
+        let err = ctx.h.send_expect_err(&[compute_budget(400_000), open_session_ix(&ctx, &bad)], &[]);
+        assert!(err.contains("ProofInvalid") || err.contains("Custom(6002)"), "policy field {i}: {err}");
+        assert!(ctx.h.account_data(&ctx.pocket).is_none(), "failed creation must roll back");
+    }
+    for name in ["login_offchain", "login_other_deployment"] {
+        let bad = open_session_args(&ctx, &format!("circuits/keys/{name}_proof.json"), 0, ed25519_key33(&ctx.session), true);
+        let err = ctx.h.send_expect_err(&[compute_budget(400_000), open_session_ix(&ctx, &bad)], &[]);
+        assert!(err.contains("ProofInvalid") || err.contains("Custom(6002)"), "{name}: {err}");
+    }
+    for change_home in [true, false] {
+        let mut bad = args.clone();
+        if change_home { bad.home[0] ^= 1; } else { bad.domain_hash = fe("123"); }
+        let err = ctx.h.send_expect_err(&[compute_budget(400_000), open_session_ix(&ctx, &bad)], &[]);
+        assert!(err.contains("ProofInvalid") || err.contains("Custom(6002)"), "{err}");
+    }
+    // V1 dispatch is absent: no fallback may bypass the new proof contract.
+    let mut legacy = open_session_ix(&ctx, &args);
+    legacy.data = ix_data("open_session", &args);
+    let err = ctx.h.send_expect_err(&[compute_budget(400_000), legacy], &[]);
+    assert!(err.contains("InstructionFallbackNotFound") || err.contains("Custom(101)"), "{err}");
+
+    ctx.h.send(&[compute_budget(400_000), open_session_ix(&ctx, &args)], &[]).expect("approved V2 policy opens");
+}
 
 struct FillWorld {
     ctx: Ctx,
@@ -936,6 +983,12 @@ fn p256_passkey_session_and_no_oracle_fill() {
     let mut args = open_session_args(&w.ctx, "circuits/keys/login_p256_proof.json", 1, compressed, false);
     args.session_key = compressed;
     args.session_expiry_slot = EXPIRY_SLOT + 1;
+    // Renewal must bind and preserve the stored policy, even if the
+    // submitter supplies a different policy argument. Subsequent fills
+    // below still sign the original policy hash.
+    let mut ignored_policy = w.ctx.policy.clone();
+    ignored_policy.daily_cap_usd_e6 += 1;
+    args.policy = Some(ignored_policy);
     w.ctx.h.send(&[compute_budget(400_000), open_session_ix(&w.ctx, &args)], &[]).expect("rotate to p256 session");
     set_clock(&mut w.ctx.h, FILL_SLOT);
 

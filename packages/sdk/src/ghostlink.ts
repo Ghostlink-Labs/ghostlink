@@ -14,6 +14,8 @@ import {
   conservativePolicy,
   fieldToBytes32,
   hexToBytes,
+  homeHash,
+  pocketAuthorizationContext,
   toBase58,
   type CensusLatestResponse,
   type IntentRequest,
@@ -46,7 +48,7 @@ import {
 } from "./pocket.js";
 
 export interface GhostLinkConfig {
-  /** This development release refuses mainnet; deployment IDs and setup keys are not production-ready. */
+  /** V2 is localnet-only until a fresh deployment and migration are verified. */
   cluster: Cluster;
   indexer: string;
   relayer?: string;
@@ -84,6 +86,8 @@ export interface SessionAuthorizationParams {
   /** Must exceed every previous session expiry for this pocket. */
   expirySlot: bigint;
   home: Uint8Array;
+  /** Exact owner-approved policy. Renewal must use the current confirmed policy. */
+  policy: Policy;
 }
 
 export class GhostLink {
@@ -96,8 +100,8 @@ export class GhostLink {
   }
 
   static async init(config: GhostLinkConfig): Promise<GhostLink> {
-    if (config.cluster !== "devnet" && config.cluster !== "localnet") {
-      throw new Error("This development SDK has no verified mainnet deployment; use devnet or localnet");
+    if (config.cluster !== "localnet") {
+      throw new Error("This V2 SDK has no verified devnet or mainnet deployment; use localnet");
     }
     return new GhostLink(config);
   }
@@ -240,6 +244,8 @@ export class GhostLink {
      */
     expirySlot: bigint;
     home: Uint8Array;
+    /** Omit for off-chain login; supply explicitly to authorize a pocket. */
+    policy?: Policy;
   }): Promise<GhostLinkSession> {
     if (!this.config.prover) throw new Error("no prover configured");
     const signer = params.session ?? softwareSession();
@@ -258,10 +264,11 @@ export class GhostLink {
     // A remote P-256 key does not establish that a hardware authenticator
     // created it. Never classify a bot-supplied key as passkey-held authority.
     if (params.session?.kind !== 0) throw new Error("Delegated bots require an Ed25519 session public key");
+    if (!params.policy) throw new Error("Bot authorization requires an explicit approved policy");
     return this.prepareAuthorization(params);
   }
 
-  private async prepareAuthorization(params: SessionAuthorizationParams): Promise<GhostLinkAuthorization> {
+  private async prepareAuthorization(params: Omit<SessionAuthorizationParams, "policy"> & { policy?: Policy }): Promise<GhostLinkAuthorization> {
     if (!this.config.prover) throw new Error("no prover configured");
     const signer = copySessionPublicKey(params.session);
     const { input, appId } = buildLoginInput({
@@ -274,6 +281,7 @@ export class GhostLink {
       expirySlot: params.expirySlot,
       home: params.home,
       witness: params.witness,
+      policy: params.policy,
     });
     const proof = await proveLogin(this.config.prover, input, appId);
     return {
@@ -288,7 +296,18 @@ export class GhostLink {
   // ---- pocket -------------------------------------------------------------
 
   pocketFor(session: GhostLinkAuthorization, home: Uint8Array, policy?: Policy): PocketHandle {
-    return derivePocket(session.appId, home, policy ?? conservativePolicy());
+    const pocket = derivePocket(session.appId, home, policy ?? conservativePolicy());
+    this.checkPocketAuthorization(session, pocket);
+    return pocket;
+  }
+
+  private checkPocketAuthorization(session: GhostLinkAuthorization, pocket: PocketHandle): void {
+    const signals = session.proof.publicSignals;
+    if (signals.length !== 12 || fieldFromDecimal(signals[11]) !== pocketAuthorizationContext(pocket.policy, session.signer.kind)
+      || fieldFromDecimal(signals[9]) !== homeHash(pocket.home)
+      || fieldFromDecimal(signals[3]) !== session.appId || pocket.appId !== session.appId) {
+      throw new Error("Pocket policy, home or deployment does not match the approved V2 authorization");
+    }
   }
 
   funding(pocket: PocketHandle): FundingOptions {
@@ -323,6 +342,7 @@ export class GhostLink {
     domainHash?: FieldElement,
   ): Promise<TxResponse> {
     if (!this.config.relayer) throw new Error("no relayer configured");
+    this.checkPocketAuthorization(session, pocket);
     const signals = session.proof.publicSignals;
     const bound = {
       registry: roots?.registry ?? fieldFromDecimal(signals[0]),

@@ -4,12 +4,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bundledLoginVerificationKey, verifyLogin } from "../src/index.js";
-import { hexToBytes } from "@ghostlink/common";
+import { conservativePolicy, developmentSessionDeployment, hexToBytes } from "@ghostlink/common";
 import { ed25519 } from "@noble/curves/ed25519";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const vkPath = join(root, "circuits/keys/login_vk.json");
-const proofPath = join(root, "circuits/keys/login_proof.json");
+const proofPath = join(root, "circuits/keys/login_offchain_proof.json");
 const built = existsSync(vkPath) && existsSync(proofPath);
 
 describe.skipIf(!built)("verifyLogin", () => {
@@ -36,6 +36,28 @@ describe.skipIf(!built)("verifyLogin", () => {
 
   it("ships the same verifying key the circuits produced", () => {
     expect(bundledLoginVerificationKey()).toEqual(JSON.parse(readFileSync(vkPath, "utf8")));
+  });
+
+  it("separates website login from exact pocket policy and deployment consent", async () => {
+    const f = JSON.parse(readFileSync(join(root, "circuits/keys/login_proof.json"), "utf8"));
+    const policy = { ...conservativePolicy(), oracleFeeds: vectors.policyWithFeeds.feeds.map(
+      (feed: { mint: string; feedId: string; decimals: number }) => ({
+        mint: hexToBytes(feed.mint), feedId: hexToBytes(feed.feedId), decimals: feed.decimals,
+      }),
+    ) };
+    const pocket = { policy, sessionKind: 0 };
+    const request = { ...base(), proof: f.proof, publicSignals: f.publicSignals };
+    expect((await verifyLogin(request)).ok).toBe(false);
+    expect((await verifyLogin({ ...base(), expect: { pocket } })).ok).toBe(false);
+    expect((await verifyLogin({ ...request, expect: { pocket } })).ok).toBe(true);
+    const deployment = developmentSessionDeployment();
+    deployment.pocketProgram[0] ^= 1;
+    expect((await verifyLogin({ ...request, expect: { pocket: { ...pocket, deployment } } })).ok).toBe(false);
+    expect((await verifyLogin({ ...request, expect: { pocket: { ...pocket, policy: { ...policy, dailyCapUsdE6: policy.dailyCapUsdE6 + 1n } } } })).ok).toBe(false);
+    const mutated = [...f.publicSignals];
+    mutated[11] = "0";
+    // Clearing the context cannot turn a spending proof into a login proof.
+    expect((await verifyLogin({ ...request, publicSignals: mutated })).ok).toBe(false);
   });
 
   it("accepts the fixture proof for its domain, session and home", async () => {

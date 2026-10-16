@@ -38,13 +38,42 @@ export class SubmissionJournal {
     const binding = createHash("sha256").update(JSON.stringify(this.#scope)).digest("hex");
     this.#storage = new EncryptedSqlite(path, key, "ghostlink:solver-journal:" + binding);
     this.#clock = clock;
-    try { this.#storage.db.exec(`CREATE TABLE IF NOT EXISTS attempts (
+    try { this.#storage.transaction(() => {
+      const hasContexts = this.#storage.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pocket_contexts'").get();
+      this.#storage.db.exec(`CREATE TABLE IF NOT EXISTS pocket_contexts (pocket TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;
+      CREATE TABLE IF NOT EXISTS attempts (
       id TEXT PRIMARY KEY, pocket TEXT NOT NULL, nonce TEXT NOT NULL, record BLOB NOT NULL,
       UNIQUE(pocket, nonce)
-    ) STRICT;`); } catch (error) { this.#storage.close(); throw error; }
+    ) STRICT;`);
+      if (!hasContexts) for (const row of this.#storage.db.prepare("SELECT * FROM attempts").all()) {
+        const record = this.#read(row)!;
+        this.#advanceContext(record.identity.pocket, Math.max(this.authorizationSlot(record.identity.pocket),
+          record.authorizationSlot ?? 0, record.transaction?.minContextSlot ?? 0));
+      }
+    }); } catch (error) { this.#storage.close(); throw error; }
   }
 
   close(): void { this.#storage.close(); }
+  #contextAad(pocket: string): string { return JSON.stringify([this.#scope, "pocket-authority:v1", pocket]); }
+  authorizationSlot(pocket: string): number {
+    const row = this.#storage.db.prepare("SELECT record FROM pocket_contexts WHERE pocket=?").get(pocket);
+    if (!row) return 0;
+    const plain = this.#storage.open(row.record as Uint8Array, this.#contextAad(pocket));
+    try {
+      const slot = JSON.parse(plain.toString()) as number;
+      if (!Number.isSafeInteger(slot) || slot < 0) throw new Error("invalid authorization context");
+      return slot;
+    } finally { plain.fill(0); }
+  }
+  #advanceContext(pocket: string, slot: number): void {
+    if (!Number.isSafeInteger(slot) || slot < this.authorizationSlot(pocket)) throw new Error("authorization context is stale");
+    this.#storage.db.prepare("INSERT INTO pocket_contexts VALUES (?,?) ON CONFLICT(pocket) DO UPDATE SET record=excluded.record")
+      .run(pocket, this.#storage.seal(Buffer.from(JSON.stringify(slot)), this.#contextAad(pocket)));
+  }
+  /** Call only after checking the account's program, layout and PDA, even when its session is refused. */
+  observePocketContext(pocket: string, slot: number): void {
+    this.#storage.transaction(() => this.#advanceContext(pocket, slot));
+  }
   #aad(id: string, pocket: string, nonce: string): string { return JSON.stringify([this.#scope, id, pocket, nonce]); }
   #read(row: Record<string, unknown> | undefined): Attempt | undefined {
     if (!row) return;
@@ -91,7 +120,7 @@ export class SubmissionJournal {
     return this.#storage.transaction(() => {
       const record = this.get(id);
       if (!record || record.transaction || record.lease?.token !== token || record.lease.until <= this.#clock()) throw new Error("preparation lease lost; do not broadcast");
-      if (transaction.minContextSlot < (record.authorizationSlot ?? 0)) throw new Error("prepared authorization context is stale");
+      if (transaction.minContextSlot < Math.max(record.authorizationSlot ?? 0, this.authorizationSlot(record.identity.pocket))) throw new Error("prepared authorization context is stale");
       record.transaction = structuredClone(transaction);
       delete record.lease;
       record.observation = { intentHashHex: id, state: "pending", signature: transaction.signature };
@@ -115,6 +144,7 @@ export class SubmissionJournal {
       if (!Number.isSafeInteger(slot) || slot < Math.max(record.authorizationSlot ?? 0, record.transaction?.minContextSlot ?? 0)) {
         throw new Error("authorization context is stale");
       }
+      this.#advanceContext(record.identity.pocket, slot);
       record.authorizationSlot = slot; this.#write(record);
     });
   }

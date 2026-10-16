@@ -10,6 +10,9 @@
  *   SOLVER_MAX_SPREAD_BPS — how far above the input's value a fill may go (default 100)
  *   SOLVER_ALLOW_UNPRICED=1 — fill output mints without a price (NFT-style)
  *   SOLVER_CREATE_POCKET_ATA=1 — pay rent for missing pocket output accounts
+ *   SOLVER_MAX_COMPUTE_UNITS — cap full-fill compute (default 1400000)
+ *   SOLVER_PRIORITY_MICRO_LAMPORTS — operator-fixed CU price (default 0)
+ *   SOLVER_MAX_NETWORK_FEE_LAMPORTS — network fee ceiling, excludes rent (default 20000)
  *   TRUST_PROXY=1 — honour X-Forwarded-For (only behind your own proxy)
  */
 import { readFileSync } from "node:fs";
@@ -17,6 +20,7 @@ import { Connection, Keypair } from "@solana/web3.js";
 import { buildServer, MockPlanner } from "./server.js";
 import { SubmissionJournal } from "./journal.js";
 import { POCKET_PROGRAM_ID } from "@ghostlink/common";
+import { DEFAULT_TRANSACTION_LIMITS } from "./transactions.js";
 
 const keypairPath = process.env.GHOSTLINK_SOLVER_KEYPAIR;
 if (!keypairPath) {
@@ -46,6 +50,11 @@ buildServer({
   keypair,
   planner: new MockPlanner(),
   journal,
+  transactionLimits: {
+    maxComputeUnits: Number(process.env.SOLVER_MAX_COMPUTE_UNITS ?? DEFAULT_TRANSACTION_LIMITS.maxComputeUnits),
+    priorityMicroLamports: BigInt(process.env.SOLVER_PRIORITY_MICRO_LAMPORTS ?? DEFAULT_TRANSACTION_LIMITS.priorityMicroLamports),
+    maxNetworkFeeLamports: BigInt(process.env.SOLVER_MAX_NETWORK_FEE_LAMPORTS ?? DEFAULT_TRANSACTION_LIMITS.maxNetworkFeeLamports),
+  },
   priceAccounts,
   maxQuoteSpreadBps: process.env.SOLVER_MAX_SPREAD_BPS ? Number(process.env.SOLVER_MAX_SPREAD_BPS) : undefined,
   allowUnpriced: process.env.SOLVER_ALLOW_UNPRICED === "1",

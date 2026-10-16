@@ -14,7 +14,6 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
 import bs58 from "bs58";
@@ -37,9 +36,11 @@ import { validateIntent, type ValidatedIntent } from "./validate.js";
 import { PriceReader, checkEconomics } from "./economics.js";
 import { NonceConflictError, SubmissionJournal } from "./journal.js";
 import { IntentAuthorizationError, SubmissionCoordinator } from "./submission.js";
+import { prepareVersionedTransaction, type LookupTableRequest, type TransactionLimits } from "./transactions.js";
 
 export interface RoutePlan {
   instructions: TransactionInstruction[];
+  lookupTables?: LookupTableRequest[];
 }
 
 export interface RoutePlanner {
@@ -64,6 +65,7 @@ export interface SolverDeps {
   keypair: Keypair;
   planner: RoutePlanner;
   journal: SubmissionJournal;
+  transactionLimits?: TransactionLimits;
   /** mint base58 -> Pyth price update account base58 (user-pinned feeds). */
   priceAccounts: Record<string, string>;
   /** How much more than the input's value the solver will deliver; default 100 bps. */
@@ -180,14 +182,10 @@ export function buildServer(deps: SolverDeps): Server {
     const setup: TransactionInstruction[] = [createAtaIdempotentIx(solver, solver, inMint)];
     if (deps.createPocketAta) setup.push(createAtaIdempotentIx(solver, pocket, outMint));
 
-    const tx = new Transaction().add(...setup, pre, begin, ...route.instructions, end);
-    tx.feePayer = solver;
-    const latest = await deps.connection.getLatestBlockhashAndContext({ commitment: "confirmed", minContextSlot: minimumSlot });
-    const { blockhash, lastValidBlockHeight } = latest.value;
-    tx.recentBlockhash = blockhash;
-    tx.sign(deps.keypair);
-    return { rawBase64: tx.serialize().toString("base64"), signature: bs58.encode(tx.signature!),
-      blockhash, lastValidBlockHeight, minContextSlot: latest.context.slot };
+    return prepareVersionedTransaction(deps.connection, deps.keypair, {
+      instructions: [...setup, pre, begin, ...route.instructions, end], lookupTables: route.lookupTables,
+      minimumSlot, deadlineSlot: v.intent.deadlineSlot, limits: deps.transactionLimits,
+    });
   }
 
   return router.server();

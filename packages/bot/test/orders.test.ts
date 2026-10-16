@@ -39,6 +39,26 @@ async function world() {
 }
 
 describe("durable bot orders", () => {
+  it("shares authorization freshness across consent replacement, migrates old contexts and authenticates the shared record", async () => {
+    const w = await world();
+    const next = (await w.m.create(initData(), { requestKey: requestKey(9), appId: w.consent.appId,
+      home: w.consent.home, sessionExpirySlot: "10001" })).consent;
+    w.bank(200); w.override(next); await w.m.confirm(initData(), next.id);
+    w.bank(100); w.override();
+    await expect(w.prepare(2, w.params, w.manager())).rejects.toThrow(/stale/);
+    expect(w.chain.getAccountInfoAndContext).toHaveBeenLastCalledWith(expect.any(PublicKey), { commitment: "confirmed", minContextSlot: 200 });
+    const db = new DatabaseSync(w.path);
+    try {
+      db.exec("DROP TABLE bot_contexts"); // Prior schema had only per-consent floors.
+      const restored = w.manager();
+      await expect(w.prepare(2, w.params, restored)).rejects.toThrow(/stale/);
+      const row = db.prepare("SELECT record FROM bot_contexts LIMIT 1").get()!.record as Uint8Array;
+      const corrupt = Buffer.from(row); corrupt[0]! ^= 1;
+      db.prepare("UPDATE bot_contexts SET record=?").run(corrupt);
+      await expect(w.prepare(2)).rejects.toThrow();
+    } finally { db.close(); }
+  });
+
   it("allocates distinct nonces across workers; identical business retries recover exactly the same signed intent", async () => {
     const w = await world(), second = w.manager();
     const [a, retry, b] = await Promise.all([w.prepare(2), w.prepare(2, w.params, second), w.prepare(3, w.params, second)]);

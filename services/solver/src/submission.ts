@@ -49,14 +49,18 @@ export class SubmissionCoordinator {
     const id = bytesToHex(v.hash), prior = this.#journal.get(id);
     await this.#genesis();
     const head = await this.#rpc(this.#chain.getSlot("confirmed")); this.#context(head, 0);
-    const slot = Math.max(head, minimumSlot, prior?.authorizationSlot ?? 0, prior?.transaction?.minContextSlot ?? 0);
+    const pocket = new PublicKey(v.intent.pocket);
+    const slot = Math.max(head, minimumSlot, prior?.authorizationSlot ?? 0, prior?.transaction?.minContextSlot ?? 0,
+      this.#journal.authorizationSlot(pocket.toBase58()));
     const response = await this.#rpc(this.#chain.getAccountInfoAndContext(new PublicKey(v.intent.pocket), { commitment: "confirmed", minContextSlot: slot }));
     this.#context(response.context.slot, slot);
     this.#journal.authorizedContext(id, response.context.slot);
     if (!response.value) throw new IntentAuthorizationError("pocket not found");
     const a = readPocketAccount(response.value);
+    if (!pocketPda(a.appId).equals(pocket)) throw new IntentAuthorizationError();
+    this.#journal.observePocketContext(pocket.toBase58(), response.context.slot);
     const key = new Uint8Array(33); key.set(v.sessionKey);
-    if (!pocketPda(a.appId).equals(new PublicKey(v.intent.pocket)) || a.sessionKind !== v.sessionKind ||
+    if (a.sessionKind !== v.sessionKind ||
       !Buffer.from(a.sessionKey).equals(Buffer.from(key)) || !Buffer.from(policyHash(a.policy)).equals(Buffer.from(v.intent.policyHash)) ||
       a.sessionExpirySlot <= BigInt(response.context.slot) || v.intent.deadlineSlot < BigInt(response.context.slot) ||
       isPocketNonceUsed(a, v.intent.nonce)) throw new IntentAuthorizationError();

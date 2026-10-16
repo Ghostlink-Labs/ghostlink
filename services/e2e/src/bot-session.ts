@@ -77,12 +77,12 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
       let result = await send(restartedUrl);
       const deadline = Date.now() + 20_000;
       while (!["confirmed", "finalized", "failed", "expired"].includes(result.state) && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 1_000));
         const status = await fetch(`${restartedUrl}/intents/${result.intentHashHex}`);
-        if (!status.ok) throw new Error("solver status unavailable");
+        if (!status.ok) throw new Error(`solver status HTTP ${status.status}; last outcome ${result.state} (${result.reason ?? "no reason"})`);
         result = await status.json() as IntentSubmission;
       }
-      if (result.signature !== first.signature || !["confirmed", "finalized"].includes(result.state)) throw new Error(`restarted trade not confirmed: ${result.state}`);
+      if (result.signature !== first.signature || !["confirmed", "finalized"].includes(result.state)) throw new Error(`restarted trade not confirmed: ${result.state} (${result.reason ?? "no reason"})`);
       return { signature: first.signature };
     },
     async close() { await stop(); store.close(); key.fill(0); rmSync(dir, { recursive: true, force: true }); },

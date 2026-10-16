@@ -63,6 +63,10 @@ function world() {
   });
   const manager = (j = journal()) => new SubmissionCoordinator(chain as unknown as SubmissionChain, j, 1000);
   return { dir, path, key, scope, v, prepare, journal, manager, chain,
+    intentAt: (nonce: bigint): ValidatedIntent => {
+      const next = { ...intent, nonce }, hash = intentHash(next);
+      return { ...v, intent: next, hash, signature: ed25519.sign(hash, session.secretKey.subarray(0, 32)) };
+    },
     clock: (n: number) => { now += n; }, useNonce: () => { used = true; }, revoke: () => { expiry = 0n; },
     setStatus: (s: SignatureStatus | null) => { status = s; }, setContext: (s: number) => { context = s; },
     setGenesis: (g: string) => { genesis = g; }, setExpiry: () => { height = finalizedHeight = 501; validHash = false; context = accountContext = head = 700; },
@@ -71,6 +75,28 @@ function world() {
 }
 
 describe("durable submission and reconciliation", () => {
+  it("shares refused authorization context across intents without allocating a trade, and migrates prior account floors", async () => {
+    const w = world(), first = w.manager(); await first.submit(w.v, w.prepare);
+    const other = w.intentAt(8n); w.bank(200); w.revoke();
+    await expect(first.submit(other, w.prepare)).rejects.toThrow(/authorized/);
+    expect(w.journal().get(identityFor(other).intentHashHex)).toBeUndefined();
+    w.bank(100); w.restoreAuthority();
+    await w.manager().submit(w.v, w.prepare);
+    await expect(w.manager().submit(other, w.prepare)).rejects.toThrow(/stale/);
+    expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(w.chain.getAccountInfoAndContext).toHaveBeenLastCalledWith(expect.any(PublicKey), { commitment: "confirmed", minContextSlot: 200 });
+    w.journal().authorizedContext(identityFor(w.v).intentHashHex, 200);
+    const db = new DatabaseSync(w.path);
+    try {
+      db.exec("DROP TABLE pocket_contexts"); // Upgrade from records containing only per-intent account floors.
+      const upgraded = w.journal(); expect(upgraded.authorizationSlot(identityFor(w.v).pocket)).toBe(200);
+      const original = db.prepare("SELECT record FROM pocket_contexts LIMIT 1").get()!.record as Uint8Array;
+      const corrupt = Buffer.from(original); corrupt[0]! ^= 1;
+      db.prepare("UPDATE pocket_contexts SET record=?").run(corrupt);
+      expect(() => upgraded.authorizationSlot(identityFor(w.v).pocket)).toThrow();
+    } finally { db.close(); }
+  });
+
   it("never rebroadcasts using account state older than preparation or a later revocation observation, including after restart", async () => {
     const w = world(); await w.manager().submit(w.v, w.prepare);
     expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(1);

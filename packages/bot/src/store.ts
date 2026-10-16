@@ -25,12 +25,21 @@ export class BotKeyStore {
       // Existing consent databases are upgraded in place, without changing key envelopes.
       const columns = this.#db.prepare("PRAGMA table_info(consent)").all();
       if (!columns.some(c => c.name === "observed_slot")) this.#db.exec("ALTER TABLE consent ADD COLUMN observed_slot INTEGER NOT NULL DEFAULT 0");
-      this.#db.exec(`CREATE TABLE IF NOT EXISTS bot_orders (
+      const hasContexts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bot_contexts'").get();
+      this.#db.exec(`CREATE TABLE IF NOT EXISTS bot_contexts (scope TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;
+      CREATE TABLE IF NOT EXISTS bot_orders (
         bot_id TEXT NOT NULL, user_id TEXT NOT NULL, request_key TEXT NOT NULL,
         scope TEXT NOT NULL, nonce TEXT NOT NULL, deadline TEXT NOT NULL, record BLOB NOT NULL,
         PRIMARY KEY(bot_id,user_id,request_key), UNIQUE(scope,nonce)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS bot_counters (scope TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;`);
+      if (!hasContexts) {
+        for (const row of this.#db.prepare("SELECT payload, confirmed_slot, observed_slot FROM consent").all()) {
+          const consent = JSON.parse(String(row.payload)) as BotConsent;
+          const slot = Math.max(Number(row.confirmed_slot ?? 0), Number(row.observed_slot));
+          this.#advanceContext(consent, Math.max(slot, this.authorizationSlot(consent)));
+        }
+      }
     }); } catch (error) { this.#storage.close(); throw error; }
   }
 
@@ -45,6 +54,21 @@ export class BotKeyStore {
   #sealJson(value: unknown, aad: string): Buffer {
     const plain = Buffer.from(JSON.stringify(value));
     try { return this.#encrypt(plain, aad); } finally { plain.fill(0); }
+  }
+
+  /** Confirmed account floor shared by all consent records for the same deployment/pocket. */
+  authorizationSlot(c: BotConsent): number {
+    const scope = orderScope(c), row = this.#db.prepare("SELECT record FROM bot_contexts WHERE scope=?").get(scope);
+    if (!row) return 0;
+    const slot = this.#openJson<number>(row.record as Uint8Array, "ghostlink:bot-authority:v1:" + scope);
+    if (!Number.isSafeInteger(slot) || slot < 0) throw new Error("invalid authorization context");
+    return slot;
+  }
+  #advanceContext(c: BotConsent, slot: number): void {
+    if (!Number.isSafeInteger(slot) || slot < this.authorizationSlot(c)) throw new Error("authorization context is stale");
+    const scope = orderScope(c);
+    this.#db.prepare("INSERT INTO bot_contexts VALUES (?,?) ON CONFLICT(scope) DO UPDATE SET record=excluded.record")
+      .run(scope, this.#sealJson(slot, "ghostlink:bot-authority:v1:" + scope));
   }
 
   #expire(now: number): void {
@@ -90,6 +114,7 @@ export class BotKeyStore {
     this.#transaction(() => {
       const current = this.read(id, botId, userId, now);
       if (!Number.isSafeInteger(slot) || slot < Math.max(current.confirmedSlot ?? 0, current.observedSlot ?? 0)) throw new Error("authorization context is stale");
+      this.#advanceContext(current.consent, slot);
       this.#db.prepare("UPDATE consent SET observed_slot=? WHERE id=?").run(slot, id);
     });
   }
@@ -97,7 +122,7 @@ export class BotKeyStore {
   assertActive(id: string, botId: string, userId: string, now: number, slot: number): BotConsent {
     const current = this.read(id, botId, userId, now);
     if (current.state !== "confirmed") throw new Error("bot session is not active locally");
-    if (slot < Math.max(current.confirmedSlot ?? 0, current.observedSlot ?? 0)) throw new Error("authorization context is stale");
+    if (slot < Math.max(current.confirmedSlot ?? 0, current.observedSlot ?? 0, this.authorizationSlot(current.consent))) throw new Error("authorization context is stale");
     return current.consent;
   }
 
@@ -105,6 +130,7 @@ export class BotKeyStore {
     return this.#transaction(() => {
       const current = this.read(id, botId, userId, now);
       if (slot < Math.max(current.confirmedSlot ?? 0, current.observedSlot ?? 0)) throw new Error("authorization context is stale");
+      this.#advanceContext(current.consent, slot);
       if (current.state === "confirmed") return current;
       if (current.state !== "pending") throw new Error("consent request is no longer pending");
       this.#db.prepare("UPDATE consent SET state='confirmed', confirmed_slot=? WHERE id=? AND state='pending'").run(slot, id);

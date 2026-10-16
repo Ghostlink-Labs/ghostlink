@@ -154,7 +154,8 @@ export class BotOnboarding {
     if (JSON.stringify(consent.deployment) !== JSON.stringify(this.#deployment) || consent.appOrigin !== this.#origin) {
       throw new Error("stored consent belongs to another configured application or deployment");
     }
-    const slot = Math.max(await this.#head(consent.deployment), row.confirmedSlot ?? 0, row.observedSlot ?? 0);
+    const slot = Math.max(await this.#head(consent.deployment), row.confirmedSlot ?? 0, row.observedSlot ?? 0,
+      this.#store.authorizationSlot(consent));
     const response = await this.#chain.getAccountInfoAndContext(new PublicKey(consent.pocket), {
       commitment: "confirmed", minContextSlot: slot,
     });

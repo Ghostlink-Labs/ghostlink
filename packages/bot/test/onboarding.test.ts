@@ -18,7 +18,7 @@ function world() {
   const key = randomBytes(32);
   const stores: BotKeyStore[] = [];
   cleanup.push(() => { for (const s of stores) s.close(); });
-  const store = (file = path) => { const s = new BotKeyStore(file, key); stores.push(s); return s; };
+  const store = (file = path, encryptionKey = key) => { const s = new BotKeyStore(file, encryptionKey); stores.push(s); return s; };
   let now = NOW;
   let head = 100;
   let context = 100;
@@ -73,9 +73,12 @@ describe("durable bot authorization", () => {
     expect(verify(null, intentHash(signed.intent), publicKey, signed.signature.signature)).toBe(true);
     // Ordinary restart does not cancel newly installed consent; another RESTORE must do so.
     expect(w.manager(w.store(restoredPath)).status(initData(), fresh.id).state).toBe("confirmed");
-    const againArchive = w.path + ".again.enc"; await w.store(restoredPath).backupTo(againArchive);
-    const again = BotKeyStore.restoreBackup(againArchive, w.path + "-again", w.key);
-    expect(w.manager(w.store(again)).status(initData(), fresh.id).state).toBe("cancelled");
+    const nextKey = randomBytes(32); w.store(restoredPath).rotateKey(nextKey);
+    const rotated = w.store(restoredPath, nextKey);
+    expect(w.manager(rotated).status(initData(), fresh.id).state).toBe("confirmed");
+    const againArchive = w.path + ".again.enc"; await rotated.backupTo(againArchive);
+    const again = BotKeyStore.restoreBackup(againArchive, w.path + "-again", nextKey);
+    expect(w.manager(w.store(again, nextKey)).status(initData(), fresh.id).state).toBe("cancelled");
   });
 
   it("keeps one encrypted key across duplicate requests and process-style restart, then signs only after chain confirmation", async () => {

@@ -39,6 +39,30 @@ async function world() {
 }
 
 describe("durable bot orders", () => {
+  it("rotates storage keys without changing orders or nonces and fences a signer paused before persistence", async () => {
+    const w = await world(), next = randomBytes(32), signed = await w.prepare(2);
+    const stale = new BotKeyStore(w.path, w.key); cleanup.push(() => stale.close());
+    const staleManager = w.manager(stale), original = stale.withSeed.bind(stale);
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(stale, "withSeed").mockImplementation(async (...args) => {
+      const result = await original(...args); enter(); await paused; return result;
+    });
+    const pending = w.prepare(3, w.params, staleManager);
+    await entered; w.store.rotateKey(next); release();
+    await expect(pending).rejects.toThrow(/key changed/);
+    expect(() => new BotKeyStore(w.path, w.key)).toThrow();
+    const rotated = new BotKeyStore(w.path, next); cleanup.push(() => rotated.close());
+    const manager = w.manager(rotated);
+    expect(manager.status(initData(), w.consent.id).state).toBe("confirmed");
+    expect(await w.prepare(2, w.params, manager)).toEqual(signed);
+    const recovered = await w.prepare(3, w.params, manager);
+    expect(recovered.intent.nonce).toBe(1n);
+    expect((await w.prepare(4, w.params, manager)).intent.nonce).toBe(2n);
+    expect(() => stale.cancel(w.consent.id, USER.botId, USER.userId, NOW)).toThrow(/key changed/);
+  });
+
   it("shares authorization freshness across consent replacement, migrates old contexts and authenticates the shared record", async () => {
     const w = await world();
     const next = (await w.m.create(initData(), { requestKey: requestKey(9), appId: w.consent.appId,

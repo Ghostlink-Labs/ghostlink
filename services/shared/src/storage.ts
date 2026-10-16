@@ -9,6 +9,18 @@ const BACKUP_MAGIC = Buffer.from("GHOSTLINK-SQLITE-BACKUP-1\n");
 const MAX_BACKUP_BYTES = 128 * 1024 * 1024;
 const backupAad = (namespace: string) => "ghostlink:sqlite-backup:v1:" + namespace;
 
+export interface EncryptedTable {
+  name: string;
+  /** Complete schema, so a future encrypted column cannot silently retain the old key. */
+  columns: readonly string[];
+  primaryKey: readonly string[];
+  encrypted: Readonly<Record<string, (row: Record<string, unknown>) => string>>;
+}
+const identifier = (name: string) => {
+  if (!/^[a-z][a-z0-9_]*$/.test(name)) throw new Error("invalid storage schema identifier");
+  return '"' + name + '"';
+};
+
 function readBounded(path: string, maximum: number): Buffer {
   const fd = openSync(path, "r");
   let bytes: Buffer | undefined, success = false;
@@ -45,12 +57,20 @@ function decrypt(key: Uint8Array, value: Uint8Array, aad: string): Buffer {
   try { return Buffer.concat([plain, decipher.final()]); }
   finally { plain.fill(0); }
 }
+function encrypt(key: Uint8Array, secret: Uint8Array, aad: string): Buffer {
+  const iv = randomBytes(12), cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(aad));
+  const bytes = Buffer.concat([cipher.update(secret), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), bytes]);
+}
 
 export class EncryptedSqlite {
   #db!: DatabaseSync;
   #key: Buffer;
   #namespace: string;
   #closed = false;
+  #ready = false;
+  #inTransaction = false;
 
   constructor(path: string, encryptionKey: Uint8Array, namespace: string) {
     if (encryptionKey.length !== 32) throw new Error("storage requires a 32-byte encryption key");
@@ -72,11 +92,30 @@ export class EncryptedSqlite {
           finally { check.fill(0); }
         } else this.#db.prepare("INSERT INTO metadata VALUES ('key-check-v1', ?)").run(this.seal(Buffer.from(value), aad));
       });
-    } catch (error) { this.#db?.close(); this.#key.fill(0); throw error; }
+      this.#ready = true;
+    } catch (error) {
+      try { this.close(); } catch { /* Preserve the original open/authentication failure. */ }
+      throw error;
+    }
   }
 
-  get db(): DatabaseSync { return this.#db; }
-  close(): void { try { if (!this.#closed) this.#db.close(); } finally { this.#closed = true; this.#key.fill(0); } }
+  #verifyKey(db = this.#db): void {
+    if (this.#closed) throw new Error("storage is closed");
+    const row = db.prepare("SELECT value FROM metadata WHERE name='key-check-v1'").get();
+    if (!row) throw new Error("database key check is missing");
+    let plain: Buffer | undefined;
+    try {
+      plain = decrypt(this.#key, row.value as Uint8Array, this.#namespace + ":key-check:v1");
+      if (plain.toString() !== this.#namespace + ":v1") throw new Error("invalid key check");
+    } catch { throw new Error("storage key changed or database authentication failed; reopen with the approved key"); }
+    finally { plain?.fill(0); }
+  }
+  #checkCurrentKey(): void {
+    if (this.#closed) throw new Error("storage is closed");
+    if (this.#ready && !this.#inTransaction) this.#verifyKey();
+  }
+  get db(): DatabaseSync { this.#checkCurrentKey(); return this.#db; }
+  close(): void { try { if (!this.#closed) this.#db?.close(); } finally { this.#closed = true; this.#key.fill(0); } }
 
   /** A new epoch on EVERY restore, even when restoring a backup of an earlier restore. */
   get recoveryId(): string | undefined {
@@ -92,7 +131,7 @@ export class EncryptedSqlite {
 
   /** Consistent SQLite snapshot including committed WAL pages. Never overwrites an archive. */
   async backupTo(destination: string): Promise<void> {
-    if (this.#closed) throw new Error("storage is closed");
+    this.#checkCurrentKey();
     const temp = mkdtempSync(join(dirname(destination), ".ghostlink-backup-"));
     chmodSync(temp, 0o700);
     const snapshot = join(temp, "snapshot.sqlite");
@@ -100,6 +139,10 @@ export class EncryptedSqlite {
     try {
       closeSync(openSync(snapshot, "wx", 0o600));
       await backup(this.#db, snapshot);
+      // Another connection can rotate while the asynchronous SQLite backup is running.
+      // Never wrap new-key records in an archive encrypted by a stale connection's old key.
+      const check = new DatabaseSync(snapshot, { readOnly: true, allowExtension: false });
+      try { this.#verifyKey(check); } finally { check.close(); }
       plain = readBounded(snapshot, MAX_BACKUP_BYTES);
       writeFileSync(destination, Buffer.concat([BACKUP_MAGIC, this.seal(plain, backupAad(this.#namespace))]), { flag: "wx", mode: 0o600, flush: true });
       syncDirectory(dirname(destination));
@@ -145,22 +188,84 @@ export class EncryptedSqlite {
   }
 
   transaction<T>(fn: () => T): T {
+    if (this.#inTransaction) throw new Error("nested storage transaction");
     this.#db.exec("BEGIN IMMEDIATE");
-    try { const result = fn(); this.#db.exec("COMMIT"); return result; }
-    catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    try {
+      this.#checkCurrentKey(); this.#inTransaction = true;
+      const result = fn();
+      if (result && typeof (result as { then?: unknown }).then === "function") throw new Error("storage transaction callback must be synchronous");
+      this.#db.exec("COMMIT"); return result;
+    }
+    catch (error) {
+      try { this.#db.exec("ROLLBACK"); }
+      catch {
+        // SQLite can already have rolled back on an I/O/resource failure. Preserve that cause
+        // and retire this connection rather than permitting work on an uncertain transaction.
+        try { this.close(); } catch { /* The original failure remains the actionable error. */ }
+      }
+      throw error;
+    }
+    finally { this.#inTransaction = false; }
+  }
+
+  /** Atomic planned rotation on the same database. All other handles must reopen afterward. */
+  rotateKey(nextKey: Uint8Array, tables: readonly EncryptedTable[], metadataAad: Readonly<Record<string, string>> = {}): void {
+    if (nextKey.length !== 32 || Buffer.from(nextKey).equals(this.#key)) throw new Error("rotation requires a different 32-byte key");
+    const replacement = Buffer.from(nextKey);
+    let committed = false;
+    try {
+      this.transaction(() => {
+        const expected = [...tables, { name: "metadata", columns: ["name", "value"], primaryKey: ["name"], encrypted: {
+          value: (row: Record<string, unknown>) => {
+            const name = String(row.name);
+            if (name === "key-check-v1") return this.#namespace + ":key-check:v1";
+            if (name === "restore-v1") return this.#namespace + ":restore:v1";
+            if (Object.hasOwn(metadataAad, name)) return metadataAad[name]!;
+            throw new Error("unrecognized encrypted metadata; rotation requires a schema update");
+          },
+        } }];
+        const schema = this.#db.prepare("SELECT name,type FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' AND type IN ('table','view','trigger')").all();
+        if (schema.length !== expected.length || new Set(expected.map(t => t.name)).size !== expected.length ||
+          schema.some(row => row.type !== "table" || !expected.some(t => t.name === row.name))) throw new Error("unrecognized storage schema; rotation refused");
+        // Validate ALL schemas before changing anything. User callbacks supply AAD, never SQL.
+        for (const table of expected) {
+          const columns = this.#db.prepare(`PRAGMA table_xinfo(${identifier(table.name)})`).all();
+          const primary = columns.filter(c => Number(c.pk) > 0).sort((a, b) => Number(a.pk) - Number(b.pk)).map(c => String(c.name));
+          if (columns.length !== table.columns.length || columns.some(c => !table.columns.includes(String(c.name))) ||
+            JSON.stringify(primary) !== JSON.stringify(table.primaryKey) || !primary.length ||
+            Object.keys(table.encrypted).some(c => !table.columns.includes(c) || primary.includes(c))) throw new Error("unrecognized storage columns; rotation refused");
+        }
+        for (const table of expected) {
+          const encrypted = Object.entries(table.encrypted);
+          if (!encrypted.length) continue;
+          const update = this.#db.prepare(`UPDATE ${identifier(table.name)} SET ${encrypted.map(([column]) => identifier(column) + "=?").join(",")} WHERE ${table.primaryKey.map(column => identifier(column) + "=?").join(" AND ")}`);
+          for (const row of this.#db.prepare(`SELECT * FROM ${identifier(table.name)}`).all()) {
+            const values = encrypted.map(([column, aadFor]) => {
+              if (row[column] === null) return null;
+              if (!(row[column] instanceof Uint8Array)) throw new Error("invalid encrypted storage column");
+              const aad = aadFor(row), plain = this.open(row[column] as Uint8Array, aad);
+              try { return encrypt(replacement, plain, aad); } finally { plain.fill(0); }
+            });
+            const keys = table.primaryKey.map(column => {
+              if (typeof row[column] !== "string") throw new Error("invalid storage row identity");
+              return row[column] as string;
+            });
+            if (Number(update.run(...values, ...keys).changes) !== 1) throw new Error("storage rotation lost a row");
+          }
+        }
+      });
+      committed = true;
+      this.#key.fill(0); this.#key = replacement;
+    } finally { if (!committed) replacement.fill(0); }
   }
 
   seal(secret: Uint8Array, aad: string): Buffer {
-    if (this.#closed) throw new Error("storage is closed");
-    const iv = randomBytes(12);
-    const cipher = createCipheriv("aes-256-gcm", this.#key, iv);
-    cipher.setAAD(Buffer.from(aad));
-    const bytes = Buffer.concat([cipher.update(secret), cipher.final()]);
-    return Buffer.concat([iv, cipher.getAuthTag(), bytes]);
+    this.#checkCurrentKey();
+    return encrypt(this.#key, secret, aad);
   }
 
   open(value: Uint8Array, aad: string): Buffer {
-    if (this.#closed) throw new Error("storage is closed");
+    this.#checkCurrentKey();
     return decrypt(this.#key, value, aad);
   }
 }

@@ -1,6 +1,6 @@
 # Encrypted backup and recovery
 
-Status: localnet candidate. A disposable validator drill exercises actual owner rotation, settlement and sweep after restoring both databases. Automated multi-host cutover, continuous backup orchestration, storage-key rotation and production disaster recovery remain release gates.
+Status: localnet candidate. A disposable validator drill exercises owner rotation, settlement and sweep after restoring both databases, then rotates both storage keys while preserving orders and transaction identity. Automated multi-host cutover, production secret distribution/retirement, continuous backup orchestration and production disaster recovery remain release gates.
 
 ## Archive and restore contract
 
@@ -56,18 +56,51 @@ if (state.rotationRequired) throw new Error('Owner rotation is not finalized yet
 // Confirm consent through BotOnboarding before permitting signing.
 ```
 
-The snippet shows APIs, not a distributed maintenance lock. Stop all source processes before cutover. Do not share SQLite files over a network filesystem. An operator holding the key can replay a valid old archive: authentication prevents tampering, not rollback. The independent log, fresh keys, on-chain rotation and business reconciliation are necessary. Changing the storage-key file is not re-encryption; tested storage-key migration remains unfinished.
+The snippet shows APIs, not a distributed maintenance lock. Stop all source processes before cutover. Do not share SQLite files over a network filesystem. An operator holding the key can replay a valid old archive: authentication prevents tampering, not rollback. The independent log, fresh keys, on-chain rotation and business reconciliation are necessary.
+
+## Planned storage-key rotation
+
+`BotKeyStore.rotateKey(nextKey)` and `SubmissionJournal.rotateKey(nextKey)` re-encrypt the existing database in one SQLite write transaction. They preserve consent, bot signing seeds, order IDs, nonce reservations, exact transaction bytes, authority floors and restore/quarantine state. This operation does not restore an earlier snapshot or require new owner consent. Supply a different, independently generated 32-byte key for each store.
+
+Each encrypted record is authenticated under its original associated data before re-encryption. Unknown tables, columns, metadata, views or triggers are refused, so future schema changes need a reviewed migration. An authentication failure rolls back the entire change. The storage key check is committed with the records. Bot/solver workers using these APIs verify that check inside their write transactions; workers holding the old key must reopen and cannot commit old-key records afterward. A signature computed by a stale worker is not released if its final persistence step fails. A racing backup is refused if its snapshot and encryption key disagree.
+
+Use a planned maintenance window:
+
+1. Provision fresh random key bytes into a protected, versioned secret entry **before** rotation. Confirm that operators can recover both current and replacement versions. Keep keys out of command arguments, logs and source control. Do not overwrite the only copy of the current key.
+2. Stop ingress, schedulers and all workers, drain in-flight work, then take verified backups. Open the exact existing database path with its current key. Confirm its deployment identity and known order/transaction records; a mistyped new path must not become an empty replacement database.
+3. Call `rotateKey` using the replacement secret. This blocks database writes for the full migration and reads each table into memory; measure duration and memory on representative production data before scheduling a cutover. Do not run schema upgrades concurrently.
+4. Close the maintenance handle, update the service's key-version reference and reopen with the replacement key. Check known consent/orders or transaction identities and recovery state, then take and restore-test a new backup. Restart workers with the new version. Rotation of bot and solver databases is individually atomic, not a cross-database transaction: record each one's actual key version separately.
+5. If the process dies or the result is ambiguous, stop all workers and determine which approved key opens the **same** database. A tested mid-transaction process exit recovers the complete old-key state; a committed rotation requires the new key. Preserve the original storage error. Do not initialize a new database, discard reservations or restore an older snapshot merely to resolve a key-version mismatch.
+
+Example maintenance calls after the replacement secrets have been durably provisioned:
+
+```ts
+const nextBotKey = readFileSync(nextBotKeyPath);
+const nextSolverKey = readFileSync(nextSolverKeyPath);
+try {
+  botStore.rotateKey(nextBotKey);
+  journal.rotateKey(nextSolverKey);
+} finally {
+  nextBotKey.fill(0);
+  nextSolverKey.fill(0);
+}
+// Close stores; verify reopening with the new versions before restarting services.
+```
+
+Older archives remain encrypted by their original key. Retain those key versions separately according to the backup retention policy; changing the current key does not re-encrypt archived copies. Old ciphertext can also remain in database free pages, WAL files, filesystem snapshots or storage-device history. This API makes no forensic-erasure guarantee. Follow the storage retention/sanitization procedure before retiring a key. SQLite documents [transaction rollback behavior](https://www.sqlite.org/lang_transaction.html) and [deleted-content retention](https://www.sqlite.org/pragma.html#pragma_secure_delete).
+
+Storage-key rotation deliberately preserves bot signing keys. If a storage key or bot seed was exposed, use owner-authorized on-chain revocation and fresh session keys as part of incident recovery; re-encryption alone cannot remove an attacker's signing capability. Production secret-manager distribution, old-key access policy, capacity rehearsal and incident response still require deployment-specific acceptance.
 
 ## Reproduction
 
 After building the workspace, development circuit artifacts and reviewed program binaries, run on Linux/WSL:
 
 ```sh
-RESTORE_DRILL=1 CARGO_TARGET_DIR=/path/to/reviewed/program-build bash scripts/localnet-e2e.sh
+RESTORE_DRILL=1 KEY_ROTATION_DRILL=1 CARGO_TARGET_DIR=/path/to/reviewed/program-build bash scripts/localnet-e2e.sh
 ```
 
-The drill uses synthetic Telegram authentication and inventory prices on a disposable validator. It snapshots both stores, releases a signature after the snapshot, restores into new paths, rejects the old signer, pins fresh consent, submits a real owner login proof, waits for finalized rotation, rejects the old signature again, then completes a versioned fill through lost acknowledgment/restart and sweeps the entire output balance home.
+The drill uses synthetic Telegram authentication and inventory prices on a disposable validator. It snapshots both stores, releases a signature after the snapshot, restores into new paths, rejects the old signer, pins fresh consent, submits a real owner login proof and waits for finalized rotation. It then re-encrypts the bot after order signing and the solver after losing a broadcast acknowledgment, reopens both with their new keys, recovers the same signed order and transaction, confirms the versioned fill and sweeps the entire output balance home.
 
-File-backed tests cover WAL inclusion, snapshot isolation, corruption, wrong key/scope, overwrite refusal, repeated restore epochs, retained nonce reservations, exact pending-transaction reconciliation, delayed old rotations and separate finalized/confirmed freshness. The isolated packed bot consumer exercises the backup/restore API. No production credential, public-chain transaction or live-provider adoption is implied.
+File-backed tests cover WAL inclusion, snapshot isolation, corruption, wrong key/scope, overwrite refusal, repeated restore epochs, retained nonce reservations, exact pending-transaction reconciliation, delayed old rotations and separate finalized/confirmed freshness. Rotation tests include process exit midway through re-encryption, automatic SQLite rollback, unknown schema refusal, stale workers, an in-flight signer, restore metadata and a racing backup. The isolated packed bot consumer exercises backup/restore and key rotation. No production credential, public-chain transaction or live-provider adoption is implied.
 
 Node's [SQLite backup API](https://nodejs.org/docs/latest-v22.x/api/sqlite.html) requires Node 22.16 or later in that release line; Node 24 is also supported. See [transaction outcomes](TRANSACTION-RECOVERY.md) and [remaining release gates](MAINNET-READINESS.md).

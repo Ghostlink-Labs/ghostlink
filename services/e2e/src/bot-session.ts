@@ -21,7 +21,7 @@ function initData() {
 
 export async function startBotFixture(connection: Connection, appOrigin: string, policy: Policy) {
   const dir = mkdtempSync(join(tmpdir(), "ghostlink-bot-e2e-"));
-  const key = randomBytes(32);
+  let key = randomBytes(32), rotateOnNextOrder = false;
   let path = join(dir, "bot.sqlite");
   let store = new BotKeyStore(path, key);
   const options = { botToken: TOKEN, chain: connection, appOrigin, policy,
@@ -43,8 +43,13 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
     return response.json() as Promise<ConsentStatus>;
   };
   await listen();
-  const restart = async () => {
-    await stop(); store.close();
+  const restart = async (rotate = false) => {
+    await stop();
+    if (rotate) {
+      const replacement = randomBytes(32); store.rotateKey(replacement);
+      key.fill(0); key = replacement;
+    }
+    store.close();
     store = new BotKeyStore(path, key);
     manager = new BotOnboarding({ ...options, store });
     server = createBotAuthorizationServer(manager, ownerOrigin);
@@ -53,7 +58,7 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
   const prepare = async (consent: BotConsent, params: BotIntentParams) => {
     const who = { botId: "12345", userId: "42" }, requestKey = randomBytes(32).toString("hex");
     const initial = await manager.prepareIntent(consent.id, who, { requestKey, params });
-    await restart();
+    await restart(rotateOnNextOrder); rotateOnNextOrder = false;
     const signed = await manager.prepareIntent(consent.id, who, { requestKey, params });
     if (signed.intent.nonce !== initial.intent.nonce || bytesToHex(signed.hash) !== bytesToHex(initial.hash) ||
         bytesToHex(signed.signature.signature) !== bytesToHex(initial.signature.signature)) throw new Error("bot restart changed the reserved trade");
@@ -67,6 +72,7 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
     create: (input: CreateConsent) => post("/requests", input),
     confirm: (id: string) => post(`/requests/${id}/confirm`, {}),
     restart,
+    rotateAfterNextOrder() { rotateOnNextOrder = true; },
     backup: () => store.backupTo(join(dir, "backup.enc")),
     async restore() {
       await stop(); store.close();

@@ -475,6 +475,8 @@ async function main() {
       solverFixture.assertNoTransactions();
       ok("encrypted bot and solver backups restored; old signature refused before and after finalized owner rotation");
     }
+    const rotationDrill = process.env.KEY_ROTATION_DRILL === "1";
+    if (rotationDrill) botFixture.rotateAfterNextOrder();
     const deadline = BigInt(await connection.getSlot("confirmed")) + 500n;
     const tx = await botFixture.fill(consent, solverUrl, {
       inMint: inputMint.toBytes(),
@@ -482,9 +484,10 @@ async function main() {
       outMint: outputMint.toBytes(),
       outMin: BigInt(process.env.OUT_MIN ?? "160000000"),
       deadlineSlot: deadline,
-    }, () => solverFixture!.restart());
+    }, () => solverFixture!.restart(rotationDrill));
     solverFixture.assertSingleTransaction();
     ok(`durably allocated bot intent filled after bot restart, lost acknowledgment and solver restart: ${tx.signature.slice(0, 16)}…`);
+    if (rotationDrill) ok("bot and solver storage keys rotated; consent, signed order and exact transaction survived reopening with new keys");
 
     const expectedOut = process.env.OUT_MIN ?? "160000000";
     const outBalance = await connection.getTokenAccountBalance(ataAddress(pocket, outputMint));

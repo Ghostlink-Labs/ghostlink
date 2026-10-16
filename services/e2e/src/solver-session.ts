@@ -27,7 +27,7 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
   const setupResult = await connection.confirmTransaction({ signature: setupSignature, ...lifetime }, "finalized");
   if (setupResult.value.err) throw new Error("lookup-table fixture setup failed");
   const dir = mkdtempSync(join(tmpdir(), "ghostlink-solver-e2e-"));
-  let path = join(dir, "solver.sqlite"); const key = randomBytes(32);
+  let path = join(dir, "solver.sqlite"), key = randomBytes(32);
   const scope = { genesisHash: await connection.getGenesisHash(), pocketProgram: POCKET_PROGRAM_ID, solver: keypair.publicKey.toBase58() };
   let journal = new SubmissionJournal(path, key, scope);
   let first = true, plans = 0, simulations = 0, feeChecks = 0;
@@ -88,9 +88,14 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
     assertNoTransactions() {
       if (plans || packets.size) throw new Error("quarantined solver prepared or broadcast a transaction");
     },
-    async restart() {
+    async restart(rotate = false) {
       if (first) throw new Error("fixture never reached the lost-acknowledgment boundary", { cause: broadcastFailure });
-      await stop(); journal.close(); journal = new SubmissionJournal(path, key, scope); server = build(); return listen();
+      await stop();
+      if (rotate) {
+        const replacement = randomBytes(32); journal.rotateKey(replacement);
+        key.fill(0); key = replacement;
+      }
+      journal.close(); journal = new SubmissionJournal(path, key, scope); server = build(); return listen();
     },
     assertSingleTransaction(count = 1) {
       if (plans !== count || packets.size !== count || simulations !== 2 * count || feeChecks !== count) {

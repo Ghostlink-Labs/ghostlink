@@ -10,6 +10,7 @@ import { consentHash, counter, decodeIntent, encodeIntent, orderScope, padded, U
 /** Local-disk SQLite; transactional across processes on the same machine. */
 export class BotKeyStore {
   #storage: EncryptedSqlite;
+  #inTransaction = false;
   get #db() { return this.#storage.db; }
 
   constructor(path: string, encryptionKey: Uint8Array) {
@@ -60,7 +61,28 @@ export class BotKeyStore {
   static restoreBackup(archive: string, newDirectory: string, key: Uint8Array): string {
     return EncryptedSqlite.restoreBackup(archive, newDirectory, key, "ghostlink:bot-store");
   }
-  #transaction<T>(fn: () => T): T { return this.#storage.transaction(fn); }
+  /** Planned storage-key rotation preserves consent and exact orders; restart other workers afterward. */
+  rotateKey(nextKey: Uint8Array): void {
+    this.#storage.rotateKey(nextKey, [
+      { name: "consent", primaryKey: ["id"], columns: ["id", "bot_id", "user_id", "request_key", "fingerprint", "payload",
+        "encrypted_key", "state", "expires_at", "confirmed_slot", "observed_slot"], encrypted: { encrypted_key: row => String(row.payload) } },
+      { name: "bot_contexts", primaryKey: ["scope"], columns: ["scope", "record"],
+        encrypted: { record: row => "ghostlink:bot-authority:v1:" + String(row.scope) } },
+      { name: "bot_counters", primaryKey: ["scope"], columns: ["scope", "record"],
+        encrypted: { record: row => "ghostlink:bot-counter:v1:" + String(row.scope) } },
+      { name: "bot_orders", primaryKey: ["bot_id", "user_id", "request_key"],
+        columns: ["bot_id", "user_id", "request_key", "scope", "nonce", "deadline", "record"],
+        encrypted: { record: row => this.#orderAad(String(row.bot_id), String(row.user_id), String(row.request_key),
+          String(row.scope), String(row.nonce), String(row.deadline)) } },
+    ], { "bot-restore-applied-v1": "ghostlink:bot-store:restore-applied:v1" });
+  }
+  #transaction<T>(fn: () => T): T {
+    if (this.#inTransaction) return fn(); // Internal reads share the caller's write lock and key fence.
+    return this.#storage.transaction(() => {
+      this.#inTransaction = true;
+      try { return fn(); } finally { this.#inTransaction = false; }
+    });
+  }
   #encrypt(value: Uint8Array, aad: string): Buffer { return this.#storage.seal(value, aad); }
   #decrypt(value: Uint8Array, aad: string): Buffer { return this.#storage.open(value, aad); }
   #openJson<T>(value: Uint8Array, aad: string): T {
@@ -116,13 +138,15 @@ export class BotKeyStore {
   }
 
   read(id: string, botId: string, userId: string, now: number): ConsentStatus {
-    this.#expire(now);
-    const row = this.#db.prepare("SELECT payload, state, confirmed_slot, observed_slot FROM consent WHERE id=? AND bot_id=? AND user_id=?").get(id, botId, userId);
-    if (!row) throw new Error("consent request not found");
-    const consent = JSON.parse(String(row.payload)) as BotConsent;
-    if (consent.id !== id || consent.botId !== botId || consent.userId !== userId) throw new Error("invalid stored consent identity");
-    return { consent, state: row.state as ConsentStatus["state"], ...(row.confirmed_slot === null ? {} : { confirmedSlot: Number(row.confirmed_slot) }),
-      ...(Number(row.observed_slot) === 0 ? {} : { observedSlot: Number(row.observed_slot) }) };
+    return this.#transaction(() => {
+      this.#expire(now);
+      const row = this.#db.prepare("SELECT payload, state, confirmed_slot, observed_slot FROM consent WHERE id=? AND bot_id=? AND user_id=?").get(id, botId, userId);
+      if (!row) throw new Error("consent request not found");
+      const consent = JSON.parse(String(row.payload)) as BotConsent;
+      if (consent.id !== id || consent.botId !== botId || consent.userId !== userId) throw new Error("invalid stored consent identity");
+      return { consent, state: row.state as ConsentStatus["state"], ...(row.confirmed_slot === null ? {} : { confirmedSlot: Number(row.confirmed_slot) }),
+        ...(Number(row.observed_slot) === 0 ? {} : { observedSlot: Number(row.observed_slot) }) };
+    });
   }
 
   /** Record even a revoked account's context, so a later stale read cannot undo that observation. */

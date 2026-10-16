@@ -68,6 +68,18 @@ export class SubmissionJournal {
   }
   get recoveryId(): string | undefined { return this.#storage.recoveryId; }
 
+  /** Re-encrypt history atomically without changing transaction identity or recovery permission. */
+  rotateKey(nextKey: Uint8Array): void {
+    this.#storage.rotateKey(nextKey, [
+      { name: "attempts", primaryKey: ["id"], columns: ["id", "pocket", "nonce", "record"],
+        encrypted: { record: row => this.#aad(String(row.id), String(row.pocket), String(row.nonce)) } },
+      { name: "pocket_contexts", primaryKey: ["pocket"], columns: ["pocket", "record"],
+        encrypted: { record: row => this.#contextAad(String(row.pocket)) } },
+      { name: "pocket_recovery", primaryKey: ["epoch", "pocket"], columns: ["epoch", "pocket", "record"],
+        encrypted: { record: row => JSON.stringify([this.#scope, "recovery-plan:v1", String(row.epoch), String(row.pocket)]) } },
+    ]);
+  }
+
   #validateAuthority(authority: RecoveryAuthority): void {
     if (![0, 1].includes(authority.sessionKind) || !/^[0-9a-f]{66}$/.test(authority.sessionKeyHex) ||
       !/^(0|[1-9][0-9]{0,19})$/.test(authority.maxSessionExpirySlot) ||

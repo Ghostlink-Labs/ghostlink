@@ -27,7 +27,7 @@ function world() {
   const stores: SubmissionJournal[] = [];
   cleanup.push(() => { for (const s of stores) s.close(); key.fill(0); });
   let now = 1_800_000_000_000;
-  const journal = (file = path) => { const j = new SubmissionJournal(file, key, scope, () => now); stores.push(j); return j; };
+  const journal = (file = path, encryptionKey = key) => { const j = new SubmissionJournal(file, encryptionKey, scope, () => now); stores.push(j); return j; };
   const policy = conservativePolicy(), pocket = pocketPda(fieldToBytes32(23n));
   const intent = { pocket: pocket.toBytes(), nonce: 7n, inMint: randomBytes(32), inMax: 10n,
     outMint: randomBytes(32), outMin: 9n, deadlineSlot: 900n, policyHash: policyHash(policy) };
@@ -87,6 +87,24 @@ function world() {
 }
 
 describe("durable submission and reconciliation", () => {
+  it("rotates storage keys while preserving exact signed transactions and fencing stale workers", async () => {
+    const w = world(), original = w.journal(), stale = w.journal(), next = randomBytes(32);
+    const identity = identityFor(w.v), claim = original.claim(identity), packet = await w.prepare();
+    original.authorizedContext(identity.intentHashHex, 100);
+    original.prepared(identity.intentHashHex, claim.token!, packet);
+    original.rotateKey(next);
+    expect(() => w.journal()).toThrow();
+    expect(() => stale.claim(identityFor(w.intentAt(8n)))).toThrow(/key changed/);
+    const rotated = w.journal(w.path, next);
+    expect(rotated.get(identity.intentHashHex)?.transaction).toEqual(packet);
+    const result = await w.manager(rotated).submit(w.v, w.prepare);
+    expect(result.signature).toBe(packet.signature);
+    expect(w.prepare).toHaveBeenCalledTimes(1);
+    expect(Buffer.from(w.chain.sendRawTransaction.mock.calls[0]![0]).toString("base64")).toBe(packet.rawBase64);
+    w.useNonce(); w.setStatus({ slot: 100, confirmations: 0, err: null, confirmationStatus: "finalized" });
+    expect(await w.manager(rotated).status(identity.intentHashHex)).toMatchObject({ state: "finalized" });
+  });
+
   it("quarantines a restored journal, including unseen pockets, until a finalized fresh owner session", async () => {
     const w = world(), original = w.journal();
     const archive = join(w.dir, "before-trades.enc"); await original.backupTo(archive);
@@ -106,6 +124,9 @@ describe("durable submission and reconciliation", () => {
     await expect(manager.submit(delayedOldRotation, w.prepare)).rejects.toThrow(/fresh owner session/);
     const fresh = w.rotate(1300n, newKey);
     expect(await manager.prepareRecovery(identityFor(fresh).pocket)).toMatchObject({ rotationRequired: false });
+    const newStorageKey = randomBytes(32); restored.rotateKey(newStorageKey);
+    const rotatedJournal = w.journal(restoredPath, newStorageKey);
+    expect(await w.manager(rotatedJournal).prepareRecovery(identityFor(fresh).pocket)).toMatchObject({ rotationRequired: false });
     // Confirmed head normally leads finalized. Separate monotonic floors must permit this.
     w.bank(140); w.setContext(140); w.finalizedBank(110);
     await manager.submit(fresh, w.prepare);
@@ -116,7 +137,7 @@ describe("durable submission and reconciliation", () => {
     w.finalizedBank(110);
     await expect(manager.submit(w.v, w.prepare)).rejects.toThrow(/authorized/);
     const again = join(w.dir, "again.enc"); await restored.backupTo(again);
-    const twice = w.journal(SubmissionJournal.restoreBackup(again, join(w.dir, "twice"), w.key, w.scope));
+    const twice = w.journal(SubmissionJournal.restoreBackup(again, join(w.dir, "twice"), newStorageKey, w.scope), newStorageKey);
     await expect(w.manager(twice).prepareRecovery(identityFor(fresh).pocket)).rejects.toThrow(/recovery plan/);
   });
 

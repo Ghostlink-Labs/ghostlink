@@ -66,10 +66,29 @@ function world() {
     clock: (n: number) => { now += n; }, useNonce: () => { used = true; }, revoke: () => { expiry = 0n; },
     setStatus: (s: SignatureStatus | null) => { status = s; }, setContext: (s: number) => { context = s; },
     setGenesis: (g: string) => { genesis = g; }, setExpiry: () => { height = finalizedHeight = 501; validHash = false; context = accountContext = head = 700; },
+    bank: (h: number, c = h) => { head = h; accountContext = c; }, restoreAuthority: () => { expiry = 1000n; },
   };
 }
 
 describe("durable submission and reconciliation", () => {
+  it("never rebroadcasts using account state older than preparation or a later revocation observation, including after restart", async () => {
+    const w = world(); await w.manager().submit(w.v, w.prepare);
+    expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(1);
+    w.bank(90);
+    await w.manager().submit(w.v, w.prepare);
+    expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(w.chain.getAccountInfoAndContext).toHaveBeenLastCalledWith(expect.any(PublicKey), { commitment: "confirmed", minContextSlot: 100 });
+    w.bank(150); w.revoke(); await w.manager().submit(w.v, w.prepare);
+    w.bank(100); w.restoreAuthority(); await w.manager().submit(w.v, w.prepare);
+    expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(1);
+    expect(w.chain.getAccountInfoAndContext).toHaveBeenLastCalledWith(expect.any(PublicKey), { commitment: "confirmed", minContextSlot: 150 });
+    // Processed signature-status context must not masquerade as a confirmed authorization watermark.
+    w.setContext(500); w.bank(100, 151); await w.manager().submit(w.v, w.prepare);
+    expect(w.chain.sendRawTransaction).toHaveBeenCalledTimes(2);
+    expect(w.chain.sendRawTransaction).toHaveBeenLastCalledWith(expect.any(Buffer), expect.objectContaining({ minContextSlot: 151 }));
+    expect(w.prepare).toHaveBeenCalledTimes(1);
+  });
+
   it("recovers signed bytes committed by a process that exits before broadcast", async () => {
     const w = world(), identity = identityFor(w.v), packet = await w.prepare();
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", `

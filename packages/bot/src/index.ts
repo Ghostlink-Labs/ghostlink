@@ -5,3 +5,4 @@ export { BotOnboarding } from "./onboarding.js";
 export type { AuthorizationChain, BotOnboardingOptions, CreateConsent } from "./onboarding.js";
 export { createBotAuthorizationServer } from "./server.js";
 export type { BotConsent, BotDeployment, ConsentState, ConsentStatus } from "./types.js";
+export type { BotIntentParams, BotOrderStatus } from "./orders.js";

@@ -9,6 +9,7 @@ import { BorshWriter, readPocketAccount, writePolicy } from "@ghostlink/service-
 import { BotKeyStore } from "./store.js";
 import { verifyTelegramInitData, type TelegramIdentity } from "./telegram.js";
 import type { BotConsent, BotDeployment, ConsentStatus } from "./types.js";
+import { copyParams, decodeIntent, digest, orderFingerprint, orderStatus, signedOrder, type BotIntentParams, type BotOrderStatus } from "./orders.js";
 
 export interface AuthorizationChain {
   getGenesisHash(): Promise<string>;
@@ -138,7 +139,7 @@ export class BotOnboarding {
     const who = this.#identity(initData);
     const row = this.#store.read(id, who.botId, who.userId, this.#now());
     if (row.state !== "pending" && row.state !== "confirmed") throw new Error("consent request is no longer pending");
-    const slot = await this.#checkActive(row.consent);
+    const { slot } = await this.#checkActive(row);
     // Re-read under the transaction: cancellation or expiry during RPC wins.
     return this.#store.confirm(id, who.botId, who.userId, this.#now(), slot);
   }
@@ -148,17 +149,20 @@ export class BotOnboarding {
     return this.#store.cancel(id, who.botId, who.userId, this.#now());
   }
 
-  async #checkActive(consent: BotConsent): Promise<number> {
+  async #checkActive(row: ConsentStatus) {
+    const consent = row.consent;
     if (JSON.stringify(consent.deployment) !== JSON.stringify(this.#deployment) || consent.appOrigin !== this.#origin) {
       throw new Error("stored consent belongs to another configured application or deployment");
     }
-    const slot = await this.#head(consent.deployment);
+    const slot = Math.max(await this.#head(consent.deployment), row.confirmedSlot ?? 0, row.observedSlot ?? 0);
     const response = await this.#chain.getAccountInfoAndContext(new PublicKey(consent.pocket), {
       commitment: "confirmed", minContextSlot: slot,
     });
-    if (!Number.isSafeInteger(response.context.slot) || response.context.slot < slot || !response.value) {
+    if (!Number.isSafeInteger(response.context.slot) || response.context.slot < slot) {
       throw new Error("confirmed pocket state is unavailable or stale");
     }
+    this.#store.observeSlot(consent.id, consent.botId, consent.userId, this.#now(), response.context.slot);
+    if (!response.value) throw new Error("confirmed pocket state is unavailable");
     const account = readPocketAccount(response.value, new PublicKey(consent.deployment.pocketProgram));
     const id = BigInt(consent.appId);
     const expectedPda = pocketPda(id, new PublicKey(consent.deployment.pocketProgram).toBytes());
@@ -171,24 +175,57 @@ export class BotOnboarding {
       !equal(policyHash(account.policy), policyHash(policyFromDto(consent.policy)))) {
       throw new Error("confirmed pocket does not match the approved bot permissions");
     }
-    return response.context.slot;
+    return { slot: response.context.slot, account };
   }
 
-  /** Called by the bot backend, never by the public HTTP consent server. */
+  /** Backend-only. One stable business request key always identifies one immutable trade. */
+  async prepareIntent(id: string, who: Pick<TelegramIdentity, "botId" | "userId">,
+    input: { requestKey: string; params: BotIntentParams }): Promise<SignedIntent> {
+    if (!input || !/^[0-9a-f]{32,128}$/.test(input.requestKey)) throw new Error("invalid order request key");
+    return this.#prepare(id, { ...who }, input.requestKey, copyParams(input.params));
+  }
+
+  /** Compatibility API: explicit nonces share the durable allocator and cannot move backwards. */
   async signIntent(id: string, who: Pick<TelegramIdentity, "botId" | "userId">, params: IntentParams): Promise<SignedIntent> {
-    const intent = { ...params, inMint: params.inMint.slice(), outMint: params.outMint.slice() };
+    const intent = copyParams(params), nonce = params.nonce;
+    if (typeof nonce !== "bigint" || nonce < 0n || nonce > U64_MAX) throw new Error("invalid explicit nonce");
+    const row = this.#store.read(id, who.botId, who.userId, this.#now());
+    const requestKey = "manual:" + digest(orderFingerprint(row.consent, intent, nonce));
+    return this.#prepare(id, { ...who }, requestKey, intent, nonce);
+  }
+
+  orderStatus(id: string, who: Pick<TelegramIdentity, "botId" | "userId">, requestKey: string): BotOrderStatus {
+    const { consent } = this.#store.read(id, who.botId, who.userId, this.#now());
+    const order = this.#store.readOrder(consent, requestKey);
+    if (!order) throw new Error("order not found");
+    return orderStatus(order);
+  }
+
+  /** Prevents local release of an order; cannot recall a signature already returned. */
+  cancelOrder(id: string, who: Pick<TelegramIdentity, "botId" | "userId">, requestKey: string): BotOrderStatus {
+    const { consent } = this.#store.read(id, who.botId, who.userId, this.#now());
+    return orderStatus(this.#store.cancelOrder(consent, requestKey));
+  }
+
+  async #prepare(id: string, who: Pick<TelegramIdentity, "botId" | "userId">, requestKey: string,
+    intent: BotIntentParams, explicitNonce?: bigint): Promise<SignedIntent> {
     const row = this.#store.read(id, who.botId, who.userId, this.#now());
     if (row.state !== "confirmed") throw new Error("bot session is not active locally");
-    const slot = BigInt(await this.#checkActive(row.consent));
-    if (intent.inMax <= 0n || intent.outMin <= 0n || intent.deadlineSlot < slot || intent.deadlineSlot >= BigInt(row.consent.sessionExpirySlot)) {
+    const fingerprint = orderFingerprint(row.consent, intent, explicitNonce);
+    const { slot, account } = await this.#checkActive(row);
+    if (intent.deadlineSlot < BigInt(slot) || intent.deadlineSlot >= BigInt(row.consent.sessionExpirySlot)) {
       throw new Error("intent amount or deadline is outside the active session");
     }
-    return this.#store.withSeed(id, who.botId, who.userId, async seed => {
+    const order = this.#store.reserveOrder(row.consent, requestKey, fingerprint, intent, account, slot, this.#now(), explicitNonce);
+    if (order.state === "signed") return signedOrder(order);
+    const signed = await this.#store.withSeed(id, who.botId, who.userId, async seed => {
       const session = softwareSession(seed);
       if (bytesToHex(session.key32) !== row.consent.sessionKeyHex) throw new Error("stored bot key does not match consent");
       const pocket = derivePocket(BigInt(row.consent.appId), new PublicKey(row.consent.home).toBytes(), policyFromDto(row.consent.policy));
       pocket.address = new PublicKey(row.consent.pocket).toBytes();
-      return signIntent(pocket, session, intent);
+      return signIntent(pocket, session, decodeIntent(order.intent));
     });
+    // The durable write and local authorization check happen before releasing this bearer signature.
+    return signedOrder(this.#store.saveSignedOrder(row.consent, requestKey, signed, slot, this.#now()));
   }
 }

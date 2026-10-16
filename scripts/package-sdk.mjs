@@ -77,6 +77,9 @@ const reopened = new BotKeyStore(path, key);
 assert.equal(JSON.stringify(reopened), '{}');
 reopened.close(); key.fill(0);
 assert.equal(typeof BotOnboarding, 'function');
+assert.equal(typeof BotOnboarding.prototype.prepareIntent, 'function');
+assert.equal(typeof BotOnboarding.prototype.orderStatus, 'function');
+assert.equal(typeof BotOnboarding.prototype.cancelOrder, 'function');
 assert.equal(typeof createBotAuthorizationServer, 'function');
 assert.throws(() => verifyTelegramInitData('forged', '12345:' + 'a'.repeat(32)));
 console.log('Installed bot package: dependencies, encrypted database restart and authentication boundary verified.');
@@ -91,7 +94,7 @@ import { GhostLink, sessionPublicKey, type SessionAuthorizationParams, type Sess
 const authorize = (client: GhostLink, params: SessionAuthorizationParams) => client.authorizeSession(params);
 const key: SessionPublicKey = sessionPublicKey(0, new Uint8Array(32));
 void authorize; void key;
-${includeBot ? "import { BotOnboarding, type BotOnboardingOptions, type BotConsent } from '@ghostlink/bot';\nconst initBot = (options: BotOnboardingOptions) => new BotOnboarding(options);\nconst publicKey = (c: BotConsent): string => c.sessionKeyHex;\nvoid initBot; void publicKey;" : ""}
+${includeBot ? "import { BotOnboarding, type BotOnboardingOptions, type BotConsent, type BotIntentParams, type BotOrderStatus } from '@ghostlink/bot';\nconst initBot = (options: BotOnboardingOptions) => new BotOnboarding(options);\nconst prepare = (m: BotOnboarding, c: BotConsent, requestKey: string, params: BotIntentParams) => m.prepareIntent(c.id, c, { requestKey, params });\nconst status = (m: BotOnboarding, c: BotConsent, requestKey: string): BotOrderStatus => m.orderStatus(c.id, c, requestKey);\nvoid initBot; void prepare; void status;" : ""}
 `);
   const require = createRequire(join(root, "packages", "sdk", "package.json"));
   execFileSync(process.execPath, [require.resolve("typescript/bin/tsc"), "--noEmit", "--strict", "--skipLibCheck", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext", "check.mts"], { cwd: consumer, stdio: "inherit" });

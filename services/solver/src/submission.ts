@@ -45,11 +45,14 @@ export class SubmissionCoordinator {
   }
 
   /** On-chain authority is checked before creating any durable nonce claim or preparing fees. */
-  async authorize(v: ValidatedIntent): Promise<number> {
+  async authorize(v: ValidatedIntent, minimumSlot = 0): Promise<number> {
+    const id = bytesToHex(v.hash), prior = this.#journal.get(id);
     await this.#genesis();
-    const slot = await this.#rpc(this.#chain.getSlot("confirmed")); this.#context(slot, 0);
+    const head = await this.#rpc(this.#chain.getSlot("confirmed")); this.#context(head, 0);
+    const slot = Math.max(head, minimumSlot, prior?.authorizationSlot ?? 0, prior?.transaction?.minContextSlot ?? 0);
     const response = await this.#rpc(this.#chain.getAccountInfoAndContext(new PublicKey(v.intent.pocket), { commitment: "confirmed", minContextSlot: slot }));
     this.#context(response.context.slot, slot);
+    this.#journal.authorizedContext(id, response.context.slot);
     if (!response.value) throw new IntentAuthorizationError("pocket not found");
     const a = readPocketAccount(response.value);
     const key = new Uint8Array(33); key.set(v.sessionKey);
@@ -81,6 +84,7 @@ export class SubmissionCoordinator {
       const claim = this.#journal.claim(identity); record = claim.record;
       if (claim.token) {
         try {
+          this.#journal.authorizedContext(identity.intentHashHex, slot);
           const prepared = await this.#rpc(prepare(slot));
           this.#validatePrepared(prepared, slot);
           record = this.#journal.prepared(identity.intentHashHex, claim.token, prepared);
@@ -92,10 +96,11 @@ export class SubmissionCoordinator {
     // Only a fresh authoritative pending observation permits rebroadcast. No new transaction is constructed.
     if (observation.state !== "pending") return observation;
     try {
-      await this.authorize(v); // Also checks revocation between retries; status recovery never needs an active session.
+      const authorizationSlot = await this.authorize(v, record.transaction.minContextSlot);
+      this.#journal.authorizedContext(identity.intentHashHex, authorizationSlot); // Fence a newer concurrent account observation.
       const tx = record.transaction;
       const returned = await this.#rpc(this.#chain.sendRawTransaction(Buffer.from(tx.rawBase64, "base64"), {
-        skipPreflight: false, preflightCommitment: "confirmed", minContextSlot: tx.minContextSlot, maxRetries: 0,
+        skipPreflight: false, preflightCommitment: "confirmed", minContextSlot: authorizationSlot, maxRetries: 0,
       }));
       if (returned !== tx.signature) return { ...observation, state: "unknown", reason: "rpc_signature_mismatch" };
       const abort = new AbortController();

@@ -44,6 +44,12 @@ describe("encrypted consent persistence", () => {
       await store.withSeed(consent.id, "12345", "42", async recovered => { expect(Buffer.from(recovered)).toEqual(seed); });
       const db = new DatabaseSync(path);
       try {
+        // Restore the pre-order schema while retaining the original consent/key bytes.
+        store.close();
+        db.exec("ALTER TABLE consent DROP COLUMN observed_slot; DROP TABLE bot_orders; DROP TABLE bot_counters");
+        store = new BotKeyStore(path, key);
+        expect(store.read(consent.id, "12345", "42", NOW)).toMatchObject({ state: "confirmed", confirmedSlot: 100 });
+        await store.withSeed(consent.id, "12345", "42", async recovered => { expect(Buffer.from(recovered)).toEqual(seed); });
         const original = db.prepare("SELECT encrypted_key FROM consent WHERE id=?").get(consent.id)!.encrypted_key as Uint8Array;
         const corrupt = Buffer.from(original); corrupt[corrupt.length - 1]! ^= 1;
         db.prepare("UPDATE consent SET encrypted_key=? WHERE id=?").run(corrupt, consent.id);

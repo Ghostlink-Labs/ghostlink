@@ -15,6 +15,8 @@ export interface Attempt {
   transaction?: PreparedTransaction;
   observation: IntentSubmission;
   observedContext: number;
+  /** Confirmed account-read context, separate from the processed signature-status context. */
+  authorizationSlot?: number;
 }
 
 export class NonceConflictError extends Error {
@@ -78,7 +80,8 @@ export class SubmissionJournal {
       if (found?.transaction || (found?.lease && found.lease.until > now)) return { record: found };
       const token = randomBytes(32).toString("hex");
       const record: Attempt = { identity: structuredClone(identity), lease: { token, until: now + 30_000 },
-        observation: { intentHashHex: identity.intentHashHex, state: "preparing" }, observedContext: 0 };
+        observation: { intentHashHex: identity.intentHashHex, state: "preparing" }, observedContext: 0,
+        ...(found?.authorizationSlot === undefined ? {} : { authorizationSlot: found.authorizationSlot }) };
       this.#write(record);
       return { record, token };
     });
@@ -88,6 +91,7 @@ export class SubmissionJournal {
     return this.#storage.transaction(() => {
       const record = this.get(id);
       if (!record || record.transaction || record.lease?.token !== token || record.lease.until <= this.#clock()) throw new Error("preparation lease lost; do not broadcast");
+      if (transaction.minContextSlot < (record.authorizationSlot ?? 0)) throw new Error("prepared authorization context is stale");
       record.transaction = structuredClone(transaction);
       delete record.lease;
       record.observation = { intentHashHex: id, state: "pending", signature: transaction.signature };
@@ -101,6 +105,17 @@ export class SubmissionJournal {
     this.#storage.transaction(() => {
       const record = this.get(id);
       if (record && !record.transaction && record.lease?.token === token) { delete record.lease; this.#write(record); }
+    });
+  }
+
+  authorizedContext(id: string, slot: number): void {
+    this.#storage.transaction(() => {
+      const record = this.get(id);
+      if (!record) return;
+      if (!Number.isSafeInteger(slot) || slot < Math.max(record.authorizationSlot ?? 0, record.transaction?.minContextSlot ?? 0)) {
+        throw new Error("authorization context is stale");
+      }
+      record.authorizationSlot = slot; this.#write(record);
     });
   }
 

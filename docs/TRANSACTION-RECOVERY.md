@@ -1,6 +1,6 @@
 # Transaction recovery for the V2 solver
 
-Status: localnet candidate. The solver records a signed transaction before broadcasting it, then reconciles that exact signature. It still uses an inventory route and a legacy message. Jupiter composition, a bot-side nonce allocator, budgets, production deployment and independent review remain open release gates.
+Status: localnet candidate. The bot allocates and persists an immutable signed intent; the solver records a signed transaction before broadcasting it, then reconciles that exact signature. It still uses an inventory route and a legacy message. Jupiter composition, strategy jobs, budgets, production deployment and independent review remain open release gates.
 
 ## Operator configuration
 
@@ -25,7 +25,7 @@ Records, transaction bytes, preparation leases and observations are encrypted wi
 
 Before its first send, the solver stores the exact serialized signed transaction, locally derived signature, blockhash and last valid block height. The HTTP response has `intentHashHex`, `state` and, once prepared, `signature`. HTTP 202 is used for preparing, pending and unknown responses; HTTP 200 can contain a confirmed outcome, a chain failure or proven expiry. **The HTTP status alone never establishes successful settlement.** Conflicting nonce reuse returns 409. A preparation error can return 503; retain and retry the identical signed intent.
 
-`GET /intents/:intentHashHex` reconciles a stored transaction without signing or broadcasting anything. It returns metadata only, never the raw transaction or bot secret. A retry through POST may rebroadcast the identical saved bytes after a fresh authority check; it never constructs a replacement transaction or chooses a fresh nonce. Responses disable caching. The reference service limits eight active operations and has conservative IP/pocket request limits; production capacity, authentication and abuse budgets need an operator-specific design.
+`GET /intents/:intentHashHex` reconciles a stored transaction without signing or broadcasting anything. It returns metadata only, never the raw transaction or bot secret. A retry through POST may rebroadcast the identical saved bytes after a fresh authority check; it never constructs a replacement transaction or chooses a fresh nonce. That intent's authority check cannot use a bank older than its preparation or a later recorded account read, including a refused/revoked session. Confirmed account contexts are tracked separately from processed signature-status contexts. Responses disable caching. The reference service limits eight active operations and has conservative IP/pocket request limits; production capacity, authentication and abuse budgets need an operator-specific design.
 
 | State | Interpretation and caller action |
 | --- | --- |
@@ -45,11 +45,11 @@ RPC send/confirmation exceptions preserve the locally computed signature. A retu
 
 `client.submitIntent()` now returns an explicit `IntentSubmission` result instead of treating any returned signature as settlement. For durable callers, first use `signIntent`, persist the signed intent and its public session descriptor in protected storage, then call `client.submitSignedIntent(signed, publicSession)`. `client.intentStatus(intentHashHex)` polls without another signer interaction. A retry must reuse the same fields, nonce and signature material. The SDK snapshots mutable intent fields while signing and refuses a changed payload when resubmitting.
 
-The bot package still expects the caller to supply a nonce. The solver journal prevents duplicate/conflicting submissions; it is **not yet a bot-side nonce allocator, durable strategy scheduler or order cancellation service**. On-chain revocation/deadlines govern outstanding signed intents. Cancelling a local job cannot recall a packet already sent to the network.
+The bot package's `prepareIntent` allocates a nonce, reserves exact parameters and saves the signature before returning it. Reuse the same business request key after restart or timeout. Its local order status is separate from solver settlement. See the [bot contract](../packages/bot/README.md#durable-bot-orders) for window backpressure, explicit nonce compatibility and local cancellation. Durable strategy scheduling remains unfinished. On-chain revocation/deadlines govern outstanding signed intents; cancelling a local job cannot recall a packet already sent to the network.
 
 ## Verified evidence and remaining scope
 
-Tests exercise process exit after durable preparation, lost send acknowledgments, confirmation timeouts, stale RPC, wrong returned signatures, concurrent duplicate preparation, lease replacement, failed persistence, changed authority, chain failures, expiry and absent history. The full disposable-validator flow intentionally loses the first broadcast acknowledgment, restarts the solver/database, retries the same signed intent, verifies one planned transaction identity, confirms the swap and sweeps proceeds home.
+Tests exercise process exits before bot signing, after bot signature persistence and after solver preparation; lost send acknowledgments, confirmation timeouts, stale RPC, wrong returned signatures, concurrent duplicate requests, lease replacement, failed persistence, changed authority, chain failures, expiry and absent history. The full disposable-validator flow allocates the bot nonce, restarts the bot/database, recovers the exact intent/signature, intentionally loses the first broadcast acknowledgment, restarts the solver/database, retries that same intent, verifies one planned transaction identity, confirms the swap and sweeps proceeds home.
 
 These tests use synthetic Telegram authentication, development proofs and a reference inventory fill. They do not establish named-provider adoption, real Telegram device compatibility, live DEX routing or mainnet readiness. See [the release gates](MAINNET-READINESS.md).
 

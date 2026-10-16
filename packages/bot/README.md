@@ -77,15 +77,39 @@ The trusted owner interface sends the raw Telegram `initData` in `Authorization:
 
 One idempotency key binds one immutable request. Retrying identical inputs returns the same public key and state, including after restart. Changed permissions with that key fail. Pending requests expire after five minutes by default (configurable 30–900 seconds); at most three can be pending per user. Duplicate confirmation is idempotent and rechecks chain state. Once expired/cancelled, a request cannot be reactivated: create a new request and obtain fresh owner consent.
 
-`confirmed` describes completed consent, not perpetual spending authority. Every `manager.signIntent(id, { botId, userId }, params)` rechecks the current chain key, policy and expiry and signs only a canonical intent. This method is for an authenticated bot backend. It is **not exposed by the HTTP server**. Telegram authentication alone never authorizes a trade.
+`confirmed` describes completed consent, not perpetual spending authority. Every trade preparation rechecks the current chain key, policy and expiry. Each consent retains the latest confirmed account-read context, including refused authority, across restarts. Older RPC responses and concurrent stale signing results are refused. These methods are for an authenticated bot backend and are **not exposed by the HTTP server**. Telegram authentication alone never authorizes a trade.
 
 Local cancellation removes the active encrypted key record. It **does not revoke the on-chain session or invalidate an already signed intent**, and old ciphertext may remain in WAL files or backups. Use owner-authorized on-chain revocation/rotation and home recovery for that purpose. A renewed or replaced session requires new consent here; changed expiry/key is refused. Do not claim a cancelled order cannot land unless its chain deadline/revocation status establishes that.
 
+## Durable bot orders
+
+Use one stable request key for one business command, such as a hash of the authenticated Telegram update and action identity. Persist that mapping in your strategy system. Reuse it on every retry; a fresh random key on each attempt represents a different order.
+
+```ts
+import { sessionPublicKey } from '@ghostlink/sdk';
+
+// consent and who come from the authenticated backend's completed consent flow.
+const signed = await manager.prepareIntent(consent.id, who, {
+  requestKey: durableCommandKey, // 16–64 bytes as lowercase hex
+  params: { inMint, inMax, outMint, outMin, deadlineSlot }, // nonce is allocated here
+});
+const publicSession = sessionPublicKey(0, Buffer.from(consent.sessionKeyHex, 'hex'));
+const outcome = await client.submitSignedIntent(signed, publicSession);
+// Inspect outcome.state. Pending/unknown requires polling this same intent hash.
+const next = await client.intentStatus(outcome.intentHashHex);
+```
+
+The database commits the nonce and exact intent before signing, then commits the verified signature before returning it. Identical requests recover the same intent/signature after a restart. Reusing a key for changed amounts, mints, deadlines or consent fails. A cancelled, failed or uncertain order never releases its nonce for reuse. All workers for a pocket must share the same local SQLite database; unrelated databases and external direct signers are not coordinated. Existing `signIntent` calls with explicit nonces now use the same counter and cannot move backwards or conflict with an allocation. Prefer `prepareIntent` for new integrations.
+
+`manager.orderStatus(id, who, requestKey)` returns the nonce, intent hash and local `reserved`, `signed` or `cancelled` state without a bearer signature. **Signed is not submitted or confirmed.** Poll the solver's separate receipt for execution. Status lookup remains available after consent cancellation. `manager.cancelOrder(...)` prevents further local release of that order, including a signature being prepared concurrently; it cannot recall an already released signature. Unknown network outcomes require reconciliation of the original intent, never an automatic replacement trade.
+
+The allocator uses the full unsigned 64-bit range, skips on-chain used bits and retains its counter across restarts/session changes. The Pocket accepts a sliding window of 2,048 nonces. To protect older outstanding signatures, new issuance pauses if its nonce would advance beyond any earlier order whose signed deadline has not passed. This deliberately includes cancelled and already-confirmed orders until their deadlines. Use short, realistic deadlines; backpressure is not permission to discard an uncertain trade. Strategy scheduling, execution-level cancellation and cross-host coordination are separate work.
+
 ## Storage and remaining work
 
-Session seeds use AES-256-GCM with random nonces and the immutable consent record as authenticated associated data. SQLite transactions serialize consent changes; a key-check sentinel refuses the wrong database key. The database stores Telegram IDs, pocket/home addresses and policy metadata in plaintext. Treat the whole database, WAL and backups as sensitive. Best-effort buffer clearing is not a JavaScript process-memory isolation guarantee.
+Session seeds use AES-256-GCM with random nonces and the immutable consent record as authenticated associated data. Order payloads/signatures and nonce checkpoints are encrypted and bound to their identity/deployment; lookup metadata includes bot/user IDs, pocket scope, request keys, nonces and deadlines in plaintext. SQLite transactions serialize consent and order changes; a key-check sentinel refuses the wrong database key. Existing consent databases migrate without replacing their keys. Treat the whole database, WAL and backups as sensitive. Best-effort buffer clearing is not a JavaScript process-memory isolation guarantee.
 
-Use SQLite on local disk, not a network filesystem shared across hosts. Database/key backup and restore, encryption-key rotation, retention/purge, host compromise recovery and operational monitoring still need release evidence. Storage transactions protect consent idempotency. The reference solver now has a separate [durable transaction journal](../../docs/TRANSACTION-RECOVERY.md), but **bot-side nonce allocation and strategy jobs remain unfinished**. The caller currently supplies each intent nonce. Do not retry an unknown trade outcome as a new trade.
+Use SQLite on local disk, not a network filesystem shared across hosts. Database/key backup and restore, encryption-key rotation, retention/purge, host compromise recovery and operational monitoring still need release evidence. Never restore an older database or delete order/counter history and resume automatically: that can lose issued signatures and permit duplicate business commands. Reconcile against all outstanding signatures and the chain before resuming. The reference solver has a separate [durable transaction journal](../../docs/TRANSACTION-RECOVERY.md). Strategy jobs and a coordinated restore procedure remain unfinished.
 
 Tests cover forged/stale Telegram data, cross-user access, permission/key substitution, cancellation races, program/genesis mismatch, a process exit without SQLite close, encrypted-record tampering, a fresh installed consumer and a disposable-validator flow. Local end-to-end authentication uses a synthetic Telegram token; real Telegram device/wallet handoff and trusted-owner UI acceptance remain unverified. The validator uses a reference inventory route, not Jupiter. See [release gates](../../docs/MAINNET-READINESS.md) and [provider research](../../docs/BOT-COMPATIBILITY.md).
 

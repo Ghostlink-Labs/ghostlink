@@ -27,4 +27,4 @@ export interface BotConsent {
 }
 
 export type ConsentState = "pending" | "confirmed" | "cancelled" | "expired";
-export interface ConsentStatus { consent: BotConsent; state: ConsentState; confirmedSlot?: number }
+export interface ConsentStatus { consent: BotConsent; state: ConsentState; confirmedSlot?: number; observedSlot?: number }

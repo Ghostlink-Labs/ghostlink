@@ -393,7 +393,6 @@ async function main() {
     await send([createAtaIdempotentIx(payer.publicKey, pocket, solMint.publicKey)], []);
     const deadline = BigInt(await connection.getSlot("confirmed")) + 500n;
     const tx = await botFixture.fill(consent, solverUrl, {
-      nonce: BigInt(process.env.FILL_NONCE ?? "1"),
       inMint: usdcMint.publicKey.toBytes(),
       inMax: 25_000_000n,
       outMint: solMint.publicKey.toBytes(),
@@ -401,7 +400,7 @@ async function main() {
       deadlineSlot: deadline,
     }, () => solverFixture!.restart());
     solverFixture.assertSingleTransaction();
-    ok(`intent filled after lost acknowledgment and solver restart: ${tx.signature.slice(0, 16)}…`);
+    ok(`durably allocated bot intent filled after bot restart, lost acknowledgment and solver restart: ${tx.signature.slice(0, 16)}…`);
 
     const expectedOut = process.env.OUT_MIN ?? "160000000";
     const outBalance = await connection.getTokenAccountBalance(ataAddress(pocket, solMint.publicKey));

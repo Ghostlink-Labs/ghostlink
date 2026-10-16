@@ -6,8 +6,7 @@ import { join } from "node:path";
 import { once } from "node:events";
 import type { Connection } from "@solana/web3.js";
 import { bytesToHex, CENSUS_PROGRAM_ID, POCKET_PROGRAM_ID, REGISTRY_PROGRAM_ID, toBase58, type IntentSubmission, type Policy } from "@ghostlink/common";
-import { BotKeyStore, BotOnboarding, createBotAuthorizationServer, type BotConsent, type ConsentStatus, type CreateConsent } from "@ghostlink/bot";
-import type { IntentParams } from "@ghostlink/sdk";
+import { BotKeyStore, BotOnboarding, createBotAuthorizationServer, type BotConsent, type BotIntentParams, type ConsentStatus, type CreateConsent } from "@ghostlink/bot";
 
 // Deliberately synthetic, never used to contact Telegram.
 const TOKEN = "12345:" + "a".repeat(32);
@@ -44,18 +43,24 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
     return response.json() as Promise<ConsentStatus>;
   };
   await listen();
+  const restart = async () => {
+    await stop(); store.close();
+    store = new BotKeyStore(path, key);
+    manager = new BotOnboarding({ ...options, store });
+    server = createBotAuthorizationServer(manager, ownerOrigin);
+    await listen();
+  };
   return {
     create: (input: CreateConsent) => post("/requests", input),
     confirm: (id: string) => post(`/requests/${id}/confirm`, {}),
-    async restart() {
-      await stop(); store.close();
-      store = new BotKeyStore(path, key);
-      manager = new BotOnboarding({ ...options, store });
-      server = createBotAuthorizationServer(manager, ownerOrigin);
-      await listen();
-    },
-    async fill(consent: BotConsent, solverUrl: string, params: IntentParams, restartSolver: () => Promise<string>): Promise<{ signature: string }> {
-      const signed = await manager.signIntent(consent.id, { botId: "12345", userId: "42" }, params);
+    restart,
+    async fill(consent: BotConsent, solverUrl: string, params: BotIntentParams, restartSolver: () => Promise<string>): Promise<{ signature: string }> {
+      const who = { botId: "12345", userId: "42" }, requestKey = randomBytes(32).toString("hex");
+      const initial = await manager.prepareIntent(consent.id, who, { requestKey, params });
+      await restart();
+      const signed = await manager.prepareIntent(consent.id, who, { requestKey, params });
+      if (signed.intent.nonce !== initial.intent.nonce || bytesToHex(signed.hash) !== bytesToHex(initial.hash) ||
+          bytesToHex(signed.signature.signature) !== bytesToHex(initial.signature.signature)) throw new Error("bot restart changed the reserved trade");
       const i = signed.intent;
       const body = JSON.stringify({ pocket: consent.pocket, nonce: i.nonce.toString(), inMint: toBase58(i.inMint), inMax: i.inMax.toString(),
           outMint: toBase58(i.outMint), outMin: i.outMin.toString(), deadlineSlot: i.deadlineSlot.toString(), policyHashHex: bytesToHex(i.policyHash),
@@ -68,6 +73,7 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
       const first = await send(solverUrl);
       if (!first.signature) throw new Error("expected durably prepared transaction identity");
       const restartedUrl = await restartSolver();
+      if (manager.orderStatus(consent.id, who, requestKey).intentHashHex !== first.intentHashHex) throw new Error("solver receipt does not identify the bot order");
       let result = await send(restartedUrl);
       const deadline = Date.now() + 20_000;
       while (!["confirmed", "finalized", "failed", "expired"].includes(result.state) && Date.now() < deadline) {

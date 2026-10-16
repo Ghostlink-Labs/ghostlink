@@ -56,7 +56,8 @@ describe("durable bot authorization", () => {
     await expect(manager.confirm(initData(), a.consent.id)).rejects.toThrow(/unavailable/);
     const secondStore = w.store(); const restarted = w.manager(secondStore);
     const duplicate = await restarted.create(initData(), w.input);
-    expect(duplicate).toEqual(a);
+    expect(duplicate).toMatchObject(a);
+    expect(duplicate.observedSlot).toBe(100); // The failed chain read also established a freshness floor.
     await expect(restarted.create(initData(), { ...w.input, sessionExpirySlot: "1001" })).rejects.toThrow(/different permissions/);
     w.activate(a.consent);
     const [one, two] = await Promise.all([manager.confirm(initData(), a.consent.id), restarted.confirm(initData(), a.consent.id)]);

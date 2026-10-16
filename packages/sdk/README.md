@@ -78,7 +78,7 @@ Trade submission returns explicit states. Inspect `tx.state`; `pending`, `prepar
 
 - The facade refuses devnet and mainnet because V2 has no verified live deployment. The existing devnet app uses the preserved V1 deployment. This is a configuration guard, not an RPC genesis check or a sandbox around low-level functions.
 - Only classic SPL Token swaps are supported. Token-2022 transfers and native SOL swap legs need explicit implementations.
-- Input tokens require a pinned fresh price feed. Software sessions cannot buy unpriced output tokens. Unattended new-token sniping is not supported.
+- Priced trades require pinned fresh feeds. The local PocketV3 candidate supports explicitly approved, bounded unpriced buys and tracked exits to their original base; see [the policy and limitations](../../docs/adr/0004-bounded-speculative-trading.md). This does not certify production sniper-bot compatibility.
 - One active session key exists per pocket. A new session replaces the previous one. One bot cannot independently revoke another key in the same pocket because multiple concurrent delegations are not implemented.
 - V2 binds the exact policy, session kind and deployment in the proof. The `open_session_v2` instruction requires new development proofs/keys and a fresh, reviewed deployment. It must not be deployed over V1.
 - Passkey sessions require user interaction. Backend automation uses Ed25519 sessions under the existing limits.

@@ -82,6 +82,7 @@ export function syncNative(account: PublicKey) {
 }
 
 export class JupiterForkPlanner implements RoutePlanner {
+  readonly funding = "intent-input" as const;
   #planner: JupiterPlanner;
   #pool: RaydiumPool;
   readonly lookupAddresses: PublicKey[];

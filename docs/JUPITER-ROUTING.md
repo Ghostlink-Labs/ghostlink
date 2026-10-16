@@ -6,7 +6,7 @@ The solver has an opt-in composable Jupiter adapter for one approved Raydium CP 
 
 Set `SOLVER_ROUTER=jupiter-raydium-cp`, `JUPITER_API_KEY_PATH` to a private file containing the API key, and `JUPITER_POOLS_PATH` to a private JSON file with an array of pool approvals. Each entry contains `pool`, `token0`, `token1` (base58 addresses in the pool's on-chain order), and `maxTradeFeePpm` (combined trade and enabled creator fees in millionths, at most 50,000). Approval of a pool permits either direction of its pair; the signed intent still determines the direction and amounts. No pools are implicitly trusted or shipped as production recommendations.
 
-`JUPITER_SLIPPAGE_BPS` defaults to 50 and accepts 0 through 500. The user's signed minimum output takes precedence whenever stricter. Existing solver price, authorization, compute, priority-fee, network-fee and journal configuration still applies. Jupiter routing does not enable unattended trades in unpriced assets or bypass Pocket policy.
+`JUPITER_SLIPPAGE_BPS` defaults to 50 and accepts 0 through 500. The user's signed minimum output takes precedence whenever stricter. Existing solver price, authorization, compute, priority-fee, network-fee and journal configuration still applies. Unpriced trades additionally require `SOLVER_ALLOW_UNPRICED=1` and the owner-approved [PocketV3 speculative policy](adr/0004-bounded-speculative-trading.md). The inventory test planner cannot use that opt-in.
 
 The fixed-origin client calls [Jupiter's composable build endpoint](https://developers.jup.ag/docs/api-reference/swap/build), requests transaction version 0, exact input, no wrapping, no platform fee, and the pocket's derived output token account. It sends the key only to `api.jup.ag`, refuses redirects, aborts after four seconds, caps the streamed body at 256 KiB and redacts provider/transport errors. It has no automatic provider retry: retry the identical signed intent through the durable submission path.
 
@@ -52,6 +52,8 @@ After building the workspace, circuits and GhostLink SBF programs, run:
 CARGO_TARGET_DIR=/path/to/compiled-programs \
   bash scripts/jupiter-localnet-e2e.sh /private/path/to/routing-snapshot
 ```
+
+To exercise an unpriced token buy and tracked partial exit, prefix the same command with `SPECULATIVE_TRADING=1`. This configures only the base-asset oracle, carries speculative limits through owner proof and durable bot consent, verifies quantity/cost accounting and proves recovery clears the position. Both variants keep quotes and base prices synthetic; this is not live provider acceptance.
 
 The snapshot directory must contain:
 

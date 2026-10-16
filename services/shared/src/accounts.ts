@@ -3,9 +3,9 @@ import { PublicKey, type AccountInfo } from "@solana/web3.js";
 import type { Policy } from "@ghostlink/common";
 import { POCKET } from "./instructions.js";
 
-const POCKET_DISC = sha256(new TextEncoder().encode("account:Pocket")).subarray(0, 8);
-/** Discriminator plus current Pocket::INIT_SPACE, including owner_action_nonce. */
-export const POCKET_ACCOUNT_SIZE = 2089;
+const POCKET_DISC = sha256(new TextEncoder().encode("account:PocketV3")).subarray(0, 8);
+/** Discriminator plus current Pocket::INIT_SPACE, including the bounded speculative ledger. */
+export const POCKET_ACCOUNT_SIZE = 3293;
 
 /** Same circular 2048-bit window as programs/pocket/src/state.rs. */
 export function isPocketNonceUsed(account: { nonceBase: bigint; nonceBitmap: Uint8Array }, nonce: bigint): boolean {
@@ -52,12 +52,20 @@ export function readPocketAccount(info: AccountInfo<Uint8Array>, expectedProgram
     if (size > 8) throw new Error("invalid Pocket policy vector");
     return Array.from({ length: size }, read);
   };
-  const readPolicy = (): Policy => ({
+  const readPolicy = (): Policy => {
+    const policy: Policy = {
     dailyCapUsdE6: u64(), maxSlippageBps: Number(integer(2)),
     bigActionThresholdUsdE6: u64(), noOracleCapUsdE6: u64(), sessionMaxSlots: u64(),
     allowedOutMints: vector(() => take(32)),
     oracleFeeds: vector(() => ({ mint: take(32), feedId: take(32), decimals: u8() })),
-  });
+    };
+    const enabled = u8();
+    if (enabled === 1) {
+      policy.speculative = { dailyBuyCapUsdE6: u64(), maxCostExposureUsdE6: u64(),
+        maxPositions: u8(), baseMints: vector(() => take(32)) };
+    } else if (enabled !== 0) throw new Error("invalid speculative policy flag");
+    return policy;
+  };
   const appId = take(32);
   const domainHash = take(32);
   const home = key();
@@ -79,6 +87,9 @@ export function readPocketAccount(info: AccountInfo<Uint8Array>, expectedProgram
   const maxSessionExpirySlot = u64();
   const nonceBase = u64();
   const ownerActionNonce = u64();
-  return { appId, domainHash, home, sessionKind, sessionKey, sessionExpirySlot, policy, pending,
+  const speculativeBoughtTodayUsdE6 = u64();
+  const speculativePositions = Array.from({ length: 8 }, () => ({ mint: key(), baseMint: key(),
+    tokenAccount: key(), quantity: u64(), costUsdE6: u64() })).filter(p => p.quantity > 0n);
+  return { speculativeBoughtTodayUsdE6, speculativePositions, appId, domainHash, home, sessionKind, sessionKey, sessionExpirySlot, policy, pending,
     dayStartSlot, spentTodayUsdE6, nonceBitmap, bump, maxSessionExpirySlot, nonceBase, ownerActionNonce };
 }

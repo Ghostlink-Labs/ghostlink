@@ -76,6 +76,7 @@ export async function fetchJupiterBuild(query: URLSearchParams, apiKey: string, 
 
 /** Experimental composable adapter. Only one reviewed Raydium CP hop, classic SPL, V2 ExactIn. */
 export class JupiterPlanner implements RoutePlanner {
+  readonly funding = "intent-input" as const;
   readonly #options: JupiterOptions;
   constructor(private readonly chain: RouteChain, options: JupiterOptions, private readonly fetcher: typeof fetch = globalThis.fetch) {
     requireRoute(typeof options.apiKey === "string" && options.apiKey.length > 0 && options.apiKey.length <= 512 && !/[\s\x00-\x1f\x7f]/.test(options.apiKey), "invalid Jupiter API key configuration");

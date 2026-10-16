@@ -172,6 +172,14 @@ pub struct OracleFeedBinding {
 }
 
 #[derive(BorshSerialize, Clone)]
+pub struct SpeculativePolicy {
+    pub daily_buy_cap_usd_e6: u64,
+    pub max_cost_exposure_usd_e6: u64,
+    pub max_positions: u8,
+    pub base_mints: Vec<[u8; 32]>,
+}
+
+#[derive(BorshSerialize, Clone)]
 pub struct Policy {
     pub daily_cap_usd_e6: u64,
     pub max_slippage_bps: u16,
@@ -180,12 +188,13 @@ pub struct Policy {
     pub session_max_slots: u64,
     pub allowed_out_mints: Vec<[u8; 32]>,
     pub oracle_feeds: Vec<OracleFeedBinding>,
+    pub speculative: Option<SpeculativePolicy>,
 }
 
 impl Policy {
     /// Canonical bytes exactly as programs/pocket/src/state.rs builds them.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = b"ghostlink:policy:v3".to_vec();
         out.extend_from_slice(&self.daily_cap_usd_e6.to_le_bytes());
         out.extend_from_slice(&self.max_slippage_bps.to_le_bytes());
         out.extend_from_slice(&self.big_action_threshold_usd_e6.to_le_bytes());
@@ -200,6 +209,14 @@ impl Policy {
             out.extend_from_slice(&f.mint);
             out.extend_from_slice(&f.feed_id);
             out.push(f.decimals);
+        }
+        out.push(u8::from(self.speculative.is_some()));
+        if let Some(s) = &self.speculative {
+            out.extend_from_slice(&s.daily_buy_cap_usd_e6.to_le_bytes());
+            out.extend_from_slice(&s.max_cost_exposure_usd_e6.to_le_bytes());
+            out.push(s.max_positions);
+            out.push(s.base_mints.len() as u8);
+            for m in &s.base_mints { out.extend_from_slice(m); }
         }
         out
     }
@@ -219,6 +236,7 @@ pub fn feeds_policy() -> Policy {
         no_oracle_cap_usd_e6: 20_000_000,
         session_max_slots: 216_000,
         allowed_out_mints: vec![],
+        speculative: None,
         oracle_feeds: vec![
             OracleFeedBinding {
                 mint: label("usdc mint"),
@@ -232,6 +250,14 @@ pub fn feeds_policy() -> Policy {
             },
         ],
     }
+}
+
+pub fn speculative_policy() -> Policy {
+    let mut p = feeds_policy();
+    p.speculative = Some(SpeculativePolicy { daily_buy_cap_usd_e6: 30_000_000,
+        max_cost_exposure_usd_e6: 20_000_000, max_positions: 2,
+        base_mints: vec![label("usdc mint"), label("sol mint")] });
+    p
 }
 
 #[derive(BorshSerialize, Clone)]

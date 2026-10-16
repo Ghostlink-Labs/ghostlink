@@ -40,6 +40,7 @@ use ghostlink_verifier::{verify_login, verify_owner};
 pub mod oracle;
 pub mod precompile;
 pub mod state;
+pub mod speculative;
 pub mod token;
 
 use oracle::{read_price, usd_e6};
@@ -187,7 +188,7 @@ pub mod ghostlink_pocket {
         );
 
         // Re-derive the bound commitments from the raw arguments.
-        let key32 = Pocket::session_key32(args.session_kind, &args.session_key);
+        let key32 = PocketV3::session_key32(args.session_kind, &args.session_key);
         let session_commitment = poseidon::session_commitment(&key32, args.session_expiry_slot)
             .map_err(|_| error!(PocketError::HashFailed))?;
         let home_hash = poseidon::home_hash(&args.home.to_bytes())
@@ -230,6 +231,7 @@ pub mod ghostlink_pocket {
             pocket.pending = None;
             pocket.day_start_slot = clock.slot;
             pocket.spent_today_usd_e6 = 0;
+            pocket.speculative_ledger = speculative::SpeculativeLedger::default();
             pocket.nonce_bitmap = [0u8; NONCE_BITMAP_BYTES];
             pocket.nonce_base = 0;
             pocket.owner_action_nonce = 0;
@@ -333,44 +335,46 @@ pub mod ghostlink_pocket {
             require!(allowed.contains(&args.out_mint), PocketError::OutMintNotAllowed);
         }
 
-        // Value the input in USD through the user-pinned oracle feed.
-        let in_feed = pocket
-            .policy
-            .feed_for(&args.in_mint)
-            .ok_or(error!(PocketError::NoInputOracle))?
-            .clone();
-        let in_price = read_price(
-            &ctx.accounts.in_price.to_account_info(),
-            &in_feed.feed_id,
-            clock.unix_timestamp,
-        )?;
-        let in_value_usd_e6 = usd_e6(args.in_max, in_feed.decimals, &in_price)?;
-
+        // Classification is fixed by the owner-bound policy. A provider's
+        // quote never becomes an oracle or changes these permissions.
+        let in_feed = pocket.policy.feed_for(&args.in_mint).cloned();
+        let out_priced = pocket.policy.feed_for(&args.out_mint).is_some();
+        let mode = match (in_feed.is_some(), out_priced) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => return err!(PocketError::NoInputOracle),
+        };
+        let in_value_usd_e6 = if let Some(feed) = in_feed {
+            let price = read_price(&ctx.accounts.in_price.to_account_info(), &feed.feed_id, clock.unix_timestamp)?;
+            usd_e6(args.in_max, feed.decimals, &price)?
+        } else { 0 };
         pocket.roll_day(clock.slot);
-        require!(
-            pocket
-                .spent_today_usd_e6
-                .checked_add(in_value_usd_e6)
-                .ok_or(error!(PocketError::Overflow))?
-                <= pocket.policy.daily_cap_usd_e6,
-            PocketError::DailyCapExceeded
-        );
-
-        // Passkey rules: a P-256 session is passkey-held by construction;
-        // a software session stays under the big-action threshold and may
-        // not buy oracle-less mints (docs/adr/0001).
-        let passkey_signed = pocket.session_kind == SESSION_KIND_P256;
-        if !passkey_signed {
-            require!(
-                in_value_usd_e6 <= pocket.policy.big_action_threshold_usd_e6,
-                PocketError::PasskeyRequired
-            );
+        if mode != 2 {
+            require!(pocket.spent_today_usd_e6.checked_add(in_value_usd_e6)
+                .ok_or(error!(PocketError::Overflow))? <= pocket.policy.daily_cap_usd_e6,
+                PocketError::DailyCapExceeded);
         }
-        if pocket.policy.feed_for(&args.out_mint).is_none() {
-            require!(
-                passkey_signed && in_value_usd_e6 <= pocket.policy.no_oracle_cap_usd_e6,
-                PocketError::NoOracleViolation
-            );
+        let passkey_signed = pocket.session_kind == SESSION_KIND_P256;
+        if !passkey_signed && mode != 2 {
+            require!(in_value_usd_e6 <= pocket.policy.big_action_threshold_usd_e6, PocketError::PasskeyRequired);
+        }
+        if mode != 0 {
+            let spec = pocket.policy.speculative.as_ref().ok_or(error!(PocketError::NoOracleViolation))?;
+            require!(args.in_max > 0 && args.out_min > 0, PocketError::SpeculativeViolation);
+            if mode == 1 {
+                require!(in_value_usd_e6 <= pocket.policy.no_oracle_cap_usd_e6, PocketError::NoOracleViolation);
+                // Staging a policy update stops new exposure; exits and
+                // owner recovery remain available during the timelock.
+                require!(!matches!(&pocket.pending, Some(PendingChange { change: Change::Policy(_), .. })),
+                    PocketError::ChangePending);
+                pocket.speculative_ledger.check_buy(spec, args.out_mint, args.in_mint,
+                    ctx.accounts.pocket_out_account.key(), in_value_usd_e6)?;
+            } else {
+                require!(spec.base_mints.contains(&args.out_mint), PocketError::SpeculativeViolation);
+                pocket.speculative_ledger.check_exit(args.in_mint, args.out_mint,
+                    ctx.accounts.pocket_in_account.key(), args.in_max)?;
+            }
         }
 
         let fill = &mut ctx.accounts.fill_state;
@@ -383,6 +387,8 @@ pub mod ghostlink_pocket {
         fill.out_account = ctx.accounts.pocket_out_account.key();
         fill.in_value_usd_e6 = in_value_usd_e6;
         fill.passkey_signed = passkey_signed;
+        fill.mode = mode;
+        fill.in_account = ctx.accounts.pocket_in_account.key();
 
         let app_id = pocket.app_id;
         let bump = [pocket.bump];
@@ -443,9 +449,21 @@ pub mod ghostlink_pocket {
             let floor = (fill.in_value_usd_e6 as u128)
                 .checked_mul(10_000u128 - pocket.policy.max_slippage_bps as u128)
                 .ok_or(error!(PocketError::Overflow))?;
-            require!(out_usd * 10_000 >= floor, PocketError::SlippageFloor);
+            if fill.mode == 0 {
+                require!(out_usd * 10_000 >= floor, PocketError::SlippageFloor);
+            }
+            // An exit can realize a loss. The signed minimum, original
+            // base asset and tracked quantity constrain it, not cost basis.
         }
-        // else: fill_begin already enforced the passkey + no-oracle cap.
+        let mut released_cost_usd_e6 = 0;
+        if fill.mode == 1 {
+            let spec = pocket.policy.speculative.clone().ok_or(error!(PocketError::NoOracleViolation))?;
+            pocket.speculative_ledger.acquire(&spec, args.out_mint, args.in_mint,
+                fill.out_account, received, fill.in_value_usd_e6)?;
+        } else if fill.mode == 2 {
+            released_cost_usd_e6 = pocket.speculative_ledger.exit(args.in_mint, args.out_mint,
+                fill.in_account, args.in_max)?;
+        }
 
         pocket.mark_nonce(args.nonce);
         pocket.spent_today_usd_e6 = pocket
@@ -461,6 +479,8 @@ pub mod ghostlink_pocket {
             out_mint: args.out_mint,
             out_received: received,
             in_value_usd_e6: fill.in_value_usd_e6,
+            mode: fill.mode,
+            released_cost_usd_e6,
         });
         Ok(())
     }
@@ -487,7 +507,7 @@ pub mod ghostlink_pocket {
         authorize(&ctx.accounts.pocket, &ctx.accounts.instructions, &ctx.accounts.registry_tree, &auth, &digest)?;
         ctx.accounts.pocket.consume_owner_action()?;
 
-        let pocket = &ctx.accounts.pocket;
+        let pocket = &mut ctx.accounts.pocket;
         let app_id = pocket.app_id;
         let bump = [pocket.bump];
         let seeds: &[&[u8]] = &[b"pocket", app_id.as_ref(), &bump];
@@ -521,6 +541,7 @@ pub mod ghostlink_pocket {
                 &ctx.accounts.token_program.to_account_info(),
                 seeds,
             )?;
+            pocket.speculative_ledger.swept(src_info.key());
         }
 
         // Surplus lamports (direct SOL deposits) go home too; the rent
@@ -591,7 +612,10 @@ pub mod ghostlink_pocket {
         );
         match pending.change {
             Change::Home(h) => pocket.home = h,
-            Change::Policy(p) => pocket.policy = p,
+            Change::Policy(p) => {
+                require!(!pocket.speculative_ledger.has_positions(), PocketError::PositionsOpen);
+                pocket.policy = p;
+            },
         }
         pocket.consume_owner_action()?;
         emit!(ChangeExecuted { pocket: pocket.key() });
@@ -672,7 +696,7 @@ fn check_tree_account(
 /// Owner proof: binds registry membership, this pocket's domain and
 /// app_id, and the exact action digest (reduced into the field).
 fn check_owner_proof(
-    pocket: &Account<Pocket>,
+    pocket: &Account<PocketV3>,
     registry_tree: &UncheckedAccount,
     proof: &OwnerProofArgs,
     action_digest: &[u8; 32],
@@ -697,7 +721,7 @@ fn check_owner_proof(
 
 /// Session-or-owner authorization for sweep and revoke.
 fn authorize(
-    pocket: &Account<Pocket>,
+    pocket: &Account<PocketV3>,
     instructions: &UncheckedAccount,
     registry_tree: &UncheckedAccount,
     auth: &SessionOrOwner,
@@ -735,11 +759,11 @@ pub struct OpenSession<'info> {
     #[account(
         init_if_needed,
         payer = payer,
-        space = 8 + Pocket::INIT_SPACE,
+        space = 8 + PocketV3::INIT_SPACE,
         seeds = [b"pocket", args.app_id.as_ref()],
         bump
     )]
-    pub pocket: Account<'info, Pocket>,
+    pub pocket: Box<Account<'info, PocketV3>>,
     /// CHECK: owner program, PDA address and layout verified in handler.
     pub registry_tree: UncheckedAccount<'info>,
     /// CHECK: owner program, PDA address and layout verified in handler.
@@ -756,7 +780,7 @@ pub struct FillBegin<'info> {
     #[account(mut)]
     pub solver: Signer<'info>,
     #[account(mut, seeds = [b"pocket", pocket.app_id.as_ref()], bump = pocket.bump)]
-    pub pocket: Account<'info, Pocket>,
+    pub pocket: Box<Account<'info, PocketV3>>,
     /// CHECK: parsed and owner/mint-checked in handler.
     #[account(mut)]
     pub pocket_in_account: UncheckedAccount<'info>,
@@ -789,7 +813,7 @@ pub struct FillEnd<'info> {
     #[account(mut)]
     pub solver: Signer<'info>,
     #[account(mut, seeds = [b"pocket", pocket.app_id.as_ref()], bump = pocket.bump)]
-    pub pocket: Account<'info, Pocket>,
+    pub pocket: Box<Account<'info, PocketV3>>,
     #[account(
         mut,
         close = solver,
@@ -809,7 +833,7 @@ pub struct SweepHome<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, seeds = [b"pocket", pocket.app_id.as_ref()], bump = pocket.bump)]
-    pub pocket: Account<'info, Pocket>,
+    pub pocket: Box<Account<'info, PocketV3>>,
     /// CHECK: must equal pocket.home (verified in handler); receives
     /// closed-account rent and surplus lamports.
     #[account(mut)]
@@ -828,7 +852,7 @@ pub struct OwnerAction<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, seeds = [b"pocket", pocket.app_id.as_ref()], bump = pocket.bump)]
-    pub pocket: Account<'info, Pocket>,
+    pub pocket: Box<Account<'info, PocketV3>>,
     /// CHECK: owner program, PDA address and layout verified in handler.
     pub registry_tree: UncheckedAccount<'info>,
 }
@@ -837,7 +861,7 @@ pub struct OwnerAction<'info> {
 pub struct ExecuteChange<'info> {
     pub payer: Signer<'info>,
     #[account(mut, seeds = [b"pocket", pocket.app_id.as_ref()], bump = pocket.bump)]
-    pub pocket: Account<'info, Pocket>,
+    pub pocket: Box<Account<'info, PocketV3>>,
 }
 
 #[derive(Accounts)]
@@ -845,7 +869,7 @@ pub struct Revoke<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, seeds = [b"pocket", pocket.app_id.as_ref()], bump = pocket.bump)]
-    pub pocket: Account<'info, Pocket>,
+    pub pocket: Box<Account<'info, PocketV3>>,
     /// CHECK: validated when the owner-proof path is taken.
     pub registry_tree: UncheckedAccount<'info>,
     /// CHECK: constrained to the instructions sysvar address.

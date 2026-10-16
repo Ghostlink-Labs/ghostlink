@@ -142,6 +142,7 @@ async function main() {
 
   // ---- mints ---------------------------------------------------------------
   const fork = process.env.JUPITER_FIXTURE_DIR ? loadJupiterFixture(process.env.JUPITER_FIXTURE_DIR) : undefined;
+  const speculative = Boolean(fork && process.env.SPECULATIVE_TRADING === "1");
   const usdcMint = Keypair.fromSeed(label("e2e usdc mint seed"));
   const solMint = Keypair.fromSeed(label("e2e sol mint seed"));
   const inputMint = fork ? new PublicKey(fork.approval.token0) : usdcMint.publicKey;
@@ -196,14 +197,15 @@ async function main() {
     buildRelayer({ connection, payer, minWalletLamports: 1n }), 8788,
   );
   // Synthetic Pyth accounts loaded by this disposable validator's genesis.
-  const priceAccounts = {
+  const priceAccounts: Record<string, string> = {
     [inputMint.toBase58()]: priceAccountFor("e2e usdc price acct").toBase58(),
     [outputMint.toBase58()]: priceAccountFor("e2e sol price acct").toBase58(),
   };
+  if (speculative) delete priceAccounts[outputMint.toBase58()];
   const usdcFeedId = label("usdc pyth feed");
   const solFeedId = label("sol pyth feed");
   solverFixture = await startSolverFixture(connection, solverKp, priceAccounts, keepRunning ? demoPortBase + 2 : 0,
-    { planner: forkPlanner, lookupAddresses: forkPlanner?.lookupAddresses });
+    { planner: forkPlanner, lookupAddresses: forkPlanner?.lookupAddresses, allowUnpriced: speculative });
   const solverUrl = solverFixture.url;
   const actionsUrl = await listen(buildActions({ connection, baseUrl: keepRunning ? `http://127.0.0.1:${demoPortBase + 3}` : "http://e2e.local" }), 8790);
   ok(`services up (indexer ${indexerUrl})`);
@@ -303,6 +305,11 @@ async function main() {
       { mint: outputMint.toBytes(), feedId: solFeedId, decimals: outputDecimals },
     ],
   };
+  if (speculative) {
+    policy.oracleFeeds = policy.oracleFeeds.slice(0, 1);
+    policy.speculative = { dailyBuyCapUsdE6: 30_000_000n, maxCostExposureUsdE6: 20_000_000n,
+      maxPositions: 2, baseMints: [inputMint.toBytes()] };
+  }
   botFixture = await startBotFixture(connection, origin, policy);
   const request = { requestKey: "ab".repeat(16), appId: deriveAppId(identity.sField, deriveDomainHash(origin)).toString(),
     home: home.toBase58(), sessionExpirySlot: expirySlot.toString() };
@@ -474,6 +481,10 @@ async function main() {
     }
   }
   ok(`owner proof recovered ${sweepMints.length} complete token balances and closed their pocket accounts`);
+  const recoveredPocket = await connection.getAccountInfo(pocket, "confirmed");
+  if (!recoveredPocket || readPocketAccount(recoveredPocket).speculativePositions.length !== 0) {
+    throw new Error("owner recovery retained speculative trading permission");
+  }
 
   console.log(
     "\nE2E PASSED — register, snapshot, bot consent, prove, verify, open, confirm, restart, fund, bot-signed fill, sweep.",

@@ -442,6 +442,9 @@ export function policyToDto(p: Policy): PolicyDto {
     noOracleCapUsdE6: p.noOracleCapUsdE6.toString(),
     sessionMaxSlots: p.sessionMaxSlots.toString(),
     allowedOutMints: p.allowedOutMints.map(toBase58),
+    speculative: p.speculative && { dailyBuyCapUsdE6: p.speculative.dailyBuyCapUsdE6.toString(),
+      maxCostExposureUsdE6: p.speculative.maxCostExposureUsdE6.toString(),
+      maxPositions: p.speculative.maxPositions, baseMints: p.speculative.baseMints.map(toBase58) },
     oracleFeeds: p.oracleFeeds.map((f) => ({
       mint: toBase58(f.mint),
       feedIdHex: bytesToHex(f.feedId),
@@ -459,6 +462,9 @@ export function policyFromDto(d: PolicyDto): Policy {
     noOracleCapUsdE6: BigInt(d.noOracleCapUsdE6),
     sessionMaxSlots: BigInt(d.sessionMaxSlots),
     allowedOutMints: d.allowedOutMints.map(bs58decode),
+    speculative: d.speculative && { dailyBuyCapUsdE6: BigInt(d.speculative.dailyBuyCapUsdE6),
+      maxCostExposureUsdE6: BigInt(d.speculative.maxCostExposureUsdE6),
+      maxPositions: d.speculative.maxPositions, baseMints: d.speculative.baseMints.map(bs58decode) },
     oracleFeeds: d.oracleFeeds.map((f) => ({
       mint: bs58decode(f.mint),
       feedId: hexToBytes(f.feedIdHex),

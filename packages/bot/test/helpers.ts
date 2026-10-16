@@ -21,7 +21,7 @@ export function initData(userId = 42, authDate = NOW, extra: Record<string, stri
 
 export function pocketAccount(c: BotConsent, nonceBase = 0n, used: bigint[] = []) {
   const key = new Uint8Array(33); key.set(hexToBytes(c.sessionKeyHex));
-  const w = new BorshWriter().fixed(createHash("sha256").update("account:Pocket").digest().subarray(0, 8))
+  const w = new BorshWriter().fixed(createHash("sha256").update("account:PocketV3").digest().subarray(0, 8))
     .fixed(fieldToBytes32(BigInt(c.appId))).fixed(fieldToBytes32(domainHash(c.appOrigin)))
     .fixed(new PublicKey(c.home).toBytes()).u8(0).fixed(key).u64(BigInt(c.sessionExpirySlot));
   writePolicy(w, policyFromDto(c.policy));

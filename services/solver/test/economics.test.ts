@@ -40,6 +40,14 @@ describe("economics", () => {
     expect(checkEconomics(nft, { in: usdc }, 100, true).ok).toBe(true);
   });
 
+  it("never treats unpriced exit cost basis as market value or allows two unpriced legs", () => {
+    const exit = { inMax: 100n, outMin: 1n };
+    expect(checkEconomics(exit, { out: usdc }, 100).ok).toBe(false);
+    expect(checkEconomics(exit, { out: usdc }, 100, true)).toEqual({ ok: true, outUsdE6: 1n });
+    expect(checkEconomics(exit, {}, 100, true).ok).toBe(false);
+    expect(checkEconomics({ ...exit, outMin: 0n }, { out: usdc }, 100, true).ok).toBe(false);
+  });
+
   it("parses a PriceUpdateV2 account and rejects partial verification", () => {
     const build = (level: number) => {
       const data = Buffer.alloc(134);

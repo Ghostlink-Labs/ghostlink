@@ -10,6 +10,8 @@
 //! on-chain unchanged.
 
 mod common;
+#[path = "common/speculative_flows.rs"]
+mod speculative_flows;
 
 use common::*;
 use solana_clock::Clock;
@@ -267,7 +269,8 @@ fn identity_flow_and_refusals() {
 
     // Open a session with the fixture proof.
     set_clock(&mut ctx.h, OPEN_SLOT);
-    let args = open_session_args(&ctx, "circuits/keys/login_proof.json", 0, ed25519_key33(&ctx.session), true);
+    let proof = "circuits/keys/login_proof.json";
+    let args = open_session_args(&ctx, proof, 0, ed25519_key33(&ctx.session), true);
     ctx.h.send(&[compute_budget(400_000), open_session_ix(&ctx, &args)], &[]).expect("open_session");
 
     let data = ctx.h.account_data(&ctx.pocket).expect("pocket exists");
@@ -310,7 +313,7 @@ fn first_session_binds_policy_purpose_and_deployment() {
             3 => p.no_oracle_cap_usd_e6 += 1,
             4 => p.session_max_slots += 1,
             5 => p.allowed_out_mints.push(ctx.sol),
-            6 => p.oracle_feeds[0].mint = ctx.sol,
+            6 => p.oracle_feeds[0].mint = label("different priced mint"),
             7 => p.oracle_feeds[0].feed_id[0] ^= 1,
             _ => p.oracle_feeds[0].decimals += 1,
         }
@@ -349,12 +352,16 @@ struct FillWorld {
     sol_price: Pubkey,
 }
 
-fn fill_world() -> FillWorld {
+fn fill_world() -> FillWorld { fill_world_with_policy(false) }
+
+fn fill_world_with_policy(speculative: bool) -> FillWorld {
     let mut ctx = setup();
+    if speculative { ctx.policy = speculative_policy(); }
     register(&mut ctx);
     snapshot(&mut ctx);
     set_clock(&mut ctx.h, OPEN_SLOT);
-    let args = open_session_args(&ctx, "circuits/keys/login_proof.json", 0, ed25519_key33(&ctx.session), true);
+    let proof = if speculative { "circuits/keys/login_speculative_proof.json" } else { "circuits/keys/login_proof.json" };
+    let args = open_session_args(&ctx, proof, 0, ed25519_key33(&ctx.session), true);
     ctx.h.send(&[compute_budget(400_000), open_session_ix(&ctx, &args)], &[]).expect("open_session");
     set_clock(&mut ctx.h, FILL_SLOT);
 
@@ -580,6 +587,7 @@ fn fill_flow_and_refusals() {
     let solver_nft = Pubkey::new_unique();
     w.ctx.h.svm.set_account(solver_nft, token_account(&nft, &solver_pk, 5)).unwrap();
     let saved_out = w.pocket_out;
+    let priced_output = w.pocket_out;
     w.pocket_out = pocket_nft;
     // Include a matching fill_end so the begin/end pairing check passes
     // and the refusal is specifically the no-oracle policy.
@@ -961,7 +969,7 @@ fn base64url(data: &[u8]) -> String {
 }
 
 #[test]
-fn p256_passkey_session_and_no_oracle_fill() {
+fn p256_requires_explicit_unpriced_permission() {
     use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
 
     let mut w = fill_world();
@@ -992,8 +1000,7 @@ fn p256_passkey_session_and_no_oracle_fill() {
     w.ctx.h.send(&[compute_budget(400_000), open_session_ix(&w.ctx, &args)], &[]).expect("rotate to p256 session");
     set_clock(&mut w.ctx.h, FILL_SLOT);
 
-    // A no-oracle (NFT-style) intent: allowed now, passkey-signed and
-    // under the no-oracle cap.
+    // A passkey alone does not approve unpriced trading in PocketV3.
     let nft = label("nft mint");
     let pocket_nft = Pubkey::new_unique();
     let solver_nft = Pubkey::new_unique();
@@ -1030,6 +1037,7 @@ fn p256_passkey_session_and_no_oracle_fill() {
         client_data_json: cdj,
     };
 
+    let priced_output = w.pocket_out;
     w.pocket_out = pocket_nft;
     let txi = vec![
         secp256r1_ix(&compressed, &sig_bytes, &message),
@@ -1037,7 +1045,29 @@ fn p256_passkey_session_and_no_oracle_fill() {
         spl_transfer(&solver_nft, &pocket_nft, &solver_pk, 1),
         fill_end_ix(&w, &intent, &pocket_nft, None),
     ];
-    w.ctx.h.send(&txi, &[&solver]).expect("passkey no-oracle fill");
-    assert_eq!(w.ctx.h.token_balance(&pocket_nft), Some(1));
-    assert_eq!(w.ctx.h.token_balance(&w.solver_in), Some(10_000_000));
+    let err = w.ctx.h.send_expect_err(&txi, &[&solver]);
+    assert!(err.contains("Custom(6027)") || err.contains("NoOracleViolation"), "{err}");
+    assert_eq!(w.ctx.h.token_balance(&pocket_nft), Some(0));
+    assert_eq!(w.ctx.h.token_balance(&w.solver_in), Some(0));
+
+    // Passkey signing still works for an ordinary oracle-priced fill.
+    w.pocket_out = priced_output;
+    intent.out_mint = w.ctx.sol;
+    intent.out_min = 64_000_000; // $10 of SOL at the pinned fixture price
+    let challenge = intent_hash_of(&w, &intent);
+    let mut auth_data = sha(&[b"ghostlink.dev"]).to_vec();
+    auth_data.extend_from_slice(&[0x05, 0, 0, 0, 2]);
+    let cdj = format!(r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://ghostlink.dev"}}"#,
+        base64url(&challenge)).into_bytes();
+    let mut message = auth_data.clone();
+    message.extend_from_slice(&sha(&[&cdj]));
+    let sig: Signature = signing.sign(&message);
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let signature: [u8; 64] = sig.to_bytes().as_slice().try_into().unwrap();
+    let tx = vec![secp256r1_ix(&compressed, &signature, &message),
+        fill_begin_ix(&w, &intent, &w.usdc_price, Some(WebauthnData { authenticator_data: auth_data, client_data_json: cdj })),
+        spl_transfer(&w.solver_out, &w.pocket_out, &solver_pk, intent.out_min),
+        fill_end_ix(&w, &intent, &w.pocket_out, Some(&w.sol_price))];
+    w.ctx.h.send(&tx, &[&solver]).expect("priced passkey fill");
+    assert_eq!(w.ctx.h.token_balance(&priced_output), Some(64_000_000));
 }

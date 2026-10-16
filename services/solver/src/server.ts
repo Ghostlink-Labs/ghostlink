@@ -46,6 +46,8 @@ export interface RoutePlan {
 }
 
 export interface RoutePlanner {
+  /** Opt-in contract: output comes solely from swapping the exact intent input. */
+  readonly funding?: "intent-input";
   plan(v: ValidatedIntent, solver: PublicKey, minimumSlot?: number): Promise<RoutePlan>;
 }
 
@@ -72,7 +74,7 @@ export interface SolverDeps {
   priceAccounts: Record<string, string>;
   /** How much more than the input's value the solver will deliver; default 100 bps. */
   maxQuoteSpreadBps?: number;
-  /** Fill output mints that have no price (NFT-style); default false. */
+  /** Allow unpriced legs with an intent-funded planner; default false. Owner policy still applies. */
   allowUnpriced?: boolean;
   /**
    * Pay rent for the pocket's output token account when it is missing.
@@ -125,8 +127,10 @@ export function buildServer(deps: SolverDeps): Server {
     try {
       const result = await submissions.submit(v, async minimumSlot => {
         const inPrice = await prices.priceFor(inMint);
-        if (!inPrice) throw new HttpError(400, "input mint has no configured price account");
         const outPrice = await prices.priceFor(outMint);
+        if ((!inPrice || !outPrice) && (!deps.allowUnpriced || deps.planner.funding !== "intent-input")) {
+          throw new HttpError(400, "unpriced trades require an enabled intent-funded swap planner");
+        }
         const economics = checkEconomics(v.intent, { in: inPrice, out: outPrice },
           deps.maxQuoteSpreadBps ?? 100, deps.allowUnpriced ?? false);
         if (!economics.ok) throw new HttpError(400, economics.reason ?? "quote refused");
@@ -157,7 +161,10 @@ export function buildServer(deps: SolverDeps): Server {
       deadlineSlot: v.intent.deadlineSlot,
       policyHash: v.intent.policyHash,
     };
-    const inPriceAccount = new PublicKey(deps.priceAccounts[inMint.toBase58()]!);
+    // Unpriced exits have no input oracle. The program classifies the leg
+    // from the owner-pinned policy and ignores this placeholder only then.
+    const inPriceAccount = deps.priceAccounts[inMint.toBase58()]
+      ? new PublicKey(deps.priceAccounts[inMint.toBase58()]!) : pocket;
     const outPriceAccount = deps.priceAccounts[outMint.toBase58()];
 
     const route = await deps.planner.plan(v, solver, minimumSlot);

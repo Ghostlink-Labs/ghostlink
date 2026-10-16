@@ -92,6 +92,12 @@ export interface PolicyDto {
   sessionMaxSlots: string;
   allowedOutMints: string[]; // base58
   oracleFeeds: { mint: string; feedIdHex: string; decimals: number }[];
+  speculative?: {
+    dailyBuyCapUsdE6: string;
+    maxCostExposureUsdE6: string;
+    maxPositions: number;
+    baseMints: string[];
+  };
 }
 
 /** POST /intent (to the solver) */

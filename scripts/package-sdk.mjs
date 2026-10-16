@@ -45,12 +45,16 @@ if (process.argv.includes("--test")) {
   writeFileSync(join(consumer, "check.mjs"), `
 import assert from 'node:assert/strict';
 import { createPublicKey, verify } from 'node:crypto';
-import { GhostLink, softwareSession, sessionPublicKey, derivePocket, signIntent } from '@ghostlink/sdk';
-import { intentHash } from '@ghostlink/common';
+import { GhostLink, softwareSession, sessionPublicKey, derivePocket, signIntent, policyToDto, policyFromDto } from '@ghostlink/sdk';
+import { intentHash, conservativePolicy, policyHash } from '@ghostlink/common';
 const bot = softwareSession();
 const publicKey = sessionPublicKey(0, bot.key32);
 assert.equal('sign' in publicKey, false);
-const pocket = derivePocket(1n, new Uint8Array(32).fill(1));
+const base = new Uint8Array(32).fill(2);
+const policy = { ...conservativePolicy(), oracleFeeds: [{ mint: base, feedId: new Uint8Array(32).fill(4), decimals: 9 }],
+  speculative: { dailyBuyCapUsdE6: 30000000n, maxCostExposureUsdE6: 20000000n, maxPositions: 2, baseMints: [base] } };
+assert.deepEqual(policyFromDto(policyToDto(policy)), policy);
+const pocket = derivePocket(1n, new Uint8Array(32).fill(1), policy);
 const signed = await signIntent(pocket, bot, {
   nonce: 1n, inMint: new Uint8Array(32).fill(2), inMax: 100n,
   outMint: new Uint8Array(32).fill(3), outMin: 90n, deadlineSlot: 1000n,
@@ -59,6 +63,7 @@ const key = createPublicKey({ format: 'der', type: 'spki', key: Buffer.concat([
   Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(publicKey.key32),
 ]) });
 assert.equal(verify(null, intentHash(signed.intent), key, signed.signature.signature), true);
+assert.deepEqual(signed.intent.policyHash, policyHash(policy));
 await assert.rejects(GhostLink.init({ cluster: 'mainnet-beta', indexer: 'https://example.invalid' }), /no verified devnet or mainnet/);
 console.log('Installed SDK: ESM import, public delegation and real intent signature verified. No network transaction sent.');
 `);

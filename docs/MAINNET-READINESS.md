@@ -1,6 +1,6 @@
 # Mainnet readiness and compatibility plan
 
-Status: development release, 2026-10-16. **Not approved for real funds.** This document defines the implementation and evidence needed for a release; planned entries are not shipped features. The public repository contains protocol code and integration documentation only. Product application code, design assets, credentials and internal handoffs remain private.
+Status: development release, 2026-10-17. **Not approved for real funds.** This document defines the implementation and evidence needed for a release; planned entries are not shipped features. The public repository contains protocol code and integration documentation only. Product application code, design assets, credentials and internal handoffs remain private.
 
 ## Product scope
 
@@ -17,7 +17,7 @@ Support is an explicit contract per network, operation, token program, wallet, e
 | Existing commercial sniper bots | No named provider integration or endorsement | Operator integration and tests against its supported extension/API model; do not request wallet-key imports as a workaround |
 | Web trading terminal | Devnet product integration exists | Mainnet route, quote validation, supported asset registry, fee budgets, production observability |
 | Liquid-token market swaps | Experimental [Jupiter/Raydium CP adapter](JUPITER-ROUTING.md); full Pocket buy/sell, market-move rollback, retry, revoke and recovery tested on a local fork with cloned programs and synthetic quotes/prices | Actual provider responses, full Pocket coverage for intended route variants, independent program review and bounded public pilot; wider DEX variants need separate review |
-| New-token sniping | Blocked for unattended software sessions; input needs an oracle and unpriced outputs need passkeys | Versioned speculative trading policy and buy/sell paths, explicit opt-in, bounded exposure, price-impact/route controls, independent review |
+| New-token sniping | PocketV3 explicit opt-in, bounded buys and tracked exits tested locally through the bot and cloned DEX programs | Trusted owner consent UI, actual supported provider/asset evidence, adversarial liquidity/price-impact review, independent review and capped pilot |
 | Bonding curves / launchpads before aggregator routing | No direct adapters | Separate adapters for each launch program and migration phase; liquidity/authority checks; realistic transaction-size tests |
 | Copy trading | Same intent primitives; no trigger engine | Durable leader-event ingestion, idempotency, per-follower caps, stale-signal refusal and session expiry handling |
 | DCA / scheduled trades | No scheduler | Persisted jobs, time/price bounds, session renewal and restart recovery |
@@ -39,11 +39,9 @@ Support is an explicit contract per network, operation, token program, wallet, e
 
 ## Protocol decisions needed before sniper support
 
-The current Pocket program always values the input through a pinned feed. It only permits oracle-less output for a passkey session under the no-oracle cap. Consequently, acquiring an unpriced token does not establish a supported route to sell that token back. This must be solved as a round-trip protocol design, not a UI toggle.
+[ADR 0004](adr/0004-bounded-speculative-trading.md) implements a separate, default-off speculative policy in the PocketV3 candidate. Buys require approved priced bases and per-trade, daily and historical acquisition-cost exposure limits. The program records actual received units and their token account; exits can spend only these units back to the original base. Partial exits release proportional cost with conservative rounding. Loss-taking is permitted without claiming an oracle price for the unpriced input. Direct deposits do not grant trading permission.
 
-Proposed separate speculative policy (not implemented): fund a dedicated small pocket, authorize specified strategies for a short expiry, constrain base assets and absolute spend per trade/day, bind every signed trade to its exact output floor and deadline, and set an explicit exposure budget. Define how selling unpriced inventory consumes budget without trusting the solver's claimed valuation. Decide whether the protocol accounts for cost basis, per-mint unit limits, or a separately capped exit permission. Quote pricing alone must not be represented as a trustworthy oracle. Minimum output protects the signed intent but does not prove a fair market price.
-
-Do not weaken existing oracle/passkey rules to obtain broad token coverage. Introduce a versioned layout, explicit migration and new audited tests. Include malicious low-liquidity routes, manipulated quotes, repeated round trips, stale feeds, token decimals, budget exhaustion, session compromise and recovery races.
+Compiled-program and complete local DEX-fork checks cover buys, partial exits, restart/retry, rollback, revocation and recovery. The policy hash, account discriminator and allocation are versioned; old deployments are preserved. Real provider/asset coverage, the private owner-consent UI, external review and fresh-deployment acceptance remain required. A signed minimum is not proof of a fair price or safe liquidity.
 
 V1 has one active key per per-origin pocket. Bots hosted at one origin can otherwise replace each other's sessions. An isolated identity broker needs a verified application registry and a derivation/consent model that separates bot identities while keeping the owner secret away from third-party page scripts. Raw caller-supplied origin strings are not an isolation boundary.
 
@@ -62,7 +60,7 @@ The delegated authorization API accepts Ed25519 only. A bot-supplied P-256 key a
 | Bot authorization boundary | Public-key SDK and backend request/storage/chain checks locally verified | Trusted owner UI and application registry, real Telegram/device acceptance, on-chain revoke/rotation UX and external review |
 | First-pocket policy authorization | V2 binding locally verified; not deployed or independently reviewed | Circuit/program/SDK substitution tests, local validator evidence, external review and fresh-deployment migration |
 | Trading route | Cloned-program direct-route atomic Pocket buy/sell/failure/revoke/recovery flow passed; standalone shared variants and adversarial adapter contracts tested | Live mainnet read-only quotes, corresponding complete Pocket route tests, independent binary review and approved bounded real settlement after audit gates |
-| Asset and oracle support | Classic SPL with pinned feeds | Explicit supported mint/feed/decimal list, staleness/confidence rules, unsupported token refusal, Pyth update availability and costs |
+| Asset and oracle support | Classic SPL; priced trades and explicitly bounded unpriced round trips locally verified | Explicit supported mint/feed/decimal list, staleness/confidence rules, unsupported token refusal, Pyth update availability and costs |
 | Submission reliability | Encrypted bot nonce/order reservations and exact-transaction journal tested through restart; version-0 messages, verified lookup tables, simulation, per-message network-fee limits and nonce-window backpressure | Validated DEX instructions/protocol fees, coordinated restore, aggregate budgets, live route failure tests and operator RPC guarantees |
 | Persistent operations | SQLite consent/key and solver transaction records survive process exit; lost-acknowledgment/restart flow tested | Backup/restore drill, key rotation, RPC failover, alerts, fee/inventory budgets and durable strategy jobs; no multi-host availability claim |
 | Distribution | Source and locally packed archives; no registry release implied | Scope ownership, versioned signed/provenance-backed releases, immutable checksums, packed consumer install/type/runtime tests and dependency review |

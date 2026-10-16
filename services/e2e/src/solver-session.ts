@@ -11,7 +11,7 @@ import { buildServer, MockPlanner, type RoutePlanner } from "@ghostlink/solver/s
 import { ataAddress } from "@ghostlink/service-kit";
 
 export async function startSolverFixture(connection: Connection, keypair: Keypair, priceAccounts: Record<string, string>, port = 0,
-  options: { planner?: RoutePlanner; lookupAddresses?: PublicKey[] } = {}) {
+  options: { planner?: RoutePlanner; lookupAddresses?: PublicKey[]; allowUnpriced?: boolean } = {}) {
   // A real table exercises RPC ownership/mapping checks and v0 lookup resolution in the fill.
   const addresses = [...Object.keys(priceAccounts).map(m => new PublicKey(m)),
     ...Object.values(priceAccounts).map(a => new PublicKey(a)),
@@ -63,11 +63,11 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  const route = options.planner ?? new MockPlanner();
-  const planner = { plan: async (...args: Parameters<RoutePlanner["plan"]>) => {
+  const route: RoutePlanner = options.planner ?? new MockPlanner();
+  const planner = { funding: route.funding, plan: async (...args: Parameters<RoutePlanner["plan"]>) => {
     plans += 1; return { ...await route.plan(...args), lookupTables: [{ address: table, addresses }] };
   } };
-  const build = () => buildServer({ connection: transport, keypair, priceAccounts, planner, journal });
+  const build = () => buildServer({ connection: transport, keypair, priceAccounts, planner, journal, allowUnpriced: options.allowUnpriced });
   let server = build(), url = "";
   const listen = async () => {
     server.listen(port, "127.0.0.1"); await once(server, "listening");

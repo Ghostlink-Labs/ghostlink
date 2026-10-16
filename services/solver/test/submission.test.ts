@@ -35,13 +35,13 @@ function world() {
   let used = false, expiry = 1000n, head = 100, context = 100, genesis = scope.genesisHash, height = 200, finalizedHeight = 200;
   let status: SignatureStatus | null = null, validHash = true, accountContext = 100;
   const account = () => {
-    const w = new BorshWriter().fixed(createHash("sha256").update("account:Pocket").digest().subarray(0, 8))
+    const w = new BorshWriter().fixed(createHash("sha256").update("account:PocketV3").digest().subarray(0, 8))
       .fixed(fieldToBytes32(23n)).fixed(fieldToBytes32(domainHash("https://bot.example.com"))).fixed(solver.publicKey.toBytes())
       .u8(0).fixed(Buffer.concat([session.publicKey.toBuffer(), Buffer.alloc(1)])).u64(expiry);
     writePolicy(w, policy); w.u8(0).u64(0n).u64(0n);
     const bitmap = new Uint8Array(256); if (used) bitmap[0] = 128;
     w.fixed(bitmap).u8(PublicKey.findProgramAddressSync([Buffer.from("pocket"), Buffer.from(fieldToBytes32(23n))], POCKET)[1]).u64(1000n).u64(0n).u64(0n);
-    const data = Buffer.alloc(2089); data.set(w.out());
+    const data = Buffer.alloc(3293); data.set(w.out());
     return { data, owner: POCKET, executable: false, lamports: 1 };
   };
   const chain = {

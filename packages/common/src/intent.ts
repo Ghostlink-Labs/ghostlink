@@ -48,6 +48,17 @@ export interface OracleFeedBinding {
   decimals: number;
 }
 
+/** Explicit owner permission for bounded buys and tracked exits without an asset price feed. */
+export interface SpeculativePolicy {
+  dailyBuyCapUsdE6: bigint;
+  /** Historical committed capital, not current market value. */
+  maxCostExposureUsdE6: bigint;
+  /** 1..8. Each asset remains tied to its original base and token account. */
+  maxPositions: number;
+  /** 1..4 distinct, oracle-priced mints; each must also be an allowed output. */
+  baseMints: Uint8Array[];
+}
+
 export interface Policy {
   dailyCapUsdE6: bigint;
   maxSlippageBps: number;
@@ -59,10 +70,11 @@ export interface Policy {
   /**
    * Which Pyth feed prices which mint, fixed by the user at pocket
    * creation and changed only through the 24-hour timelock. A mint
-   * without a feed binding takes the no-oracle path: passkey-signed
-   * intents under `noOracleCapUsdE6` only. Up to 8.
+   * without a feed binding requires explicit speculative consent. Up to 8.
    */
   oracleFeeds: OracleFeedBinding[];
+  /** Absent by default. Applies to software and passkey sessions alike. */
+  speculative?: SpeculativePolicy;
 }
 
 function u64le(n: bigint): Uint8Array {
@@ -116,15 +128,33 @@ export function intentHash(intent: Intent): Uint8Array {
 
 /**
  * Canonical policy bytes -> policy_hash.
- * Layout: daily_cap u64 LE | max_slippage_bps u16 LE | big_action u64 LE |
+ * Layout: "ghostlink:policy:v3" | daily_cap u64 LE | max_slippage_bps u16 LE | big_action u64 LE |
  *         no_oracle_cap u64 LE | session_max_slots u64 LE |
  *         allowed count u8 | each allowed mint, 32 bytes, in given order |
- *         feed count u8 | each binding as mint (32), feed id (32), decimals (1).
+ *         feed count u8 | each binding as mint (32), feed id (32), decimals (1) |
+ *         speculative flag u8; if 1: daily_buy u64 | max_cost u64 | max_positions u8 |
+ *         base count u8 | each base mint (32). All integers are little endian.
  */
 export function policyBytes(p: Policy): Uint8Array {
   if (p.allowedOutMints.length > 8) throw new Error("at most 8 allowed mints");
   if (p.oracleFeeds.length > 8) throw new Error("at most 8 oracle feeds");
+  u16le(p.maxSlippageBps);
+  if (p.maxSlippageBps > 10_000) throw new Error("slippage exceeds 10000 bps");
+  const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((v, i) => v === b[i]);
+  if (p.oracleFeeds.some((f, i) => p.oracleFeeds.slice(0, i).some(prior => same(f.mint, prior.mint)))) {
+    throw new Error("duplicate oracle mint");
+  }
+  const s = p.speculative;
+  if (s && (p.noOracleCapUsdE6 <= 0n || s.dailyBuyCapUsdE6 <= 0n || s.maxCostExposureUsdE6 <= 0n ||
+    !Number.isInteger(s.maxPositions) || s.maxPositions < 1 || s.maxPositions > 8 ||
+    !Array.isArray(s.baseMints) || s.baseMints.length < 1 || s.baseMints.length > 4 ||
+    s.baseMints.some((mint, i) => s.baseMints.slice(0, i).some(prior => same(prior, mint)) ||
+      !p.oracleFeeds.some(f => same(f.mint, mint)) ||
+      (p.allowedOutMints.length > 0 && !p.allowedOutMints.some(m => same(m, mint)))))) {
+    throw new Error("invalid speculative policy limits or bases");
+  }
   const parts = [
+    new TextEncoder().encode("ghostlink:policy:v3"),
     u64le(p.dailyCapUsdE6),
     u16le(p.maxSlippageBps),
     u64le(p.bigActionThresholdUsdE6),
@@ -141,6 +171,10 @@ export function policyBytes(p: Policy): Uint8Array {
         new Uint8Array([f.decimals]),
       ];
     }),
+    new Uint8Array([s ? 1 : 0]),
+    ...(s ? [u64le(s.dailyBuyCapUsdE6), u64le(s.maxCostExposureUsdE6),
+      new Uint8Array([s.maxPositions, s.baseMints.length]),
+      ...s.baseMints.map((mint, i) => expect32(mint, `speculative.baseMints[${i}]`))] : []),
   ];
   const total = parts.reduce((n, x) => n + x.length, 0);
   const out = new Uint8Array(total);

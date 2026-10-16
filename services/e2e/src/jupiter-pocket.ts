@@ -16,6 +16,7 @@ export async function exerciseJupiterPocket(x: {
   const { connection: c, pocket, input, output, bot, solver, planner, wallet, payer, solverKey, send } = x;
   const balance = async (owner: PublicKey, mint: PublicKey) => BigInt((await c.getTokenAccountBalance(ataAddress(owner, mint))).value.amount);
   const state = async () => { const a = await c.getAccountInfo(pocket, "confirmed"); if (!a) throw new Error("pocket missing"); return a; };
+  const speculative = Boolean(readPocketAccount(await state()).policy.speculative);
   const params = async (inMint: PublicKey, outMint: PublicKey, inMax: bigint): Promise<BotIntentParams> => ({
     inMint: inMint.toBytes(), outMint: outMint.toBytes(), inMax, outMin: (await planner.quote(inMint, inMax)) * 9950n / 10000n,
     deadlineSlot: BigInt(await c.getSlot("confirmed")) + 500n,
@@ -29,6 +30,13 @@ export async function exerciseJupiterPocket(x: {
   if (beforeIn - await balance(pocket, input) !== buy.inMax || received < buy.outMin ||
       !isPocketNonceUsed(readPocketAccount(await state()), bought.nonce)) throw new Error("atomic buy settlement differs from intent");
   console.log("✓ Pocket buy through real Jupiter/Raydium programs, lost acknowledgment, durable retry and exact nonce consumption");
+  const buyState = readPocketAccount(await state());
+  const position = buyState.speculativePositions[0];
+  if (speculative && (!position || buyState.speculativePositions.length !== 1 || position.quantity !== received ||
+    !position.mint.equals(output) || !position.baseMint.equals(input) || !position.tokenAccount.equals(ataAddress(pocket, output)) ||
+    position.costUsdE6 <= 0n || position.costUsdE6 !== buyState.speculativeBoughtTodayUsdE6)) {
+    throw new Error("speculative buy did not record exact acquired quantity and historical cost");
+  }
 
   const sell = await params(output, input, received / 2n);
   const sellIn = await balance(pocket, output), sellOut = await balance(pocket, input);
@@ -37,6 +45,14 @@ export async function exerciseJupiterPocket(x: {
   if (sellIn - await balance(pocket, output) !== sell.inMax || await balance(pocket, input) - sellOut < sell.outMin ||
       !isPocketNonceUsed(readPocketAccount(await state()), sold.nonce)) throw new Error("atomic sell settlement differs from intent");
   console.log("✓ Pocket sell returned wrapped SOL; a different durable nonce settled exactly once");
+  if (speculative) {
+    const after = readPocketAccount(await state()), remaining = after.speculativePositions[0];
+    if (!position || !remaining || remaining.quantity !== received - sell.inMax ||
+      remaining.costUsdE6 !== position.costUsdE6 - position.costUsdE6 * sell.inMax / received ||
+      after.speculativeBoughtTodayUsdE6 !== buyState.speculativeBoughtTodayUsdE6 ||
+      after.spentTodayUsdE6 !== buyState.spentTodayUsdE6) throw new Error("speculative exit accounting differs from settled quantity");
+    console.log("✓ Owner-approved unpriced buy and partial exit; exact cost release, unchanged daily spend, no asset oracle");
+  }
 
   const failure = await bot.prepare(x.consent, await params(input, output, 1_000_000n));
   const revokeParams = await params(input, output, 1_000_000n);

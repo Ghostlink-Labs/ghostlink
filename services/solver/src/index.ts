@@ -2,6 +2,7 @@
  * Entry point. Environment:
  *   PORT (default 8789)
  *   RPC_URL (default http://127.0.0.1:8899)
+ *   RPC_ENDPOINTS_PATH — private JSON array of {url, headers?}; overrides RPC_URL
  *   GHOSTLINK_SOLVER_KEYPAIR — path to the solver keypair JSON
  *   SOLVER_JOURNAL_PATH — persistent SQLite path outside the repository
  *   SOLVER_JOURNAL_KEY_PATH — file with 32 raw random encryption-key bytes
@@ -20,7 +21,8 @@
  *   TRUST_PROXY=1 — honour X-Forwarded-For (only behind your own proxy)
  */
 import { readFileSync, statSync } from "node:fs";
-import { Connection, Keypair } from "@solana/web3.js";
+import { Keypair } from "@solana/web3.js";
+import { createRpcPool } from "@ghostlink/service-kit/rpc";
 import { buildServer, MockPlanner } from "./server.js";
 import { SubmissionJournal } from "./journal.js";
 import { POCKET_PROGRAM_ID } from "@ghostlink/common";
@@ -39,7 +41,13 @@ if (!journalPath || !journalKeyPath || !genesisHash) throw new Error("SOLVER_JOU
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(readFileSync(keypairPath, "utf8"))),
 );
-const connection = new Connection(process.env.RPC_URL ?? "http://127.0.0.1:8899", "confirmed");
+function rpcEndpoints() {
+  if (!process.env.RPC_ENDPOINTS_PATH) return [{ url: process.env.RPC_URL ?? "http://127.0.0.1:8899" }];
+  try { return JSON.parse(privateText("RPC_ENDPOINTS_PATH", 16_384)); }
+  catch { throw new Error("RPC_ENDPOINTS_PATH must name a bounded valid JSON configuration file"); }
+}
+const rpc = createRpcPool({ genesisHash, endpoints: rpcEndpoints() });
+const connection = rpc.connection;
 if (await connection.getGenesisHash() !== genesisHash) throw new Error("RPC genesis differs from approved solver configuration");
 const router = process.env.SOLVER_ROUTER ?? "inventory";
 if (router !== "inventory" && router !== "jupiter-raydium-cp") throw new Error("unsupported SOLVER_ROUTER");

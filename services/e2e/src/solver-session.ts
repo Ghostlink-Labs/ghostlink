@@ -10,6 +10,7 @@ import { SubmissionJournal, type RecoverySession } from "@ghostlink/solver/journ
 import { SubmissionCoordinator } from "@ghostlink/solver/submission";
 import { buildServer, MockPlanner, type RoutePlanner } from "@ghostlink/solver/server";
 import { ataAddress } from "@ghostlink/service-kit";
+import { startRpcFaultFixture } from "./rpc-fault.js";
 
 export async function startSolverFixture(connection: Connection, keypair: Keypair, priceAccounts: Record<string, string>, port = 0,
   options: { planner?: RoutePlanner; lookupAddresses?: PublicKey[]; allowUnpriced?: boolean } = {}) {
@@ -26,6 +27,8 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
   const setupSignature = await connection.sendRawTransaction(setup.serialize());
   const setupResult = await connection.confirmTransaction({ signature: setupSignature, ...lifetime }, "finalized");
   if (setupResult.value.err) throw new Error("lookup-table fixture setup failed");
+  const rpcFault = process.env.RPC_FAILOVER_DRILL === "1" ? await startRpcFaultFixture(connection) : undefined;
+  connection = rpcFault?.connection ?? connection;
   const dir = mkdtempSync(join(tmpdir(), "ghostlink-solver-e2e-"));
   let path = join(dir, "solver.sqlite"), key = randomBytes(32);
   const scope = { genesisHash: await connection.getGenesisHash(), pocketProgram: POCKET_PROGRAM_ID, solver: keypair.publicKey.toBase58() };
@@ -42,6 +45,7 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
           const decoded = VersionedTransaction.deserialize(Buffer.from(args[0]));
           if (decoded.version !== 0 || decoded.message.addressTableLookups.length !== 1) throw new Error("fill did not use the verified lookup table");
           packets.add(Buffer.from(args[0]).toString("base64"));
+          if (first) rpcFault?.arm();
           const intervene = beforeNextBroadcast;
           beforeNextBroadcast = undefined;
           if (intervene) {
@@ -98,11 +102,12 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
       journal.close(); journal = new SubmissionJournal(path, key, scope); server = build(); return listen();
     },
     assertSingleTransaction(count = 1) {
+      rpcFault?.assertRecovered();
       if (plans !== count || packets.size !== count || simulations !== 2 * count || feeChecks !== count) {
         throw new Error(`unexpected preparation/retry: ${plans} plans, ${packets.size} packets, ${simulations} simulations, ${feeChecks} fee checks`);
       }
     },
     beforeNextBroadcast(work: () => Promise<void>) { beforeNextBroadcast = work; },
-    async close() { await stop(); journal.close(); key.fill(0); rmSync(dir, { recursive: true, force: true }); },
+    async close() { await stop(); journal.close(); key.fill(0); await rpcFault?.close(); rmSync(dir, { recursive: true, force: true }); },
   };
 }

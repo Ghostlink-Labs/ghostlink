@@ -107,6 +107,8 @@ The allocator uses the full unsigned 64-bit range, skips on-chain used bits and 
 
 ## Storage and remaining work
 
+Node backends can inject `createRpcPool(...).connection` as their authorization `chain` to use approved provider failover. Keep the existing durable store and request keys; an RPC timeout does not authorize a replacement trade. See [RPC operations](../../docs/RPC-OPERATIONS.md) for configuration and limitations. Production provider capacity and real-device tests remain required.
+
 `BotKeyStore.backupTo(file)` creates an authenticated encrypted snapshot including committed WAL data. `BotKeyStore.restoreBackup(archive, newDirectory, key)` restores into a new directory and returns its database path. Opening it cancels restored active/pending consent and retires its signing keys while preserving orders and counters. Fresh keys, owner consent and solver recovery checks are mandatory before resuming. See the [recovery runbook](../../docs/BACKUP-RESTORE.md); ordinary restart and point-in-time restore have different authority rules.
 
 Session seeds use AES-256-GCM with random nonces and the immutable consent record as authenticated associated data. Order payloads/signatures and nonce checkpoints are encrypted and bound to their identity/deployment; lookup metadata includes bot/user IDs, pocket scope, request keys, nonces and deadlines in plaintext. SQLite transactions serialize consent and order changes; a key-check sentinel refuses the wrong database key. Existing consent databases migrate without replacing their keys. Treat the whole database, WAL and backups as sensitive. Best-effort buffer clearing is not a JavaScript process-memory isolation guarantee.

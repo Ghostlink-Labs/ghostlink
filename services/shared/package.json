@@ -11,7 +11,8 @@
   "exports": {
     ".": "./dist/index.js",
     "./accounts": "./dist/accounts.js",
-    "./storage": "./dist/storage.js"
+    "./storage": "./dist/storage.js",
+    "./rpc": "./dist/rpc.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

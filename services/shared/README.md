@@ -1,5 +1,7 @@
 # GhostLink service kit
 
+The Node-only `@ghostlink/service-kit/rpc` subpath provides operator-approved HTTP failover with genesis checks, bounded requests, context floors and HTTP signature confirmation. The solver entry point uses it; Node bots can inject its connection. See the [RPC operations guide](../../docs/RPC-OPERATIONS.md) for configuration, exact-transaction retry semantics, supported methods and remaining operational gates.
+
 Shared protocol encoders, account readers, token helpers and HTTP primitives for the experimental GhostLink services and Node bot package. Low-level helpers do not establish deployment trust or production readiness. The optional expected program passed to account readers must come from trusted deployment configuration.
 
 This companion library is packed with `pnpm pack:bot`; a registry release is not implied. Its archive contains compiled code, declarations and license only. See the [bot backend guide](../../packages/bot/README.md) for installing the reviewed companion archives and their dependency overrides.

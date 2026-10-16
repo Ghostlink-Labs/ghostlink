@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  SOLANA_VERSION: v3.0.14
+  PLATFORM_TOOLS: v1.52
+
+jobs:
+  source-scope:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: reject private files in published history
+        run: |
+          for commit in $(git rev-list HEAD); do
+            git ls-tree -r --name-only "$commit"
+          done | sort -u > "$RUNNER_TEMP/source-files.txt"
+          if grep -Ei '^(apps/|docs/design/|bug-knowledge/|docs/AUDIT-|docs/build-plan\.md$|\.githooks/)|(^|/)(\.(claude|codex|cursor|continue|gemini)(/|$)|\.env($|\.)|(agents|claude|codex|code|gemini|copilot-instructions|memory|skill)\.md$)|\.(png|jpe?g|webp|gif|svg|mp4|woff2?|ttf|otf|css|html|zkey|ptau|keypair\.json)$' "$RUNNER_TEMP/source-files.txt"; then
+            echo "Only public technology source, tests and technical documentation may be committed." >&2
+            exit 1
+          fi
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - run: pnpm -r typecheck
+      - run: pnpm -r test
+      - run: pnpm audit --prod --audit-level=high
+
+  circuits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/circom
+            circuits/build/pot15_final.ptau
+          key: circom-2.2.3-ptau-${{ runner.os }}-v2
+      - name: install circom
+        run: command -v circom || cargo install --git https://github.com/iden3/circom.git --rev ad44e915a12bb047b05745c2884aad9cc8326bc6 circom --locked
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @ghostlink/common build
+      - run: bash scripts/build-circuits.sh
+      - run: pnpm --filter @ghostlink/circuits test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: circuit-keys
+          path: circuits/keys/
+
+  # Verifies the COMMITTED keys and proofs (circuits/keys) against the
+  # committed Rust verifying keys (programs/verifier/src/vks). The circuits
+  # job above regenerates throwaway keys to prove the toolchain still
+  # works; those must never be mixed with the committed Rust constants.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: install agave + platform tools
+        run: |
+          archive="$RUNNER_TEMP/solana-release.tar.bz2"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/anza-xyz/agave/releases/download/${SOLANA_VERSION}/solana-release-x86_64-unknown-linux-gnu.tar.bz2" \
+            --output "$archive"
+          echo "65614325423316a48f57f1ceeaa91ca78f4516e165e305b38c01873cf8c6b8b4  $archive" | sha256sum --check --strict
+          tar -xjf "$archive" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/solana-release/bin/solana" --version
+          "$RUNNER_TEMP/solana-release/bin/cargo-build-sbf" --version
+          echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
+      - name: build programs
+        run: |
+          for p in registry census pocket cpi-caller; do
+            cargo-build-sbf --manifest-path programs/$p/Cargo.toml --tools-version ${PLATFORM_TOOLS}
+          done
+      - name: unit, vector and proof tests
+        run: cargo test --workspace --exclude ghostlink-itests
+      - name: litesvm flow tests
+        run: cargo test -p ghostlink-itests
+      - name: executable hashes (verifiable build lands at M3)
+        run: |
+          for p in registry census pocket; do
+            sha256sum target/deploy/ghostlink_$p.so
+          done

@@ -1,0 +1,22 @@
+[package]
+name = "ghostlink-cpi-caller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Test-only program that forwards any instruction through CPI, so the integration tests can prove the real programs refuse to run under a caller."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ghostlink_cpi_caller"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = "0.32.1"

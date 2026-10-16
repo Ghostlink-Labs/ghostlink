@@ -1,0 +1,23 @@
+[package]
+name = "ghostlink-pocket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GhostLink pocket: a per-app spending account that fills intents atomically, enforces an oracle-checked slippage floor and daily cap, and can only ever withdraw to its home address."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ghostlink_pocket"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+ghostlink-verifier = { path = "../verifier" }
+solana-sha256-hasher = "3.0"

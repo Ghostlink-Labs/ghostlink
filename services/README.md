@@ -1,0 +1,21 @@
+# Off-chain services
+
+Five small TypeScript services, all stateless or rebuildable from chain data, all self-hostable — an app that doesn't trust ours can run its own copy of any of them and lose nothing, because none of them holds user secrets. What each one is trusted with is listed honestly below; "integrity" never appears, because that lives on-chain.
+
+| Service | Job | Trust it carries |
+| --- | --- | --- |
+| [`indexer/`](indexer) | Rebuilds both Merkle trees from on-chain events (RPC polling or an authenticated Helius webhook) and serves roots, paths in O(depth), and pages of leaves so clients can build witnesses locally. | Liveness; and for clients that ask for a specific path, the privacy of which wallet asked (clients rebuilding the tree locally reveal nothing). Events are attributed by program framing, every root is reconciled with the on-chain ring, and the store refuses — without mutating — anything that doesn't chain. |
+| [`relayer/`](relayer) | The fee payer: registration bundles, census cranks, session openings, owner actions (incl. creating the home's missing token accounts for a sweep). Rate-limited per IP and wallet, metered against a rolling daily budget, optionally restricted to partner origins for pocket creation. | Liveness only — every instruction carries the user's signature or proof. |
+| [`solver/`](solver) | Fills intents atomically: precompile + `fill_begin` + route + `fill_end`. Validates signatures locally and values both legs against the pinned price feeds before spending a fee. Ships with a mock route; Jupiter drops into the same interface. | Only its own capital, and it refuses to overpay for it. |
+| [`actions/`](actions) | Solana Actions (Blinks) deposit endpoint. Destination derived only from the app id, never from the request, and only for pockets that exist. | Correctness of the destination, double-checked by the wallet's simulation. |
+| [`watcher/`](watcher) | Alerts on `propose_change` (the loud 24-hour step an attacker can't skip) and large fills; retries deliveries and never forgets an undelivered one. Given a keypair, cranks `execute_change` once a timelock has elapsed so users without SOL get their own change applied. | None (the crank's fees). |
+| [`shared/`](shared) | Instruction encoding, event decoding, precompile builders and the hardened HTTP kit (bounded bodies, preflight, status mapping) — the TypeScript twin of the byte shapes the Rust integration tests prove on-chain. |
+| [`e2e/`](e2e) | The localnet end-to-end: real validator, services in-process, the whole journey over HTTP. `scripts/localnet-e2e.sh` runs it. |
+
+Keys and environment variables are documented in each service's entry file and summarized in `docs/DEVNET.md`; keypairs never live in the repo.
+
+For restart durability, set `PERSIST_PATH` on the indexer, `RELAYER_BUDGET_PATH` on the relayer, and `WATCHER_STATE_PATH` on the watcher to writable files outside the checkout. Missing files start empty; invalid snapshots fail startup. Run one process per snapshot/payer: the JSON snapshots do not provide distributed locking. Without these paths, state is memory-only. The relayer charges the RPC's full transaction fee plus estimated rent immediately before broadcasting and retains ambiguous broadcast charges conservatively for 24 hours.
+
+The watcher paginates all available history on its first run, then resumes from its saved cursor. Notifications are at-least-once: a crash between delivery and checkpointing can redeliver an alert. Execution alerts come from successful chain events, and failed cranks stay pending. Webhooks carrying pocket events must include `signature` (or Helius `transaction.signatures[0]`); tree-only `{ logs }` payloads remain supported. The indexer stores processed event-bearing transaction signatures to deduplicate webhook and poller overlap across restarts; its snapshot size grows with history.
+
+The current Pocket account allocation is **2,089 bytes**, including its discriminator and owner action nonce. `readPocketAccount` rejects earlier allocations, including 2,081-byte accounts whose padding could otherwise be mistaken for a zero nonce. This is a breaking account-format change: older deployed accounts require a separately reviewed migration or a fresh deployment; these service changes do not migrate or upgrade them.

@@ -1,0 +1,59 @@
+# Node
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+coverage/
+
+# Rust / Solana
+target/
+.anchor/
+test-ledger/
+*.so
+
+# Circuit build artifacts (regenerate with scripts/build-circuits.sh)
+circuits/build/
+*.ptau
+*.zkey
+*.wtns
+
+# Private product applications and design assets are excluded from this repository.
+/apps/
+/docs/design/
+/.claude/
+/.codex/
+/.cursor/
+/.githooks/
+**/[Aa][Gg][Ee][Nn][Tt][Ss].md
+**/[Cc][Ll][Aa][Uu][Dd][Ee].md
+**/[Cc][Oo][Dd][Ee][Xx].md
+**/[Cc][Oo][Dd][Ee].md
+/bug-knowledge/
+/docs/AUDIT-*.md
+/docs/build-plan.md
+/scripts/check-attribution.sh
+
+# E2E local artifacts
+services/e2e/.genesis/
+
+# Environment and keys — never commit secrets
+.env
+.env.*
+!.env.example
+*.keypair.json
+keys/
+# circuits/keys holds PUBLIC verifying keys and fixture proofs that the
+# TypeScript, Rust and LiteSVM suites read; the dev zkeys stay ignored above.
+!circuits/keys/
+# and the copy @ghostlink/verify ships (a test pins it to circuits/keys)
+!packages/verify/keys/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+pnpm-debug.log*

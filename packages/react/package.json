@@ -1,0 +1,33 @@
+{
+  "name": "@ghostlink/react",
+  "version": "0.1.0",
+  "description": "React bindings for GhostLink: a provider, a useGhostLink hook and a drop-in ContinueWithGhostLink button.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ghostlink/common": "workspace:*",
+    "@ghostlink/sdk": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.0",
+    "react": "^18.3.1",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.11"
+  }
+}

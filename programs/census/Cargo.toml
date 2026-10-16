@@ -1,0 +1,23 @@
+[package]
+name = "ghostlink-census"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GhostLink census: permissionless holdings snapshots appended to an incremental Merkle tree, so balance claims can be proved without revealing the wallet."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ghostlink_census"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = "0.32.1"
+ghostlink-verifier = { path = "../verifier" }
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }

@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public Rust verifying-key type name, not a credential"
+regexTarget = "secret"
+regexes = ['''^Groth16Verifyingkey$''']

@@ -1,0 +1,30 @@
+{
+  "name": "@ghostlink/actions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Solana Actions (Blinks) endpoint: builds pocket deposit transactions for the user's own wallet to simulate and sign. The wallet's simulation — and the SDK recomputing the pocket address — is the safety story.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ghostlink/common": "workspace:*",
+    "@ghostlink/service-kit": "workspace:*",
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.11"
+  }
+}

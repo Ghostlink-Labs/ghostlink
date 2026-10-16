@@ -1,0 +1,31 @@
+{
+  "name": "@ghostlink/service-kit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared plumbing for the GhostLink services: anchor instruction encoding, event decoding, precompile builders and a tiny HTTP router. Byte layouts mirror the ones the program integration tests prove on-chain.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./accounts": "./dist/accounts.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ghostlink/common": "workspace:*",
+    "@noble/curves": "^1.7.0",
+    "@noble/hashes": "^1.6.0",
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.11"
+  }
+}

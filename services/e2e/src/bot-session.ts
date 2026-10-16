@@ -50,21 +50,26 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
     server = createBotAuthorizationServer(manager, ownerOrigin);
     await listen();
   };
+  const prepare = async (consent: BotConsent, params: BotIntentParams) => {
+    const who = { botId: "12345", userId: "42" }, requestKey = randomBytes(32).toString("hex");
+    const initial = await manager.prepareIntent(consent.id, who, { requestKey, params });
+    await restart();
+    const signed = await manager.prepareIntent(consent.id, who, { requestKey, params });
+    if (signed.intent.nonce !== initial.intent.nonce || bytesToHex(signed.hash) !== bytesToHex(initial.hash) ||
+        bytesToHex(signed.signature.signature) !== bytesToHex(initial.signature.signature)) throw new Error("bot restart changed the reserved trade");
+    const i = signed.intent;
+    const body = JSON.stringify({ pocket: consent.pocket, nonce: i.nonce.toString(), inMint: toBase58(i.inMint), inMax: i.inMax.toString(),
+      outMint: toBase58(i.outMint), outMin: i.outMin.toString(), deadlineSlot: i.deadlineSlot.toString(), policyHashHex: bytesToHex(i.policyHash),
+      sessionKind: 0, signatureHex: bytesToHex(signed.signature.signature), sessionKeyHex: consent.sessionKeyHex });
+    return { body, signed, who, requestKey };
+  };
   return {
     create: (input: CreateConsent) => post("/requests", input),
     confirm: (id: string) => post(`/requests/${id}/confirm`, {}),
     restart,
-    async fill(consent: BotConsent, solverUrl: string, params: BotIntentParams, restartSolver: () => Promise<string>): Promise<{ signature: string }> {
-      const who = { botId: "12345", userId: "42" }, requestKey = randomBytes(32).toString("hex");
-      const initial = await manager.prepareIntent(consent.id, who, { requestKey, params });
-      await restart();
-      const signed = await manager.prepareIntent(consent.id, who, { requestKey, params });
-      if (signed.intent.nonce !== initial.intent.nonce || bytesToHex(signed.hash) !== bytesToHex(initial.hash) ||
-          bytesToHex(signed.signature.signature) !== bytesToHex(initial.signature.signature)) throw new Error("bot restart changed the reserved trade");
-      const i = signed.intent;
-      const body = JSON.stringify({ pocket: consent.pocket, nonce: i.nonce.toString(), inMint: toBase58(i.inMint), inMax: i.inMax.toString(),
-          outMint: toBase58(i.outMint), outMin: i.outMin.toString(), deadlineSlot: i.deadlineSlot.toString(), policyHashHex: bytesToHex(i.policyHash),
-          sessionKind: 0, signatureHex: bytesToHex(signed.signature.signature), sessionKeyHex: consent.sessionKeyHex });
+    prepare,
+    async fill(consent: BotConsent, solverUrl: string, params: BotIntentParams, restartSolver: () => Promise<string>): Promise<{ signature: string; nonce: bigint }> {
+      const { body, who, requestKey, signed } = await prepare(consent, params);
       const send = async (base: string): Promise<IntentSubmission> => {
         const response = await fetch(`${base}/intent`, { method: "POST", headers: { "content-type": "application/json" }, body });
         if (!response.ok) throw new Error(`bot fill: ${await response.text()}`);
@@ -83,7 +88,7 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
         result = await status.json() as IntentSubmission;
       }
       if (result.signature !== first.signature || !["confirmed", "finalized"].includes(result.state)) throw new Error(`restarted trade not confirmed: ${result.state} (${result.reason ?? "no reason"})`);
-      return { signature: first.signature };
+      return { signature: first.signature, nonce: signed.intent.nonce };
     },
     async close() { await stop(); store.close(); key.fill(0); rmSync(dir, { recursive: true, force: true }); },
   };

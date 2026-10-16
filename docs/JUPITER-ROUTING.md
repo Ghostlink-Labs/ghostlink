@@ -25,11 +25,41 @@ Pool fees are checked against the observed bank, not locked by a new on-chain fe
 
 ## Evidence and remaining release gates
 
-Contract tests cover both directions and direct/shared account variants, malicious instruction/account substitutions, fees, authorities, pool changes, stale contexts, malformed responses, oversized streamed bodies, provider failure and timeout. Fixtures are synthetic and are explicitly labelled as such. They do not establish a live Jupiter quote, completed swap, commercial bot integration or mainnet readiness.
+Contract tests cover both directions and direct/shared account variants, malicious instruction/account substitutions, fees, authorities, pool changes, stale contexts, malformed responses, oversized streamed bodies, provider failure and timeout. These provider-response fixtures are synthetic and are explicitly labelled as such.
+
+On 2026-10-17, a disposable Agave 3.0.15 validator completed the full V2 Pocket journey against actual cloned Jupiter and Raydium programs: registration, census, owner proof, bot consent, pocket opening, wallet-signed funding, buy, sell, lost-acknowledgment retry, service/database restart, owner revocation and recovery of both token balances. Each successful trade consumed its signed nonce exactly once. A separate local wallet moved the market after both complete simulations; the resulting submitted transaction executed `fill_begin` and the DEX, then failed and rolled back Pocket/solver token balances, nonce, spending budget and temporary fill account. Its failed identity survived restart. Revocation refused an already signed intent and new bot signing. The test deliberately skipped preflight only for that failing packet to exercise actual chain rollback; production submission keeps preflight enabled.
+
+The earlier standalone fork test exercised six swaps: both directions with direct, shared, and shared-destination accounts. The full Pocket test currently uses the direct route variant. These are real program executions on a local fork, with **synthetic quotes and Pyth accounts**, not live Jupiter API responses, public-chain trades, commercial bot adoption or production approval.
+
+The cloned binaries were observed at finalized mainnet slot 457793783:
+
+| Program | SHA-256 of captured program bytes |
+| --- | --- |
+| Jupiter `JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4` | `099da3a26d336aa7174960f057546f192fc1ccda8e3e9d1b4aa5c69fa8a79a5f` |
+| Raydium CP `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` | `b6dbea8cefc2e7d490775ce6115e34a2ba480c0853c359e0bb4043b9381ef09a` |
+
+Both observed programs were upgradeable. These hashes identify the tested artifacts; they are not a production deployment allowlist or an independent code review.
 
 Account ordering was cross-checked against the official ABI and the Raydium CPI in a confirmed public transaction ([2d1A2pdD…](https://explorer.solana.com/tx/2d1A2pdDExuPU2DsuLEEA6xFYZ8TZyZTDLJp6NeQPCUU8zhH2aWCFtSbxf3op3ibkR8jCNraUdkWpaHiRm81vzZU)). That transaction contains an unsupported multi-hop/Token-2022 route and is reference evidence only, not an accepted GhostLink fill.
 
-Before enabling a public release, collect real build responses with an operator-owned Jupiter key and validate buy/sell transactions against reviewed program binaries and a reproducible local fork, including failures, rent and complete GhostLink atomic settlement. Record binary hashes, upgrade authorities, account snapshots and provider versions. Then complete the independent security review, production proof ceremony, controlled deployment and capped pilot in [MAINNET-READINESS.md](MAINNET-READINESS.md). Never remove the V2 public-genesis guard merely to test routing.
+Before enabling a public release, collect real build responses with an operator-owned Jupiter key, repeat the complete Pocket flow with those responses and the intended supported route variants, and independently review the program binaries and operating limits. Retain binary hashes, upgrade authorities, account snapshots and provider versions. Complete the independent security review, production proof ceremony, controlled deployment and capped pilot in [MAINNET-READINESS.md](MAINNET-READINESS.md). Never remove the V2 public-genesis guard merely to test routing.
+
+## Reproducing the complete local fork
+
+After building the workspace, circuits and GhostLink SBF programs, run:
+
+```sh
+CARGO_TARGET_DIR=/path/to/compiled-programs \
+  bash scripts/jupiter-localnet-e2e.sh /private/path/to/routing-snapshot
+```
+
+The snapshot directory must contain:
+
+- `snapshot.json`: `{ "approval": { "pool", "token0", "token1", "maxTradeFeePpm" }, "accounts": [...] }`. Each account entry has `pubkey` and an RPC account object with base64 `data`, `owner`, `lamports` and `executable`. Order: pool, config, token0 vault, token1 vault, token0 mint, token1 mint, observation, Jupiter program, Raydium CP program. Capture these through read-only finalized RPC calls. The current test setup requires already wrapped SOL as token0, classic SPL token1 and creator fees disabled; these are test-fixture constraints.
+- `programs.json`: two entries containing `id` and `sha256`, identifying the intended captured Jupiter and Raydium CP binaries.
+- `<program-id>.so` for each program, extracted from its upgradeable-loader ProgramData account after the 45-byte metadata header. Keep original upgrade slot/authority and RPC context evidence with the snapshot. Program hashes must match the manifest.
+
+The harness verifies layouts and binary hashes, creates temporary genesis accounts and synthetic prices, starts its own validator, generates local test identities and stops that validator on exit. It refuses funded payer configuration and public-chain genesis, including a public RPC proxied through localhost. No external funds, wallet imports or Jupiter key are required. The synthetic quote calculator is test-only and must never be used as a live oracle or production quote adapter. Keep snapshot directories, binaries, generated keys, ledgers and service databases outside published source.
 
 ABI/layout references reviewed on 2026-10-16:
 

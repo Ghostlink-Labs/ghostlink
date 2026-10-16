@@ -10,7 +10,7 @@
  *   5. verify the proof server-side with @ghostlink/verify
  *   6. open the pocket session through the relayer
  *   7. fund the pocket through the Actions (Blink) endpoint
- *   8. fill a swap intent through the solver (mock route)
+ *   8. fill through the solver (inventory, or cloned Jupiter with the fork fixture)
  *   9. sweep home with an owner proof through the relayer
  *
  * Expects a validator prepared by scripts/localnet-e2e.sh.
@@ -50,6 +50,7 @@ import {
   deriveIdentity,
   sessionPublicKey,
   sweepDigest,
+  revokeDigest,
   type Prover,
 } from "@ghostlink/sdk";
 import { verifyLogin } from "@ghostlink/verify";
@@ -71,6 +72,8 @@ import { buildServer as buildActions } from "@ghostlink/actions/server";
 import { label, priceAccountFor } from "./genesis.js";
 import { startBotFixture } from "./bot-session.js";
 import { startSolverFixture } from "./solver-session.js";
+import { JupiterForkPlanner, loadJupiterFixture, syncNative } from "./jupiter-fixture.js";
+import { exerciseJupiterPocket } from "./jupiter-pocket.js";
 
 const RPC = process.env.RPC_URL ?? "http://127.0.0.1:8899";
 const ROOT = process.env.REPO_ROOT ?? join(process.cwd(), "..", "..");
@@ -138,38 +141,51 @@ async function main() {
   ok("trees initialized");
 
   // ---- mints ---------------------------------------------------------------
+  const fork = process.env.JUPITER_FIXTURE_DIR ? loadJupiterFixture(process.env.JUPITER_FIXTURE_DIR) : undefined;
   const usdcMint = Keypair.fromSeed(label("e2e usdc mint seed"));
   const solMint = Keypair.fromSeed(label("e2e sol mint seed"));
-  const rent = await connection.getMinimumBalanceForRentExemption(82);
-  for (const [mint, decimals] of [
-    [usdcMint, 6],
-    [solMint, 9],
-  ] as const) {
-    if (await connection.getAccountInfo(mint.publicKey)) continue;
+  const inputMint = fork ? new PublicKey(fork.approval.token0) : usdcMint.publicKey;
+  const outputMint = fork ? new PublicKey(fork.approval.token1) : solMint.publicKey;
+  const inputDecimals = fork?.inputDecimals ?? 6, outputDecimals = fork?.outputDecimals ?? 9;
+  const forkPlanner = fork ? await JupiterForkPlanner.create(connection, fork) : undefined;
+  if (fork) {
+    await send([
+      createAtaIdempotentIx(payer.publicKey, wallet.publicKey, inputMint),
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: ataAddress(wallet.publicKey, inputMint), lamports: 150_000_000 }),
+      syncNative(ataAddress(wallet.publicKey, inputMint)),
+    ], []);
+  } else {
+    const rent = await connection.getMinimumBalanceForRentExemption(82);
+    for (const [mint, decimals] of [
+      [usdcMint, 6],
+      [solMint, 9],
+    ] as const) {
+      if (await connection.getAccountInfo(mint.publicKey)) continue;
+      await send(
+        [
+          SystemProgram.createAccount({
+            fromPubkey: payer.publicKey,
+            newAccountPubkey: mint.publicKey,
+            lamports: rent,
+            space: 82,
+            programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+          }),
+          initializeMint2Ix(mint.publicKey, decimals, payer.publicKey),
+        ],
+        [mint],
+      );
+    }
+    // Wallet holds 150 USDC; the solver holds 1.0 SOL-token of inventory.
     await send(
       [
-        SystemProgram.createAccount({
-          fromPubkey: payer.publicKey,
-          newAccountPubkey: mint.publicKey,
-          lamports: rent,
-          space: 82,
-          programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
-        }),
-        initializeMint2Ix(mint.publicKey, decimals, payer.publicKey),
+        createAtaIdempotentIx(payer.publicKey, wallet.publicKey, inputMint),
+        mintToIx(inputMint, ataAddress(wallet.publicKey, inputMint), payer.publicKey, 150_000_000n),
+        createAtaIdempotentIx(payer.publicKey, solverKp.publicKey, outputMint),
+        mintToIx(outputMint, ataAddress(solverKp.publicKey, outputMint), payer.publicKey, 1_000_000_000n),
       ],
-      [mint],
+      [],
     );
   }
-  // Wallet holds 150 USDC; the solver holds 1.0 SOL-token of inventory.
-  await send(
-    [
-      createAtaIdempotentIx(payer.publicKey, wallet.publicKey, usdcMint.publicKey),
-      mintToIx(usdcMint.publicKey, ataAddress(wallet.publicKey, usdcMint.publicKey), payer.publicKey, 150_000_000n),
-      createAtaIdempotentIx(payer.publicKey, solverKp.publicKey, solMint.publicKey),
-      mintToIx(solMint.publicKey, ataAddress(solverKp.publicKey, solMint.publicKey), payer.publicKey, 1_000_000_000n),
-    ],
-    [],
-  );
   ok("mints and balances");
 
   // ---- services (in-process, real HTTP) -----------------------------------
@@ -181,12 +197,13 @@ async function main() {
   );
   // Synthetic Pyth accounts loaded by this disposable validator's genesis.
   const priceAccounts = {
-    [usdcMint.publicKey.toBase58()]: priceAccountFor("e2e usdc price acct").toBase58(),
-    [solMint.publicKey.toBase58()]: priceAccountFor("e2e sol price acct").toBase58(),
+    [inputMint.toBase58()]: priceAccountFor("e2e usdc price acct").toBase58(),
+    [outputMint.toBase58()]: priceAccountFor("e2e sol price acct").toBase58(),
   };
   const usdcFeedId = label("usdc pyth feed");
   const solFeedId = label("sol pyth feed");
-  solverFixture = await startSolverFixture(connection, solverKp, priceAccounts, keepRunning ? demoPortBase + 2 : 0);
+  solverFixture = await startSolverFixture(connection, solverKp, priceAccounts, keepRunning ? demoPortBase + 2 : 0,
+    { planner: forkPlanner, lookupAddresses: forkPlanner?.lookupAddresses });
   const solverUrl = solverFixture.url;
   const actionsUrl = await listen(buildActions({ connection, baseUrl: keepRunning ? `http://127.0.0.1:${demoPortBase + 3}` : "http://e2e.local" }), 8790);
   ok(`services up (indexer ${indexerUrl})`);
@@ -243,7 +260,7 @@ async function main() {
   ok("registered through the relayer");
 
   // ---- census snapshot -----------------------------------------------------
-  const holding = ataAddress(wallet.publicKey, usdcMint.publicKey);
+  const holding = ataAddress(wallet.publicKey, inputMint);
   const snapRes = await fetch(`${relayerUrl}/snapshot`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -257,7 +274,7 @@ async function main() {
   const binding = (await (await fetch(`${indexerUrl}/registry/binding/${wallet.publicKey.toBase58()}`)).json()) as {
     leafIndex: number;
   };
-  const census = await gl.latestCensus(wallet.publicKey.toBytes(), usdcMint.publicKey.toBytes());
+  const census = await gl.latestCensus(wallet.publicKey.toBytes(), inputMint.toBytes());
   const regLeaf = BigInt(store.registryLeaves[binding.leafIndex]!);
   const cenLeaf = BigInt(store.censusLeaves[census.leafIndex]!);
   const regPath = await gl.verifiedPath("registry", binding.leafIndex, regLeaf);
@@ -270,7 +287,7 @@ async function main() {
 
   const claim = {
     kind: "holdsAtLeast" as const,
-    mint: usdcMint.publicKey.toBytes(),
+    mint: inputMint.toBytes(),
     amount: 100_000_000n,
     maxAgeSlots: 9_000n,
   };
@@ -282,8 +299,8 @@ async function main() {
     sessionMaxSlots: 216_000n,
     allowedOutMints: [],
     oracleFeeds: [
-      { mint: usdcMint.publicKey.toBytes(), feedId: usdcFeedId, decimals: 6 },
-      { mint: solMint.publicKey.toBytes(), feedId: solFeedId, decimals: 9 },
+      { mint: inputMint.toBytes(), feedId: usdcFeedId, decimals: inputDecimals },
+      { mint: outputMint.toBytes(), feedId: solFeedId, decimals: outputDecimals },
     ],
   };
   botFixture = await startBotFixture(connection, origin, policy);
@@ -352,7 +369,7 @@ async function main() {
   await gl.openSession(
     glSession,
     pocketHandle,
-    { mint: usdcMint.publicKey.toBytes(), threshold: claim.amount, minSlot, claim: true },
+    { mint: inputMint.toBytes(), threshold: claim.amount, minSlot, claim: true },
     { registry: regPath.root, census: cenPath.root },
     domainHash,
   );
@@ -365,10 +382,23 @@ async function main() {
   await botFixture.confirm(consent.id);
   ok("bot permissions confirmed on-chain and encrypted session restored after server restart");
 
+  const ownerBody = async (action: "sweep" | "revoke") => {
+    const account = await connection.getAccountInfo(pocket, "confirmed");
+    if (!account) throw new Error("pocket missing before owner action");
+    const nonce = readPocketAccount(account).ownerActionNonce;
+    const digest = action === "sweep" ? sweepDigest(pocket.toBytes(), nonce) : revokeDigest(pocket.toBytes(), nonce);
+    const ownerInput = { registry_root: regPath.root.toString(), domain_hash: input.domain_hash, app_id: input.app_id,
+      action_hash: hashToField(digest).toString(), s: input.s, pk_hi: input.pk_hi, pk_lo: input.pk_lo, reg_index: input.reg_index, reg_siblings: input.reg_siblings };
+    const proof = await prover.prove("owner", ownerInput as Record<string, string | string[]>);
+    const bytes = proofToBytes(proof.proof as SnarkjsProof);
+    return { pocket: pocket.toBase58(), action, proofAHex: bytesToHex(bytes.a), proofBHex: bytesToHex(bytes.b), proofCHex: bytesToHex(bytes.c),
+      registryRootHex: bytesToHex(fieldToBytes32(regPath.root)) };
+  };
+
   // ---- fund through the Blink ----------------------------------------------
   const appIdHex = bytesToHex(fieldToBytes32(appId));
   const fundRes = await fetch(
-    `${actionsUrl}/actions/fund/${appIdHex}?mint=${usdcMint.publicKey.toBase58()}&rawAmount=25000000`,
+    `${actionsUrl}/actions/fund/${appIdHex}?mint=${inputMint.toBase58()}&rawAmount=25000000`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -386,16 +416,23 @@ async function main() {
   ok("pocket funded through the Blink (wallet-signed deposit)");
 
   // ---- fill an intent through the solver ------------------------------------
-  {
+  if (forkPlanner) {
+    await exerciseJupiterPocket({ connection, pocket, input: inputMint, output: outputMint, payer, wallet, solverKey: solverKp,
+      bot: botFixture, solver: solverFixture, consent, planner: forkPlanner, send, revoke: async () => {
+        const response = await fetch(`${relayerUrl}/owner-action`, { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(await ownerBody("revoke")) });
+        if (!response.ok) throw new Error(`revoke failed: ${await response.text()}`);
+      } });
+  } else {
     // The pocket's output token account is the app's (or funder's) job,
     // not the solver's: solver-paid rent would flow to the user's home
     // on sweep and could be farmed.
-    await send([createAtaIdempotentIx(payer.publicKey, pocket, solMint.publicKey)], []);
+    await send([createAtaIdempotentIx(payer.publicKey, pocket, outputMint)], []);
     const deadline = BigInt(await connection.getSlot("confirmed")) + 500n;
     const tx = await botFixture.fill(consent, solverUrl, {
-      inMint: usdcMint.publicKey.toBytes(),
+      inMint: inputMint.toBytes(),
       inMax: 25_000_000n,
-      outMint: solMint.publicKey.toBytes(),
+      outMint: outputMint.toBytes(),
       outMin: BigInt(process.env.OUT_MIN ?? "160000000"),
       deadlineSlot: deadline,
     }, () => solverFixture!.restart());
@@ -403,7 +440,7 @@ async function main() {
     ok(`durably allocated bot intent filled after bot restart, lost acknowledgment and solver restart: ${tx.signature.slice(0, 16)}…`);
 
     const expectedOut = process.env.OUT_MIN ?? "160000000";
-    const outBalance = await connection.getTokenAccountBalance(ataAddress(pocket, solMint.publicKey));
+    const outBalance = await connection.getTokenAccountBalance(ataAddress(pocket, outputMint));
     if (outBalance.value.amount !== expectedOut) {
       throw new Error(`pocket out balance ${outBalance.value.amount}, expected ${expectedOut}`);
     }
@@ -411,55 +448,32 @@ async function main() {
   }
 
   // ---- sweep home with an owner proof ----------------------------------------
-  const pocketInfo = await connection.getAccountInfo(pocket, "confirmed");
-  if (!pocketInfo) throw new Error("pocket missing before sweep");
-  const digest = sweepDigest(pocket.toBytes(), readPocketAccount(pocketInfo).ownerActionNonce);
-  const ownerInput = {
-    registry_root: regPath.root.toString(),
-    domain_hash: input.domain_hash,
-    app_id: input.app_id,
-    action_hash: hashToField(digest).toString(),
-    s: input.s,
-    pk_hi: input.pk_hi,
-    pk_lo: input.pk_lo,
-    reg_index: input.reg_index,
-    reg_siblings: input.reg_siblings,
-  };
-  const ownerProof = await prover.prove("owner", ownerInput as Record<string, string | string[]>);
-  const ownerBytes = proofToBytes(ownerProof.proof as SnarkjsProof);
-  const sweepMint = solMint.publicKey;
-  const pocketSweepAta = ataAddress(pocket, sweepMint);
-  const expectHome = process.env.OUT_MIN ?? "160000000";
-  const homeLabel = `${Number(expectHome) / 1e9} SOL-token`;
-  await send([createAtaIdempotentIx(payer.publicKey, wallet.publicKey, sweepMint)], []);
+  const sweepMints = fork ? [inputMint, outputMint] : [outputMint];
+  const expectedHome = new Map<string, bigint>();
+  await send(sweepMints.map(mint => createAtaIdempotentIx(payer.publicKey, wallet.publicKey, mint)), []);
+  for (const mint of sweepMints) {
+    const held = BigInt((await connection.getTokenAccountBalance(ataAddress(pocket, mint))).value.amount);
+    const homeHeld = BigInt((await connection.getTokenAccountBalance(ataAddress(wallet.publicKey, mint))).value.amount);
+    expectedHome.set(mint.toBase58(), held + homeHeld);
+  }
   const sweepRes = await fetch(`${relayerUrl}/owner-action`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      pocket: pocket.toBase58(),
-      action: "sweep",
+      ...await ownerBody("sweep"),
       home: wallet.publicKey.toBase58(),
-      proofAHex: bytesToHex(ownerBytes.a),
-      proofBHex: bytesToHex(ownerBytes.b),
-      proofCHex: bytesToHex(ownerBytes.c),
-      registryRootHex: bytesToHex(fieldToBytes32(regPath.root)),
-      tokenPairs: [
-        {
-          source: pocketSweepAta.toBase58(),
-          destination: ataAddress(wallet.publicKey, sweepMint).toBase58(),
-          mint: sweepMint.toBase58(),
-        },
-      ],
+      tokenPairs: sweepMints.map(mint => ({ source: ataAddress(pocket, mint).toBase58(),
+        destination: ataAddress(wallet.publicKey, mint).toBase58(), mint: mint.toBase58() })),
     }),
   });
   if (!sweepRes.ok) throw new Error(`sweep: ${await sweepRes.text()}`);
-  const homeBalance = await connection.getTokenAccountBalance(
-    ataAddress(wallet.publicKey, sweepMint),
-  );
-  if (homeBalance.value.amount !== expectHome) {
-    throw new Error(`home balance ${homeBalance.value.amount}, expected ${expectHome}`);
+  for (const mint of sweepMints) {
+    const homeBalance = await connection.getTokenAccountBalance(ataAddress(wallet.publicKey, mint));
+    if (BigInt(homeBalance.value.amount) !== expectedHome.get(mint.toBase58()) || await connection.getAccountInfo(ataAddress(pocket, mint))) {
+      throw new Error("owner sweep did not return the complete balance and close the pocket token account");
+    }
   }
-  ok(`swept home: ${homeLabel} landed at the wallet`);
+  ok(`owner proof recovered ${sweepMints.length} complete token balances and closed their pocket accounts`);
 
   console.log(
     "\nE2E PASSED — register, snapshot, bot consent, prove, verify, open, confirm, restart, fund, bot-signed fill, sweep.",

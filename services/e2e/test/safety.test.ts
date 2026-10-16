@@ -16,7 +16,8 @@ describe("V2 local validator harness", () => {
 
   it("refuses funded payer configuration before reading a key or contacting RPC", () => {
     const result = spawnSync(process.execPath, [fileURLToPath(new URL("../dist/run.js", import.meta.url))], {
-      env: { ...process.env, PAYER_KEYPAIR: "a-key-file-that-must-never-be-read.json", RPC_URL: "http://127.0.0.1:1" },
+      env: { ...process.env, PAYER_KEYPAIR: "a-key-file-that-must-never-be-read.json", RPC_URL: "http://127.0.0.1:1",
+        JUPITER_FIXTURE_DIR: "a-fixture-directory-that-must-never-be-read" },
       encoding: "utf8", timeout: 15_000,
     });
     expect(result.status).toBe(1);
@@ -44,7 +45,8 @@ describe("V2 local validator harness", () => {
     const addr = server.address(); if (!addr || typeof addr === "string") throw new Error("no address");
     try {
       await expect(promisify(execFile)(process.execPath, [fileURLToPath(new URL("../dist/run.js", import.meta.url))], {
-        env: { ...process.env, PAYER_KEYPAIR: "", RPC_URL: `http://127.0.0.1:${addr.port}` }, timeout: 15_000,
+        env: { ...process.env, PAYER_KEYPAIR: "", RPC_URL: `http://127.0.0.1:${addr.port}`,
+          JUPITER_FIXTURE_DIR: "a-fixture-directory-that-must-never-be-read" }, timeout: 15_000,
       })).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("refuses public-chain genesis") });
       expect(methods).toEqual(["getGenesisHash"]);
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }

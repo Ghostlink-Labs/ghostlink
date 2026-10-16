@@ -47,7 +47,7 @@ use precompile::{check_session_signature, WebauthnData};
 use state::*;
 use token::{close_pocket_account, parse_token_account, transfer_from_pocket, TOKEN_PROGRAM_ID};
 
-declare_id!("5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa");
+declare_id!("HbSux9YnTupzNiRUwdR2mjTpJJryx25RV42wry4kCwiH");
 
 pub const REGISTRY_PROGRAM_ID: Pubkey = pubkey!("54EZ5ZkUANBs1SfQoXaU5EQSR8VAaD3XDtKEZGp6KjRv");
 pub const CENSUS_PROGRAM_ID: Pubkey = pubkey!("CvRA16GAa5ynUE3bzgMWuPYTbHLsdvyBydJoZVft5x9d");

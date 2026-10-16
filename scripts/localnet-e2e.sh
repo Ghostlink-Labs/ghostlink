@@ -31,7 +31,7 @@ solana-test-validator \
   --reset --quiet --ledger "$LEDGER_DIR" \
   --bpf-program 54EZ5ZkUANBs1SfQoXaU5EQSR8VAaD3XDtKEZGp6KjRv "$DEPLOY_DIR/ghostlink_registry.so" \
   --bpf-program CvRA16GAa5ynUE3bzgMWuPYTbHLsdvyBydJoZVft5x9d "$DEPLOY_DIR/ghostlink_census.so" \
-  --bpf-program 5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa "$DEPLOY_DIR/ghostlink_pocket.so" \
+  --bpf-program HbSux9YnTupzNiRUwdR2mjTpJJryx25RV42wry4kCwiH "$DEPLOY_DIR/ghostlink_pocket.so" \
   --account-dir "$GENESIS_DIR" \
   &
 VALIDATOR_PID=$!

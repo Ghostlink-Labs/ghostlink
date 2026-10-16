@@ -78,7 +78,7 @@ export function buildServer(deps: ActionsDeps): Server {
         title: "Fund a GhostLink pocket",
         description:
           `Deposit into pocket ${pocket}. Only deposit into a pocket you opened yourself: ` +
-          "a pocket can only ever send funds to the home address its owner chose.",
+          "owner withdrawals return to the configured home address; authorized swaps also spend pocket funds.",
         label: "Deposit",
         links: {
           actions: [

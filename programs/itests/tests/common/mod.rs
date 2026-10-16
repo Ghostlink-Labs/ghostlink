@@ -66,7 +66,7 @@ pub fn sign64(kp: &Keypair, message: &[u8]) -> [u8; 64] {
 
 pub const REGISTRY_ID: &str = "54EZ5ZkUANBs1SfQoXaU5EQSR8VAaD3XDtKEZGp6KjRv";
 pub const CENSUS_ID: &str = "CvRA16GAa5ynUE3bzgMWuPYTbHLsdvyBydJoZVft5x9d";
-pub const POCKET_ID: &str = "5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa";
+pub const POCKET_ID: &str = "HbSux9YnTupzNiRUwdR2mjTpJJryx25RV42wry4kCwiH";
 pub const TOKEN_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const ED25519_ID: &str = "Ed25519SigVerify111111111111111111111111111";
 pub const SECP256R1_ID: &str = "Secp256r1SigVerify1111111111111111111111111";

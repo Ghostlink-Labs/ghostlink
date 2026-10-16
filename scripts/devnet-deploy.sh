@@ -26,6 +26,11 @@ echo "deployer: $(solana-keygen pubkey "$DEPLOYER") ($(solana balance -k "$DEPLO
 
 for p in registry census pocket; do
   ID=$(solana-keygen pubkey "$KEYS/$p.json")
+  EXPECTED=$(sed -n 's/.*declare_id!("\([^"]*\)").*/\1/p' "programs/$p/src/lib.rs")
+  if [ -z "$EXPECTED" ] || [ "$ID" != "$EXPECTED" ]; then
+    echo "Refusing deployment: $p key is $ID but source declares $EXPECTED" >&2
+    exit 1
+  fi
   if solana program show "$ID" -u "$URL" >/dev/null 2>&1; then
     echo "$p already deployed at $ID"
     continue

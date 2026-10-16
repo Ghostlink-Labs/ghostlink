@@ -4,12 +4,12 @@ anchor_version = "0.32.1"
 [programs.localnet]
 ghostlink_registry = "54EZ5ZkUANBs1SfQoXaU5EQSR8VAaD3XDtKEZGp6KjRv"
 ghostlink_census = "CvRA16GAa5ynUE3bzgMWuPYTbHLsdvyBydJoZVft5x9d"
-ghostlink_pocket = "5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa"
+ghostlink_pocket = "HbSux9YnTupzNiRUwdR2mjTpJJryx25RV42wry4kCwiH"
 
 [programs.devnet]
 ghostlink_registry = "54EZ5ZkUANBs1SfQoXaU5EQSR8VAaD3XDtKEZGp6KjRv"
 ghostlink_census = "CvRA16GAa5ynUE3bzgMWuPYTbHLsdvyBydJoZVft5x9d"
-ghostlink_pocket = "5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa"
+ghostlink_pocket = "HbSux9YnTupzNiRUwdR2mjTpJJryx25RV42wry4kCwiH"
 
 [provider]
 cluster = "localnet"

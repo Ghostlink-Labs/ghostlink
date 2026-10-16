@@ -36,7 +36,7 @@ export const SEP_OWNER_TAG = 2n;
 /** Program IDs (devnet/localnet deploy keys; mainnet IDs are chosen at M4). */
 export const REGISTRY_PROGRAM_ID = "54EZ5ZkUANBs1SfQoXaU5EQSR8VAaD3XDtKEZGp6KjRv";
 export const CENSUS_PROGRAM_ID = "CvRA16GAa5ynUE3bzgMWuPYTbHLsdvyBydJoZVft5x9d";
-export const POCKET_PROGRAM_ID = "5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa";
+export const POCKET_PROGRAM_ID = "HbSux9YnTupzNiRUwdR2mjTpJJryx25RV42wry4kCwiH";
 
 /** Well-known Solana program IDs. */
 export const ED25519_PROGRAM_ID = "Ed25519SigVerify111111111111111111111111111";

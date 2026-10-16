@@ -1,16 +1,20 @@
 # Devnet
 
-> Historical deployment notes, last recorded 2026-10-15. The 2026-10-16 source review changes the Pocket allocation and owner-action digest format. Those changes have **not** been deployed. Updated clients reject old 2,081-byte accounts. Do not treat the addresses or earlier successful run below as verification of this release. A migration or fresh coordinated deployment is required; see [ADR 0002](adr/0002-open-source-review.md).
+> Updated 2026-10-16: the reviewed Pocket program is deployed at a fresh devnet address. The old program and its seven legacy accounts were preserved. Clients in this release target the new 2,089-byte layout; they do not migrate or reinterpret older accounts. See [ADR 0002](adr/0002-open-source-review.md).
 
-What exists on devnet, how it got there, and how to run against it. One paragraph of plain language first: devnet is Solana's free public test network — real network, worthless tokens — where the programs live under the same addresses the code declares, so partners can integrate before mainnet. Nothing here is irreversible; mainnet is a separate M4 step behind audits and the key ceremony.
+Devnet is Solana's public test network. This deployment uses development proving keys and test tokens. Mainnet requires separate security review, a production key ceremony and explicit release authorization.
 
-## Program IDs (same on every cluster)
+## Current devnet program IDs
 
 | Program | ID |
 | --- | --- |
 | registry | `54EZ5ZkUANBs1SfQoXaU5EQSR8VAaD3XDtKEZGp6KjRv` |
 | census | `CvRA16GAa5ynUE3bzgMWuPYTbHLsdvyBydJoZVft5x9d` |
-| pocket | `5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa` |
+| pocket | `HbSux9YnTupzNiRUwdR2mjTpJJryx25RV42wry4kCwiH` |
+
+The previous Pocket program, `5nLdCXFhJDmBbE6VfxgkLxLRR5Vk516G95U3VoQobPCa`, remains unchanged. Existing pockets belong to that deployment; changing an SDK default does not move their accounts or balances. Use a compatible legacy client to inspect those accounts.
+
+The fresh deployment transaction is `2bFvZZrF4nuFzf8wnbJFafCX5gc7M1vF99GcdkUM2VNSV4ncJc2hYb5QyocsgxJQ7PJbjKXs62hYKZgsckZbA1dM`. Registration, census snapshot, proof generation and verification, opening a pocket, funding and owner-proof sweep passed against this release. The test pocket was `7wf64QrVG2RcjwVmeCN9xwmM9ztNkFcY3C5DKarZTVMm`. Eight LiteSVM flows and the regenerated circuit fixtures also passed. Live oracle swap execution was skipped in this release check; the historical fill result below is not evidence for the new deployment.
 
 Deploy keypairs live outside the repo in `~/.ghostlink/keys/` (WSL). The registration message binds `cluster:devnet` (a compile-time feature of the registry program), so devnet signatures can never replay on mainnet.
 

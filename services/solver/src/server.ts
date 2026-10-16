@@ -5,8 +5,8 @@
  * is not delivered. Solana network fees can still be charged on failure.
  *
  * Routing is pluggable. The mock planner transfers from the solver's own
- * inventory on the local validator; a Jupiter planner belongs here when mainnet routing
- * lands (docs/adr/0001). Whatever the planner, the server values both
+ * inventory on the local validator; the experimental Jupiter planner validates
+ * one approved Raydium CP hop (docs/JUPITER-ROUTING.md). The server values both
  * legs first and refuses to overpay (economics.ts).
  */
 import type { Server } from "node:http";
@@ -41,10 +41,12 @@ import { prepareVersionedTransaction, type LookupTableRequest, type TransactionL
 export interface RoutePlan {
   instructions: TransactionInstruction[];
   lookupTables?: LookupTableRequest[];
+  /** Bank used to validate route accounts; later composition must not regress. */
+  minimumSlot?: number;
 }
 
 export interface RoutePlanner {
-  plan(v: ValidatedIntent, solver: PublicKey): Promise<RoutePlan>;
+  plan(v: ValidatedIntent, solver: PublicKey, minimumSlot?: number): Promise<RoutePlan>;
 }
 
 /** Fills from the solver's own token inventory at the intent's terms. */
@@ -158,7 +160,7 @@ export function buildServer(deps: SolverDeps): Server {
     const inPriceAccount = new PublicKey(deps.priceAccounts[inMint.toBase58()]!);
     const outPriceAccount = deps.priceAccounts[outMint.toBase58()];
 
-    const route = await deps.planner.plan(v, solver);
+    const route = await deps.planner.plan(v, solver, minimumSlot);
     const begin = fillBeginIx({
       solver,
       pocket,
@@ -184,7 +186,7 @@ export function buildServer(deps: SolverDeps): Server {
 
     return prepareVersionedTransaction(deps.connection, deps.keypair, {
       instructions: [...setup, pre, begin, ...route.instructions, end], lookupTables: route.lookupTables,
-      minimumSlot, deadlineSlot: v.intent.deadlineSlot, limits: deps.transactionLimits,
+      minimumSlot: Math.max(minimumSlot, route.minimumSlot ?? minimumSlot), deadlineSlot: v.intent.deadlineSlot, limits: deps.transactionLimits,
     });
   }
 

@@ -13,14 +13,19 @@
  *   SOLVER_MAX_COMPUTE_UNITS — cap full-fill compute (default 1400000)
  *   SOLVER_PRIORITY_MICRO_LAMPORTS — operator-fixed CU price (default 0)
  *   SOLVER_MAX_NETWORK_FEE_LAMPORTS — network fee ceiling, excludes rent (default 20000)
+ *   SOLVER_ROUTER — inventory (default) or experimental jupiter-raydium-cp
+ *   JUPITER_API_KEY_PATH — private text file, required for Jupiter
+ *   JUPITER_POOLS_PATH — JSON array of explicitly approved classic-SPL pools
+ *   JUPITER_SLIPPAGE_BPS — fixed quote tolerance, 0..500 (default 50)
  *   TRUST_PROXY=1 — honour X-Forwarded-For (only behind your own proxy)
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { Connection, Keypair } from "@solana/web3.js";
 import { buildServer, MockPlanner } from "./server.js";
 import { SubmissionJournal } from "./journal.js";
 import { POCKET_PROGRAM_ID } from "@ghostlink/common";
 import { DEFAULT_TRANSACTION_LIMITS } from "./transactions.js";
+import { JupiterPlanner } from "./jupiter.js";
 
 const keypairPath = process.env.GHOSTLINK_SOLVER_KEYPAIR;
 if (!keypairPath) {
@@ -36,6 +41,18 @@ const keypair = Keypair.fromSecretKey(
 );
 const connection = new Connection(process.env.RPC_URL ?? "http://127.0.0.1:8899", "confirmed");
 if (await connection.getGenesisHash() !== genesisHash) throw new Error("RPC genesis differs from approved solver configuration");
+const router = process.env.SOLVER_ROUTER ?? "inventory";
+if (router !== "inventory" && router !== "jupiter-raydium-cp") throw new Error("unsupported SOLVER_ROUTER");
+function privateText(name: string, maximum: number): string {
+  const path = process.env[name];
+  if (!path || !statSync(path).isFile() || statSync(path).size > maximum) throw new Error(`${name} must name a bounded configuration file`);
+  return readFileSync(path, "utf8").trim();
+}
+const planner = router === "inventory" ? new MockPlanner() : new JupiterPlanner(connection, {
+  apiKey: privateText("JUPITER_API_KEY_PATH", 512),
+  pools: JSON.parse(privateText("JUPITER_POOLS_PATH", 32_768)),
+  slippageBps: Number(process.env.JUPITER_SLIPPAGE_BPS ?? 50),
+});
 const journalKey = readFileSync(journalKeyPath);
 const journal = new SubmissionJournal(journalPath, journalKey, { genesisHash, pocketProgram: POCKET_PROGRAM_ID, solver: keypair.publicKey.toBase58() });
 journalKey.fill(0);
@@ -48,7 +65,7 @@ if (!Number.isInteger(port) || port <= 0) throw new Error(`PORT must be a positi
 buildServer({
   connection,
   keypair,
-  planner: new MockPlanner(),
+  planner,
   journal,
   transactionLimits: {
     maxComputeUnits: Number(process.env.SOLVER_MAX_COMPUTE_UNITS ?? DEFAULT_TRANSACTION_LIMITS.maxComputeUnits),

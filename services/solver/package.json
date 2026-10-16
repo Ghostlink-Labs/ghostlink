@@ -11,6 +11,7 @@
     ".": "./dist/index.js",
     "./server": "./dist/server.js",
     "./validate": "./dist/validate.js",
+    "./jupiter": "./dist/jupiter.js",
     "./journal": "./dist/journal.js"
   },
   "scripts": {

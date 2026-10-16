@@ -11,7 +11,7 @@ GhostLink proves membership in a wallet registry and, optionally, a historical t
 - Anchor registry, census and pocket programs, plus a shared Groth16 verifier.
 - Circom login and owner circuits, shared encoding vectors and public proof fixtures.
 - TypeScript SDK, React bindings, browser prover and server proof verifier.
-- Indexer, relayer, inventory-based test solver, funding Actions endpoint and recovery watcher.
+- Indexer, relayer, inventory-based test solver with an experimental [Jupiter/Raydium CP adapter](docs/JUPITER-ROUTING.md), funding Actions endpoint and recovery watcher.
 
 This repository publishes the reusable technology only. The website, dApp, prototypes, product designs and brand assets are not included. React bindings are unstyled integration components.
 

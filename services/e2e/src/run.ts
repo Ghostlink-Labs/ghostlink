@@ -592,6 +592,22 @@ async function main() {
     throw new Error("owner recovery retained speculative trading permission");
   }
 
+  // Exercise ingestion after trading too: an old Filled decoder used to silently drop current program events.
+  if (finalizedIndexer) {
+    const target = await connection.getSlot("confirmed"), deadline = Date.now() + 60_000;
+    while (await connection.getSlot("finalized") < target) {
+      if (Date.now() > deadline) throw new Error("recovery history did not finalize for indexer verification");
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  for (let tick = 0; tick < 100; tick++) { await poller.tick(); if (!poller.status.catchingUp) break; }
+  if (poller.status.catchingUp || !store.activity.some(item => item.pocket === pocket.toBase58() && item.kind === "Filled" &&
+      ["0", "1", "2"].includes(item.detail.mode ?? "") && /^[0-9]+$/.test(item.detail.releasedCostUsdE6 ?? "")) ||
+      store.pockets.get(pocket.toBase58())?.sweptHomeTo !== wallet.publicKey.toBase58()) {
+    throw new Error("indexer did not retain actual trade mode/cost and owner recovery history");
+  }
+  ok("indexer retained actual PocketV3 trade mode/cost and subsequent owner recovery history");
+
   if (process.env.RECOVERY_DESTINATION_DRILL === "1") {
     const {exerciseRecoveryDestinations}=await import("./recovery-destinations.js");
     await exerciseRecoveryDestinations({connection,payer,wallet,pocket,relayerUrl,send,ownerBody:()=>ownerBody("sweep"), recovery: process.env.RELAYER_JOURNAL_DRILL === "1" ? relayerFixture : undefined});

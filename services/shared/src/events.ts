@@ -49,6 +49,12 @@ class Reader {
     if (value !== 0 && value !== 1) throw new Error("invalid event boolean");
     return value === 1;
   }
+
+  tradeMode(): 0 | 1 | 2 {
+    const value = this.take(1)[0];
+    if (value !== 0 && value !== 1 && value !== 2) throw new Error("invalid event trade mode");
+    return value;
+  }
 }
 
 export interface RegisteredEvent {
@@ -88,6 +94,8 @@ export interface FilledEvent {
   outMint: string;
   outReceived: bigint;
   inValueUsdE6: bigint;
+  mode: 0 | 1 | 2;
+  releasedCostUsdE6: bigint;
 }
 
 export interface ChangeProposedEvent {
@@ -174,6 +182,8 @@ const DISCS: [string, (r: Reader) => GhostLinkEvent][] = [
       outMint: r.pubkey(),
       outReceived: r.u64(),
       inValueUsdE6: r.u64(),
+      mode: r.tradeMode(),
+      releasedCostUsdE6: r.u64(),
     }),
   ],
   [

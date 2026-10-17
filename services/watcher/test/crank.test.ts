@@ -20,7 +20,7 @@ describe("durable funded watcher", () => {
     w.chain.sendRawTransaction.mockImplementation(async () => { if (mode === "error") throw new Error(marker); return bs58.encode(new Uint8Array(64).fill(8)); });
     await original.tick(); const saved = j.get(w.pocket.toBase58())!;
     expect(saved.state).toBe("pending"); expect(w.chain.confirmTransaction).not.toHaveBeenCalled();
-    j.close(); const reopened = w.open(), restored = w.watcher(reopened);
+    original.close(); j.close(); const reopened = w.open(), restored = w.watcher(reopened);
     await restored.tick();
     w.chain.sendRawTransaction.mockImplementation(async bytes => bs58.encode(Transaction.from(bytes).signature!));
     await restored.tick();

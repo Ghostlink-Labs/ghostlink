@@ -174,6 +174,8 @@ export class IndexerStore {
           outMint: event.outMint,
           outReceived: event.outReceived.toString(),
           usdE6: event.inValueUsdE6.toString(),
+          mode: event.mode.toString(),
+          releasedCostUsdE6: event.releasedCostUsdE6.toString(),
         });
         break;
       }

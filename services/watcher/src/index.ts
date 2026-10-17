@@ -21,21 +21,25 @@
  *   NOTIFY_WEBHOOK — optional URL that receives JSON notifications
  *   LARGE_FILL_USD_E6 — threshold for large-fill alerts (default $100)
  *   GHOSTLINK_WATCHER_KEYPAIR — optional fee payer; enables the crank
- *   WATCHER_STATE_PATH — durable scoped snapshot (required by entry point)
- *   WATCHER_POLL_MS — polling interval, 100..60000 (default 5000)
+ *   WATCHER_STATE_PATH / WATCHER_STATE_KEY_PATH — durable scoped queue and raw 32-byte encryption key (required)
+ *   WATCHER_POLL_MS — polling interval, 100..30000 (default 5000)
  *   WATCHER_JOURNAL_PATH / WATCHER_JOURNAL_KEY_PATH — required for funded execution
  *   WATCHER_TOTAL_BUDGET_LAMPORTS — explicit cumulative fee cap, never reset by restart
  *   WATCHER_MAX_FEE_LAMPORTS — per-packet cap (default 20000)
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { POCKET, decodeLogs, type GhostLinkEvent } from "@ghostlink/service-kit";
+import { POCKET, type GhostLinkEvent } from "@ghostlink/service-kit";
 import { createRpcPool, loadRpcEndpoints } from "@ghostlink/service-kit/rpc";
 import { CrankJournal } from "./journal.js";
 import { DurableCranker } from "./crank.js";
-export { CrankJournal, DurableCranker };
+import { WatcherState } from "./state.js";
+import { completeEvents } from "./logs.js";
+export { CrankJournal, DurableCranker, WatcherState };
 
 export interface Notifier {
   notify(subject: string, body: Record<string, unknown>): Promise<void>;
@@ -101,6 +105,8 @@ export function eventsToNotifications(
           pocket: event.pocket,
           inMint: event.inMint,
           usdE6: event.inValueUsdE6.toString(),
+          mode: event.mode,
+          releasedCostUsdE6: event.releasedCostUsdE6.toString(),
         },
       });
     }
@@ -153,167 +159,169 @@ export class PendingChanges {
   }
 }
 
+export interface WatcherOptions { maximumPages?: number; maximumTransactions?: number; maximumDeliveries?: number; maximumTickMs?: number; pageSize?: number }
 export class Watcher {
-  /** Newest signature every notification of which was delivered. */
-  private cursor: string | undefined;
   private busy = false;
-  private readonly durableCranker?: DurableCranker;
   private stopping = false;
+  private head = -1;
+  private readonly durableCranker?: DurableCranker;
+  readonly pending = new PendingChanges();
+  readonly state: WatcherState;
+  readonly status = { lastSuccessAt: null as string | null, lastHeadAdvancedAt: null as string | null,
+    lastError: null as string | null, catchingUp: true, pendingTransactions: 0, appliedThroughSlot: 0 };
+  private readonly limits: Required<WatcherOptions>;
+  constructor(private readonly connection: Connection, private readonly notifier: Notifier, private readonly largeFillUsdE6: bigint,
+    cranker?: Keypair, state?: WatcherState, private readonly journal?: CrankJournal, options: WatcherOptions = {}) {
+    if (largeFillUsdE6 < 0n || largeFillUsdE6 > 0xffffffffffffffffn) throw new Error("invalid watcher alert threshold");
+    this.limits = { maximumPages: 4, maximumTransactions: 32, maximumDeliveries: 32, maximumTickMs: 10_000, pageSize: 1000, ...options };
+    for (const [name, maximum] of Object.entries({ maximumPages: 100, maximumTransactions: 1000, maximumDeliveries: 256, maximumTickMs: 30_000, pageSize: 1000 })) {
+      const value = this.limits[name as keyof WatcherOptions];
+      if (!Number.isSafeInteger(value) || value < 1 || value > maximum) throw new Error("invalid watcher work limits");
+    }
+    if (cranker && (!state || !journal || state.scope.genesisHash !== journal.scope.genesisHash || state.scope.payer !== cranker.publicKey.toBase58())) throw new Error("funded watcher requires scoped durable state and crank journal");
+    if (journal && !cranker) throw new Error("crank journal requires its payer");
+    // Only in-process observer fixtures may omit storage. Hosted startup always supplies a durable scoped database.
+    this.state = state ?? new WatcherState(":memory:", randomBytes(32), { genesisHash: "11111111111111111111111111111111",
+      pocketProgram: POCKET.toBase58(), payer: null, receiver: "fixture", threshold: largeFillUsdE6.toString() });
+    if (this.state.scope.pocketProgram !== POCKET.toBase58() || this.state.scope.payer !== (cranker?.publicKey.toBase58() ?? null) ||
+      this.state.scope.threshold !== largeFillUsdE6.toString()) throw new Error("watcher state configuration mismatch");
+    this.pending.restore(this.state.snapshot().pending);
+    if (cranker) this.durableCranker = new DurableCranker(connection, cranker, journal!);
+  }
   get idle(): boolean { return !this.busy; }
   drain(): void { this.stopping = true; }
-  readonly pending = new PendingChanges();
-  private readonly scope?: { genesisHash: string; pocketProgram: string; cranker: string | null };
-
-  constructor(
-    private readonly connection: Connection,
-    private readonly notifier: Notifier,
-    private readonly largeFillUsdE6: bigint,
-    /** When set, due changes are executed with this payer. */
-    private readonly cranker?: Keypair,
-    private readonly statePath?: string,
-    /** Required by the hosted entry point; omitted only for unscoped local fixtures. */
-    genesisHash?: string,
-    private readonly journal?: CrankJournal,
-  ) {
-    if (cranker) {
-      if (!journal || !statePath || genesisHash !== journal.scope.genesisHash) throw new Error("funded watcher requires a scoped durable crank journal and snapshot");
-      this.durableCranker = new DurableCranker(connection, cranker, journal);
-    } else if (journal) throw new Error("crank journal requires its payer");
-    if (genesisHash) {
-      try {
-        if (new PublicKey(genesisHash).toBase58() !== genesisHash) throw new Error();
-      } catch { throw new Error("invalid watcher genesis"); }
-      this.scope = { genesisHash, pocketProgram: POCKET.toBase58(), cranker: cranker?.publicKey.toBase58() ?? null };
-    }
-    if (statePath && existsSync(statePath)) {
-      try {
-        const state = JSON.parse(readFileSync(statePath, "utf8"));
-        if (state.version !== (this.scope ? 2 : 1) || (state.cursor !== undefined && typeof state.cursor !== "string") || !Array.isArray(state.pending)) throw new Error();
-        if (this.scope && (state.scope?.genesisHash !== this.scope.genesisHash ||
-          state.scope?.pocketProgram !== this.scope.pocketProgram || state.scope?.cranker !== this.scope.cranker)) throw new Error();
-        this.pending.restore(state.pending);
-        this.cursor = state.cursor;
-      } catch { throw new Error("invalid or mismatched watcher snapshot"); }
-    }
+  close(): void { if (this.busy) throw new Error("watcher must drain before close"); this.stopping = true; this.state.close(); }
+  ready(): boolean {
+    try { this.state.assertOwned(); } catch { return false; }
+    const fresh = (time: string | null) => time !== null && Date.now() - Date.parse(time) >= 0 && Date.now() - Date.parse(time) < 30_000;
+    return !this.stopping && !this.status.catchingUp && this.status.lastError === null && fresh(this.status.lastSuccessAt) && fresh(this.status.lastHeadAdvancedAt);
   }
-
-  private persist(): void {
-    if (!this.statePath) return;
-    mkdirSync(dirname(this.statePath), { recursive: true });
-    const tmp = `${this.statePath}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ version: this.scope ? 2 : 1, scope: this.scope, cursor: this.cursor, pending: this.pending.snapshot() }), { mode: 0o600 });
-    renameSync(tmp, this.statePath);
-  }
-
   async tick(): Promise<void> {
     if (this.busy || this.stopping) return;
     this.busy = true;
+    const deadline = Date.now() + this.limits.maximumTickMs, available = () => !this.stopping && Date.now() < deadline;
+    let delivered = 0, processed = 0;
     try {
-      const sigs = [];
-      let before: string | undefined;
-      for (;;) {
-        const page = await this.connection.getSignaturesForAddress(POCKET as PublicKey, {
-          limit: 1000, before, until: this.cursor,
-        }, "confirmed");
-        sigs.push(...page);
-        if (page.length < 1000) break;
-        before = page[page.length - 1]!.signature;
+      this.state.renew();
+      if (!this.state.scan()) {
+        const head = await this.connection.getSlot("confirmed");
+        if (!available()) return;
+        if (head > this.head) { this.head = head; this.status.lastHeadAdvancedAt = new Date().toISOString(); }
+        this.state.begin(head);
       }
-      for (const info of [...sigs].reverse()) {
-        if (!info.err) {
-          const tx = await this.connection.getTransaction(info.signature, {
-            maxSupportedTransactionVersion: 0,
-            commitment: "confirmed",
-          });
-          if (!tx) throw new Error(`transaction ${info.signature} not available yet`);
-          if (!tx.meta) throw new Error(`transaction ${info.signature} metadata not available yet`);
-          const events = tx.meta.err ? [] : decodeLogs(tx.meta.logMessages ?? []);
-          this.pending.observe(events);
-          for (const n of eventsToNotifications(events, this.largeFillUsdE6)) {
-            await withRetry(() => this.notifier.notify(n.subject, { ...n.body, signature: info.signature }));
+      for (let n = 0; n < this.limits.maximumPages && available(); n++) {
+        const scan = this.state.scan()!; if (scan.done) break;
+        const page = await this.connection.getSignaturesForAddress(POCKET, { limit: this.limits.pageSize, before: scan.before, minContextSlot: scan.upperSlot }, "confirmed");
+        this.state.page(scan.before, page, this.limits.pageSize);
+      }
+      while (processed < this.limits.maximumTransactions && available()) {
+        const observation = this.state.oldest(); if (!observation) break;
+        let delivery = this.state.delivery();
+        if (!delivery) {
+          let events: GhostLinkEvent[] = [];
+          if (!observation.failed) {
+            const tx = await this.connection.getTransaction(observation.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+            if (!tx?.meta || tx.slot !== observation.slot || tx.transaction.signatures[0] !== observation.signature) throw new Error("watcher transaction identity or metadata unavailable");
+            if (tx.meta.err !== null) throw new Error("watcher transaction status contradicts history");
+            events = completeEvents(tx.meta.logMessages);
           }
+          const candidate = new PendingChanges(); candidate.restore(this.state.snapshot().pending); candidate.observe(events);
+          delivery = this.state.prepare(observation, candidate.snapshot(), eventsToNotifications(events, this.largeFillUsdE6));
         }
-        this.cursor = info.signature;
-        this.persist();
+        while (delivery.next < delivery.alerts.length && delivered < this.limits.maximumDeliveries && available()) {
+          const alert = delivery.alerts[delivery.next]!;
+          this.state.renew();
+          // One admitted attempt per alert per tick. Failures retry the exact durable body/ID on the next tick.
+          await this.notifier.notify(alert.subject, structuredClone(alert.body));
+          this.state.acknowledge(String(alert.body.eventId)); delivered++; delivery = this.state.delivery()!;
+        }
+        if (delivery.next < delivery.alerts.length) break;
+        this.state.complete(observation.signature); this.pending.restore(this.state.snapshot().pending); processed++;
       }
-      if (this.durableCranker && !this.stopping) await this.crank();
-    } finally {
-      this.busy = false;
-    }
+      const complete = this.state.finish();
+      this.status.catchingUp = !complete; this.status.pendingTransactions = this.state.count(); this.status.appliedThroughSlot = this.state.through();
+      if (complete) {
+        this.status.lastSuccessAt = new Date().toISOString();
+        if (this.durableCranker && available()) await this.crank(available);
+      }
+      this.status.lastError = null;
+    } catch (error) { this.status.catchingUp = true; this.status.lastError = "watcher progress failed; preserving durable work"; throw error; }
+    finally { this.busy = false; }
   }
-
-  private async crank(): Promise<void> {
-    this.persist(); // Refuse funding if notification/proposal progress cannot be saved.
+  private async crank(available: () => boolean): Promise<void> {
+    this.state.renew(); this.pending.restore(this.state.snapshot().pending);
     const slot = BigInt(await this.connection.getSlot("confirmed"));
     const pockets = new Set([...this.journal!.outstanding(), ...this.pending.due(slot)]);
+    let admitted = 0;
     for (const pocket of pockets) {
-      if (this.stopping) break;
+      if (!available() || admitted++ >= this.limits.maximumTransactions) break;
+      this.state.renew();
       try { await this.durableCranker!.execute(pocket); }
       catch { console.error("watcher crank not confirmed; retaining pending change"); }
-      // Only actual executed/cancelled events remove pending work and produce notifications.
     }
   }
   start(intervalMs = 5000): NodeJS.Timeout {
-    if (!Number.isSafeInteger(intervalMs) || intervalMs < 100 || intervalMs > 60_000) throw new Error("invalid watcher polling interval");
-    return setInterval(() => {
-      this.tick().catch(() => console.error("watcher poll failed; preserving saved progress"));
-    }, intervalMs);
+    if (!Number.isSafeInteger(intervalMs) || intervalMs < 100 || intervalMs > 30_000) throw new Error("invalid watcher polling interval");
+    return setInterval(() => { void this.tick().catch(() => console.error("watcher poll failed; preserving saved progress")); }, intervalMs);
   }
-}
-
-async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
-  let last: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      last = e;
-      if (i + 1 < attempts) await new Promise((r) => setTimeout(r, 500 * 2 ** i));
-    }
-  }
-  throw last;
 }
 
 // Entry point when run directly.
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 async function main() {
-  const genesisHash = process.env.WATCHER_GENESIS_HASH, statePath = process.env.WATCHER_STATE_PATH;
-  if (!genesisHash || !statePath) throw new Error("WATCHER_GENESIS_HASH and WATCHER_STATE_PATH are required");
+  const genesisHash = process.env.WATCHER_GENESIS_HASH, statePath = process.env.WATCHER_STATE_PATH, keyPath = process.env.WATCHER_STATE_KEY_PATH;
+  if (!genesisHash || !statePath || !keyPath) throw new Error("approved watcher chain, durable state and encryption key are required");
   const rpc = createRpcPool({ genesisHash, endpoints: loadRpcEndpoints(process.env.RPC_ENDPOINTS_PATH, process.env.RPC_URL) });
-  const connection = rpc.connection;
-  await connection.getGenesisHash();
-  const notifier = process.env.NOTIFY_WEBHOOK
-    ? new WebhookNotifier(process.env.NOTIFY_WEBHOOK)
-    : new ConsoleNotifier();
-  const threshold = BigInt(process.env.LARGE_FILL_USD_E6 ?? "100000000");
-  const cranker = process.env.GHOSTLINK_WATCHER_KEYPAIR
-    ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.env.GHOSTLINK_WATCHER_KEYPAIR, "utf8"))))
-    : undefined;
-  let journal: CrankJournal | undefined;
-  if (cranker) {
-    const journalPath = process.env.WATCHER_JOURNAL_PATH, keyPath = process.env.WATCHER_JOURNAL_KEY_PATH;
-    if (!journalPath || !keyPath || !process.env.WATCHER_TOTAL_BUDGET_LAMPORTS) throw new Error("funded watcher journal and budget are required");
+  let journal: CrankJournal | undefined, state: WatcherState | undefined;
+  const server = createServer();
+  try {
+    await rpc.connection.getGenesisHash();
+    const notifier = process.env.NOTIFY_WEBHOOK ? new WebhookNotifier(process.env.NOTIFY_WEBHOOK) : new ConsoleNotifier();
+    const threshold = BigInt(process.env.LARGE_FILL_USD_E6 ?? "100000000");
+    const cranker = process.env.GHOSTLINK_WATCHER_KEYPAIR
+      ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.env.GHOSTLINK_WATCHER_KEYPAIR, "utf8")))) : undefined;
+    if (cranker && (!process.env.WATCHER_JOURNAL_PATH || !process.env.WATCHER_JOURNAL_KEY_PATH || !process.env.WATCHER_TOTAL_BUDGET_LAMPORTS)) throw new Error("funded watcher journal and budget are required");
     const key = readFileSync(keyPath);
-    try { journal = new CrankJournal(journalPath, key, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker.publicKey.toBase58() }, {
-      maximumFeeLamports: Number(process.env.WATCHER_MAX_FEE_LAMPORTS ?? 20_000),
-      totalBudgetLamports: Number(process.env.WATCHER_TOTAL_BUDGET_LAMPORTS),
-    }); } finally { key.fill(0); }
-  }
-  const watcher = new Watcher(connection, notifier, threshold, cranker, statePath, genesisHash, journal);
-  const timer = watcher.start(Number(process.env.WATCHER_POLL_MS ?? 5000));
-  let stopping = false;
-  const shutdown = () => {
-    if (stopping) return;
-    stopping = true; clearInterval(timer); watcher.drain();
-    const deadline = setTimeout(() => { rpc.close(); journal?.close(); process.exit(1); }, 30_000);
-    deadline.unref();
-    const drain = setInterval(() => {
-      if (!watcher.idle) return;
-      clearInterval(drain); clearTimeout(deadline); rpc.close(); journal?.close();
-    }, 50);
-  };
-  process.once("SIGTERM", shutdown); process.once("SIGINT", shutdown);
-  void watcher.tick().catch(() => console.error("watcher poll failed; preserving saved progress"));
-  console.log(`ghostlink watcher running${cranker ? ` (crank payer ${cranker.publicKey.toBase58()})` : ""}`);
+    try { state = new WatcherState(statePath, key, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker?.publicKey.toBase58() ?? null,
+      receiver: createHash("sha256").update(process.env.NOTIFY_WEBHOOK ?? "console").digest("hex"), threshold: threshold.toString() }); }
+    finally { key.fill(0); }
+    if (cranker) {
+      const journalPath = process.env.WATCHER_JOURNAL_PATH, journalKeyPath = process.env.WATCHER_JOURNAL_KEY_PATH;
+      if (!journalPath || !journalKeyPath || !process.env.WATCHER_TOTAL_BUDGET_LAMPORTS) throw new Error("funded watcher journal and budget are required");
+      const journalKey = readFileSync(journalKeyPath);
+      try { journal = new CrankJournal(journalPath, journalKey, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker.publicKey.toBase58() }, {
+        maximumFeeLamports: Number(process.env.WATCHER_MAX_FEE_LAMPORTS ?? 20_000), totalBudgetLamports: Number(process.env.WATCHER_TOTAL_BUDGET_LAMPORTS),
+      }); } finally { journalKey.fill(0); }
+    }
+    const watcher = new Watcher(rpc.connection, notifier, threshold, cranker, state, journal, {
+      maximumPages: Number(process.env.WATCHER_PAGES_PER_TICK ?? 4), maximumTransactions: Number(process.env.WATCHER_TRANSACTIONS_PER_TICK ?? 32),
+      maximumDeliveries: Number(process.env.WATCHER_DELIVERIES_PER_TICK ?? 32), maximumTickMs: Number(process.env.WATCHER_TICK_BUDGET_MS ?? 10_000),
+    });
+    const port = Number(process.env.WATCHER_PORT ?? process.env.PORT ?? 8791), interval = Number(process.env.WATCHER_POLL_MS ?? 5000);
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(interval) || interval < 100 || interval > 30_000) throw new Error("invalid watcher service limits");
+    server.requestTimeout = 5000; server.headersTimeout = 5000; server.keepAliveTimeout = 1000; server.maxConnections = 64;
+    server.on("request", (req, res) => {
+      const route = req.method === "GET" && (req.url === "/ready" || req.url === "/health");
+      const ready = watcher.ready(); res.writeHead(route ? (req.url === "/ready" && !ready ? 503 : 200) : 404, { "content-type": "application/json" });
+      res.end(JSON.stringify(route ? { ready } : { error: "not found" }));
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, resolve); });
+    const timer = watcher.start(interval);
+    let stopping = false;
+    const shutdown = (failed = false) => {
+      if (stopping) return;
+      stopping = true; clearInterval(timer); clearInterval(lease); watcher.drain(); server.close();
+      const deadline = setTimeout(() => { server.closeAllConnections(); rpc.close(); state?.close(); journal?.close(); process.exit(1); }, 30_000); deadline.unref();
+      const drain = setInterval(() => {
+        if (!watcher.idle) return;
+        clearInterval(drain); clearTimeout(deadline); server.closeAllConnections(); rpc.close(); watcher.close(); journal?.close();
+        if (failed) process.exitCode = 1;
+      }, 50);
+    };
+    const lease = setInterval(() => { try { state!.renew(); } catch { shutdown(true); } }, 15_000);
+    process.once("SIGTERM", () => shutdown()); process.once("SIGINT", () => shutdown());
+    void watcher.tick().catch(() => console.error("watcher poll failed; preserving saved progress"));
+    console.log(`ghostlink watcher running on :${port}`);
+  } catch (error) { server.close(); rpc.close(); state?.close(); journal?.close(); throw error; }
 }
 if (isMain) void main().catch(() => { console.error("watcher startup failed; check approved configuration and dependencies"); process.exitCode = 1; });

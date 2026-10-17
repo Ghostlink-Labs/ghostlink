@@ -8,16 +8,18 @@ import { BorshWriter, POCKET, pocketPda, POCKET_ACCOUNT_SIZE, writePolicy, event
 import { vi } from "vitest";
 import bs58 from "bs58";
 import { CrankJournal } from "../src/journal.js";
+import { WatcherState } from "../src/state.js";
 import { Watcher } from "../src/index.js";
 import { DurableCranker } from "../src/crank.js";
 
 export function world(totalBudgetLamports = 20_000) {
-  const directory = mkdtempSync(join(tmpdir(), "ghostlink-crank-test-")), path = join(directory, "crank.sqlite"), state = join(directory, "state.json");
+  const directory = mkdtempSync(join(tmpdir(), "ghostlink-crank-test-")), path = join(directory, "crank.sqlite"), state = join(directory, "state.sqlite");
   const key = randomBytes(32), payer = Keypair.generate(), genesis = Keypair.generate().publicKey.toBase58(), appId = randomBytes(32);
   const pocket = pocketPda(appId), home = Keypair.generate().publicKey, newHome = Keypair.generate().publicKey;
   let pending = true, after = 100n, slot = 101, height = 150, valid = true, status: SignatureStatus | null = null;
   const scope = { genesisHash: genesis, pocketProgram: POCKET.toBase58(), payer: payer.publicKey.toBase58() };
   const stores: CrankJournal[] = [];
+  const states: WatcherState[] = [];
   const open = () => { const j = new CrankJournal(path, key, scope, { maximumFeeLamports: 10_000, totalBudgetLamports }); stores.push(j); return j; };
   const account = () => {
     const w = new BorshWriter().fixed(createHash("sha256").update("account:PocketV3").digest().subarray(0, 8))
@@ -40,15 +42,18 @@ export function world(totalBudgetLamports = 20_000) {
     getBlockHeight: vi.fn(async () => height), isBlockhashValid: vi.fn(async () => ({ context: { slot }, value: valid })),
     sendRawTransaction: vi.fn(async (bytes: Uint8Array) => bs58.encode(Transaction.from(bytes).signature!)),
     confirmTransaction: vi.fn(async () => { status = { slot, confirmations: 1, err: null, confirmationStatus: "confirmed" }; return { value: { err: null }, context: { slot } }; }),
-    getSignaturesForAddress: vi.fn(async (_key: unknown, config: { until?: string }) => config.until ? [] : [{ signature: "proposal", slot: 1, err: null, memo: null, blockTime: 0 }]),
-    getTransaction: vi.fn(async () => ({ meta: { err: null, logMessages: logs } })),
+    getSignaturesForAddress: vi.fn(async () => [{ signature: "proposal", slot: 1, err: null, memo: null, blockTime: 0 }]),
+    getTransaction: vi.fn(async () => ({ slot: 1, transaction: { signatures: ["proposal"] }, meta: { err: null, logMessages: logs } })),
   };
   return { directory, path, state, key, payer, genesis, pocket, scope, open, chain,
     cranker: (j = open()) => new DurableCranker(chain as unknown as Connection, payer, j),
-    watcher: (j = open()) => new Watcher(chain as unknown as Connection, { notify: async () => {} }, 1n, payer, state, genesis, j),
+    watcher: (j = open()) => {
+      const db = new WatcherState(state, key, { genesisHash: genesis, pocketProgram: POCKET.toBase58(), payer: payer.publicKey.toBase58(), receiver: "fixture", threshold: "1" });
+      states.push(db); return new Watcher(chain as unknown as Connection, { notify: async () => {} }, 1n, payer, db, j);
+    },
     status: (s: SignatureStatus | null) => { status = s; }, pending: (v: boolean) => { pending = v; },
     after: (n: bigint) => { after = n; }, slot: (n: number) => { slot = n; },
     expire: () => { height = 300; slot = 400; valid = false; status = null; },
-    cleanup: () => { for (const store of stores) store.close(); key.fill(0); rmSync(directory, { recursive: true, force: true }); },
+    cleanup: () => { for (const db of states) db.close(); for (const store of stores) store.close(); key.fill(0); rmSync(directory, { recursive: true, force: true }); },
   };
 }

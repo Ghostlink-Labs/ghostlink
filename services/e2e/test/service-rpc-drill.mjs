@@ -72,7 +72,7 @@ async function start(name, extra = {}) {
   const env = { ...process.env, PORT: String(listenPort), NODE_ENV: "production", POLL_MS: "100",
     RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
     GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: "", INDEXER_STATE_PATH: join(directory, "indexer.db"), INDEXER_STATE_KEY_PATH: journalKeyPath, RELAYER_BUDGET_PATH: "", RELAYER_JOURNAL_PATH: join(directory, "relayer.db"), RELAYER_JOURNAL_KEY_PATH: journalKeyPath,
-    WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.json"), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
+    WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.sqlite"), WATCHER_STATE_KEY_PATH: journalKeyPath, WATCHER_PORT: String(listenPort), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
   const child = spawn(process.execPath, [fileURLToPath(new URL(`../../${name}/dist/index.js`, import.meta.url))], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   const state = { child, output: "", url: `http://127.0.0.1:${listenPort}` };
   child.stdout.on("data", data => { state.output += data; });

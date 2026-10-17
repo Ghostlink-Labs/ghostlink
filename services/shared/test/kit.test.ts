@@ -24,6 +24,16 @@ const vectors = JSON.parse(
   readFileSync(join(root, "packages/common/fixtures/vectors.json"), "utf8"),
 );
 
+it("decodes the complete PocketV3 Filled layout and rejects truncated or unsupported modes", () => {
+  // Matches programs/pocket/src/state.rs: four 32-byte fields, three u64 amounts, mode u8 and released cost u64.
+  const encoded = Buffer.concat([eventDisc("Filled"), Buffer.alloc(32, 1), Buffer.alloc(32, 2), Buffer.alloc(32, 3),
+    new BorshWriter().u64(7n).out(), Buffer.alloc(32, 4), new BorshWriter().u64(8n).u64(0n).u8(2).u64(900n).out()]);
+  const event = decodeEventData(encoded);
+  expect(event).toMatchObject({ kind: "Filled", inMax: 7n, outReceived: 8n, inValueUsdE6: 0n, mode: 2, releasedCostUsdE6: 900n });
+  for (const length of [encoded.length - 1, encoded.length - 9]) expect(decodeEventData(encoded.subarray(0, length))).toBeNull();
+  encoded[encoded.length - 9] = 3; expect(decodeEventData(encoded)).toBeNull();
+});
+
 describe("instruction encoding", () => {
   it("derives the fixture pocket PDA", () => {
     const appId = hexToBytes(

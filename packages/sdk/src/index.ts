@@ -9,4 +9,5 @@ export * from "./domains.js";
 export { ApplicationRegistry, applicationRegistryDigest, type ApplicationManifest, type TrustedApplication } from "./applications.js";
 export * from "./owner-consent.js";
 export * from "./telegram.js";
+export * from "./pairing.js";
 export type { IntentSubmission } from "@ghostlink/common";

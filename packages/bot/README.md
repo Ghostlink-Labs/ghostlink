@@ -81,6 +81,12 @@ One idempotency key binds one immutable request. Retrying identical inputs retur
 
 Local cancellation removes the active encrypted key record. It **does not revoke the on-chain session or invalidate an already signed intent**, and old ciphertext may remain in WAL files or backups. Use owner-authorized on-chain revocation/rotation and home recovery for that purpose. A renewed or replaced session requires new consent here; changed expiry/key is refused. Do not claim a cancelled order cannot land unless its chain deadline/revocation status establishes that.
 
+## External-browser pairing
+
+For Telegram clients that open a separate browser, the server also exposes `/pairings/create` and `/pairings/status` to the configured Mini App origin, and `/pairings/claim` to the trusted owner origin. Use the SDK's `prepareTelegramPairing`, `parseTelegramPairingCode` and `verifyTelegramPairingClaim` helpers with the [external-browser pairing protocol](../../docs/OWNER-CONSENT.md#external-browser-pairing). Codes are copied by the user, never placed in URLs. `/requests` accepts optional `pairing: {tokenHash,claimId}` to link one immutable consent. The server's HMAC check does not replace the owner's independent Telegram Ed25519 verification.
+
+Pairing data is process-local, encrypted in memory, bounded to three entries per user and 256 total, and lost on restart. Claims expire after at most two minutes; linked metadata expires after at most five minutes. Route a pairing's calls to the same process. Poll at intervals of at least five seconds within the shared 30-request/minute/IP allowance. A status of `unavailable` means chain confirmation could not be established, including RPC failure or revoked/replaced authority; never infer trading access from it. Existing durable consent and keys survive expiry/restart. Disable request-body logging for these credential-carrying endpoints.
+
 ## Durable bot orders
 
 Use one stable request key for one business command, such as a hash of the authenticated Telegram update and action identity. Persist that mapping in your strategy system. Reuse it on every retry; a fresh random key on each attempt represents a different order.

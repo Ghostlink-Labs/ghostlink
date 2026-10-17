@@ -97,6 +97,11 @@ export class BotOnboarding {
     return verifyTelegramInitData(initData, this.#token, { nowSeconds: this.#now() });
   }
 
+  /** Fixed operator origin and authenticated identity for the credential handoff adapter. */
+  get applicationOrigin(): string { return this.#origin; }
+  pairingIdentity(initData: string): TelegramIdentity { return this.#identity(initData); }
+  pairingTime(): number { return this.#now(); }
+
   async #head(deployment: BotDeployment): Promise<number> {
     if (await this.#chain.getGenesisHash() !== deployment.genesisHash) throw new Error("RPC genesis does not match approved deployment");
     const slot = await this.#chain.getSlot("confirmed");

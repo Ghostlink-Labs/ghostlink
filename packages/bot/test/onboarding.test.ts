@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { createPublicKey, randomBytes, verify } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,6 +48,52 @@ function world() {
 }
 
 describe("durable bot authorization", () => {
+  it("pairs disjoint browsers with exact origins and confirms only independently observed chain authority", async () => {
+    const w = world(), m = w.manager(), owner = "https://owner.example.com", bot = "https://bot.example.com";
+    const server = createBotAuthorizationServer(m, owner);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanup.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const address = server.address(); if (!address || typeof address === "string") throw new Error("no address");
+    const endpoint = `http://127.0.0.1:${address.port}`;
+    // HMAC verifies server authentication here; production Ed25519 refusal is tested in the SDK/owner boundary.
+    const raw = initData(42, NOW, {signature:"synthetic-owner-must-reject"});
+    const token = "ac".repeat(32), tokenHash = createHash("sha256").update(Buffer.from(token,"hex")).digest("hex");
+    const code = `GLP1.12345.42.${token}`, claimId = "bd".repeat(32);
+    const post = (path:string, body:unknown, origin:string, auth=raw) => fetch(endpoint+path, {
+      method:"POST",headers:{origin,authorization:"tma "+auth,"content-type":"application/json"},body:JSON.stringify(body),
+    });
+    for (const [operation, origin] of [["create",bot],["claim",owner],["status",bot]]) {
+      const preflight = await fetch(endpoint+"/pairings/"+operation,{method:"OPTIONS",headers:{origin:origin!}});
+      expect(preflight.status).toBe(204);expect(preflight.headers.get("access-control-allow-origin")).toBe(origin);
+      expect(preflight.headers.get("vary")).toBe("Origin");
+    }
+    expect((await post("/pairings/create",{tokenHash},owner)).status).toBe(403);
+    expect((await post("/pairings/create?credential=forbidden",{tokenHash},bot)).status).toBe(403);
+    const created = await post("/pairings/create",{tokenHash},bot);
+    expect(created.status).toBe(200);expect(created.headers.get("cache-control")).toBe("no-store");
+    expect(await created.json()).toEqual({botId:"12345",userId:"42",expiresAt:NOW+120});
+    expect((await post("/pairings/claim",{code,claimId},bot)).status).toBe(403);
+    const claim = await post("/pairings/claim",{code,claimId},owner);
+    expect(claim.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(await claim.json()).toEqual({initData:raw,expiresAt:NOW+120});
+    expect((await post("/pairings/claim",{code,claimId},owner)).status).toBe(200);
+    expect((await post("/pairings/claim",{code,claimId:"cd".repeat(32)},owner)).status).toBe(403);
+    expect((await post("/pairings/status",{tokenHash},bot,initData(43))).status).toBe(403);
+    const input={...w.input,pairing:{tokenHash,claimId}};
+    const response=await post("/requests",input,owner);expect(response.status).toBe(200);
+    const {consent}=await response.json() as {consent:BotConsent};
+    expect((await post("/requests",input,owner)).status).toBe(200);
+    expect((await post("/requests",{...input,sessionExpirySlot:"1001"},owner)).status).toBe(403);
+    const status=()=>post("/pairings/status",{tokenHash},bot).then(r=>r.json());
+    expect(await status()).toEqual({state:"unavailable"});
+    w.activate(consent);
+    expect(await status()).toEqual({state:"confirmed",consentId:consent.id,pocket:consent.pocket});
+    w.activate({...consent,sessionExpirySlot:"0"});
+    expect(await status()).toEqual({state:"unavailable"});
+    w.setNow(NOW+300);
+    expect((await post("/pairings/status",{tokenHash},bot,initData(42,NOW+300))).status).toBe(403);
+  });
+
   it("retires restored keys, preserves order reservations, and requires fresh owner consent after a real backup", async () => {
     const w = world(), store = w.store(), manager = w.manager(store);
     const { consent: old } = await manager.create(initData(), w.input);

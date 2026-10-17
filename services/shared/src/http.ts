@@ -37,6 +37,10 @@ interface Route {
 export interface RouterOptions {
   /** Largest accepted request body; default 64 KiB. */
   maxBodyBytes?: number;
+  /** Includes requests still reading a body and handlers whose client disconnected. */
+  maxInFlight?: number;
+  /** Bound idle/slow connections as well as dispatched requests. */
+  maxConnections?: number;
   /** `access-control-allow-origin`; default "*" (public read APIs). */
   allowOrigin?: string;
   /** Include thrown error messages in 500 responses (default: outside production). */
@@ -51,9 +55,16 @@ export class Router {
   private readonly allowOrigin: string;
   private readonly exposeErrors: boolean;
   private readonly onError: (error: unknown, req: IncomingMessage) => void;
+  private readonly maxInFlight: number;
+  private readonly maxConnections: number;
 
   constructor(options: RouterOptions = {}) {
     this.maxBodyBytes = options.maxBodyBytes ?? 64 * 1024;
+    this.maxInFlight = options.maxInFlight ?? 64;
+    this.maxConnections = options.maxConnections ?? 512;
+    for (const n of [this.maxBodyBytes, this.maxInFlight, this.maxConnections]) {
+      if (!Number.isSafeInteger(n) || n < 1) throw new RangeError("HTTP limits must be positive integers");
+    }
     this.allowOrigin = options.allowOrigin ?? "*";
     this.exposeErrors = options.exposeErrors ?? process.env.NODE_ENV !== "production";
     this.onError =
@@ -89,8 +100,17 @@ export class Router {
   }
 
   server(): Server {
+    let active = 0;
     const server = createServer((req, res) => {
+      if (active >= this.maxInFlight) {
+        res.once("finish", () => req.destroy());
+        send(res, 503, { error: "service busy; retry the same request" },
+          { ...this.corsHeaders(), connection: "close", "retry-after": "1" }, req.method === "HEAD");
+        return;
+      }
+      active++;
       this.dispatch(req, res).catch((e) => {
+        if (res.destroyed || res.writableEnded) return;
         if (e instanceof HttpError) {
           if (e.status === 413) {
             res.setHeader("connection", "close");
@@ -106,12 +126,13 @@ export class Router {
           { error: this.exposeErrors ? (e instanceof Error ? e.message : String(e)) : "internal error" },
           this.corsHeaders(),
         );
-      });
+      }).finally(() => { active--; });
     });
     // Slow-client protection; JSON APIs never need long-lived requests.
     server.requestTimeout = 30_000;
     server.headersTimeout = 15_000;
     server.keepAliveTimeout = 5_000;
+    server.maxConnections = this.maxConnections;
     return server;
   }
 
@@ -208,34 +229,41 @@ function send(
 }
 
 /**
- * In-memory fixed-window rate limiter (liveness-only services). Expired
- * windows are swept periodically so the map cannot grow without bound.
+ * In-memory fixed-window limiter. Never evict an unexpired quota to admit a
+ * new identity; reject new keys when full. Expiry order bounds cleanup work.
  */
 export class RateLimiter {
   private hits = new Map<string, { count: number; windowStart: number }>();
-  private calls = 0;
+  private latestTime = -Infinity;
 
   constructor(
     private readonly max: number,
     private readonly windowMs: number,
-  ) {}
+    private readonly maxKeys = 10_000,
+  ) {
+    for (const value of [max, windowMs, maxKeys]) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new RangeError("rate limits must be positive integers");
+    }
+  }
 
   allow(key: string, now = Date.now()): boolean {
-    if (++this.calls % 1000 === 0) this.sweep(now);
+    if (key.length > 256 || !Number.isFinite(now)) return false;
+    now = this.latestTime = Math.max(now, this.latestTime);
+    // Entries are inserted in window-start order; hits don't reorder them.
+    for (const [oldKey, entry] of this.hits) {
+      if (now - entry.windowStart < this.windowMs) break;
+      this.hits.delete(oldKey);
+    }
     const entry = this.hits.get(key);
-    if (!entry || now - entry.windowStart >= this.windowMs) {
+    if (!entry) {
+      if (this.hits.size >= this.maxKeys) return false;
       this.hits.set(key, { count: 1, windowStart: now });
       return true;
     }
-    entry.count += 1;
+    entry.count = Math.min(this.max + 1, entry.count + 1);
     return entry.count <= this.max;
   }
 
-  private sweep(now: number): void {
-    for (const [key, entry] of this.hits) {
-      if (now - entry.windowStart >= this.windowMs) this.hits.delete(key);
-    }
-  }
 }
 
 /**
@@ -257,12 +285,16 @@ export class Semaphore {
   private active = 0;
   private waiting: (() => void)[] = [];
 
-  constructor(private readonly limit: number) {
+  constructor(private readonly limit: number, private readonly maxQueued = 64) {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("concurrency must be a positive integer");
+    if (!Number.isSafeInteger(maxQueued) || maxQueued < 0) throw new RangeError("queue capacity must be a nonnegative integer");
   }
 
   async run<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.active >= this.limit) await new Promise<void>((r) => this.waiting.push(r));
+    if (this.active >= this.limit) {
+      if (this.waiting.length >= this.maxQueued) throw new HttpError(503, "service busy; retry later");
+      await new Promise<void>((r) => this.waiting.push(r));
+    }
     else this.active += 1;
     try {
       return await fn();

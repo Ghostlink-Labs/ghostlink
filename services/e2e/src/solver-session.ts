@@ -77,11 +77,35 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
   const listen = async () => {
     server.listen(port, "127.0.0.1"); await once(server, "listening");
     const addr = server.address(); if (!addr || typeof addr === "string") throw new Error("no solver address");
-    url = `http://127.0.0.1:${addr.port}`; return url;
+    url = `http://127.0.0.1:${addr.port}`;
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      if ((await fetch(`${url}/ready`)).status === 200) return url;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    throw new Error("solver never became ready");
   };
   const stop = () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   await listen();
   return { get url() { return url; },
+    async readinessDrill() {
+      if (!rpcFault) throw new Error("readiness drill requires RPC_FAILOVER_DRILL=1");
+      const waitFor = async (status: number) => {
+        const deadline = Date.now() + 20_000;
+        while (Date.now() < deadline) {
+          if ((await fetch(`${url}/ready`)).status === status) return;
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        throw new Error(`readiness did not become ${status}`);
+      };
+      rpcFault.outage(true);
+      try {
+        await waitFor(503);
+        if ((await fetch(`${url}/health`)).status !== 200 ||
+          (await fetch(`${url}/intent`, { method: "POST", body: "{}" })).status !== 503) throw new Error("outage admission/liveness failed");
+      } finally { rpcFault.outage(false); }
+      await waitFor(200);
+    },
     backup: () => journal.backupTo(join(dir, "backup.enc")),
     async restore() {
       await stop(); journal.close();

@@ -115,6 +115,28 @@ export class EncryptedSqlite {
     if (this.#ready && !this.#inTransaction) this.#verifyKey();
   }
   get db(): DatabaseSync { this.#checkCurrentKey(); return this.#db; }
+  /** Commit a fresh encryption of the existing sentinel; no business state changes. */
+  checkWritable(): void {
+    if (this.#closed || this.#inTransaction) throw new Error("storage probe unavailable");
+    const timeout = Number(this.#db.prepare("PRAGMA busy_timeout").get()!.timeout);
+    let failed = false;
+    this.#db.exec("PRAGMA busy_timeout=0");
+    try {
+      this.transaction(() => {
+        const plain = Buffer.from(this.#namespace + ":v1");
+        try {
+          this.#db.prepare("UPDATE metadata SET value=? WHERE name='key-check-v1'")
+            .run(this.seal(plain, this.#namespace + ":key-check:v1"));
+        } finally { plain.fill(0); }
+      });
+    } catch (e) { failed = true; throw e; }
+    finally {
+      if (!this.#closed) {
+        try { this.#db.exec(`PRAGMA busy_timeout=${timeout}`); }
+        catch (e) { try { this.close(); } catch { /* Preserve the primary failure. */ } if (!failed) throw e; }
+      }
+    }
+  }
   close(): void { try { if (!this.#closed) this.#db?.close(); } finally { this.#closed = true; this.#key.fill(0); } }
 
   /** A new epoch on EVERY restore, even when restoring a backup of an earlier restore. */

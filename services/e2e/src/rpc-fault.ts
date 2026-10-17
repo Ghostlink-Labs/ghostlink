@@ -9,10 +9,11 @@ export async function startRpcFaultFixture(upstream: Connection) {
   if (!["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) throw new Error("RPC fault drill requires loopback");
   const genesisHash = await upstream.getGenesisHash();
   if (["EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"].includes(genesisHash)) throw new Error("RPC fault drill refuses public genesis");
-  let armed = false, dropped = false, secondaryStatus = 0;
+  let armed = false, dropped = false, secondaryStatus = 0, outage = false;
   const sent: { provider: number; body: string }[] = [];
   const servers = [0, 1].map(index => createServer(async (req, res) => {
     try {
+      if (outage) { req.resume(); res.writeHead(503); res.end(); return; }
       let body = "";
       for await (const chunk of req) {
         body += chunk;
@@ -46,7 +47,7 @@ export async function startRpcFaultFixture(upstream: Connection) {
       endpoints.push({ url: `http://127.0.0.1:${address.port}` });
     }
     const pool = createRpcPool({ genesisHash, endpoints });
-    return { connection: pool.connection, arm: () => { armed = true; },
+    return { connection: pool.connection, arm: () => { armed = true; }, outage: (value: boolean) => { outage = value; },
       assertRecovered() {
         if (!dropped || !secondaryStatus || sent.length < 2 || sent[0]!.provider !== 0 || sent[1]!.provider !== 1 || sent[0]!.body !== sent[1]!.body) {
           throw new Error("RPC failover did not preserve the accepted transaction and reconcile through the fallback");

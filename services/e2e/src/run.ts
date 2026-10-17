@@ -209,6 +209,10 @@ async function main() {
   let solverUrl = solverFixture.url;
   const actionsUrl = await listen(buildActions({ connection, baseUrl: keepRunning ? `http://127.0.0.1:${demoPortBase + 3}` : "http://e2e.local" }), 8790);
   ok(`services up (indexer ${indexerUrl})`);
+  if (process.env.OPERATIONS_DRILL === "1") {
+    await solverFixture.readinessDrill();
+    ok("provider outage refused new work, preserved liveness and recovered readiness");
+  }
 
   // ---- the SDK client ------------------------------------------------------
   const prover: Prover = {

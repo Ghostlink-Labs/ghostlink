@@ -1,5 +1,7 @@
 # RPC failover for bot and solver operations
 
+The solver adds cached readiness, an authenticated journal write probe, bounded admission, private provider metrics and graceful draining around this transport. See [solver operations](SOLVER-OPERATIONS.md).
+
 `@ghostlink/service-kit/rpc` provides a Node-only `createRpcPool` factory. The solver entry point uses it for authorization reads, route preparation, simulation, fee checks, signed sends and confirmation. It accepts one to four **operator-approved** endpoints and an independently approved genesis hash. Never accept an endpoint or expected genesis from a trade request or Telegram user. Existing candidate public-chain guards still apply.
 
 Set `RPC_ENDPOINTS_PATH` to a private JSON file outside the repository. It overrides `RPC_URL`; without it, the solver uses the existing single URL. The file is bounded to 16 KiB and has this shape:

@@ -62,6 +62,7 @@ export class SubmissionJournal {
   }
 
   close(): void { this.#storage.close(); }
+  checkWritable(): void { this.#storage.checkWritable(); }
   backupTo(destination: string): Promise<void> { return this.#storage.backupTo(destination); }
   static restoreBackup(archive: string, newDirectory: string, key: Uint8Array, scope: JournalScope): string {
     return EncryptedSqlite.restoreBackup(archive, newDirectory, key, journalNamespace(scope));

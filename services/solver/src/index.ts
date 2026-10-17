@@ -1,6 +1,8 @@
 /**
  * Entry point. Environment:
  *   PORT (default 8789)
+ *   OPERATIONS_PORT (default 18789, loopback only; must differ from PORT)
+ *   SOLVER_MIN_BALANCE_LAMPORTS (default 5000000, at least maximum network fee)
  *   RPC_URL (default http://127.0.0.1:8899)
  *   RPC_ENDPOINTS_PATH — private JSON array of {url, headers?}; overrides RPC_URL
  *   GHOSTLINK_SOLVER_KEYPAIR — path to the solver keypair JSON
@@ -28,6 +30,7 @@ import { SubmissionJournal } from "./journal.js";
 import { POCKET_PROGRAM_ID } from "@ghostlink/common";
 import { DEFAULT_TRANSACTION_LIMITS } from "./transactions.js";
 import { JupiterPlanner } from "./jupiter.js";
+import { operatorServer } from "./operations.js";
 
 const keypairPath = process.env.GHOSTLINK_SOLVER_KEYPAIR;
 if (!keypairPath) {
@@ -68,9 +71,11 @@ const priceAccounts = process.env.PRICE_ACCOUNTS
   ? (JSON.parse(process.env.PRICE_ACCOUNTS) as Record<string, string>)
   : {};
 const port = Number(process.env.PORT ?? 8789);
-if (!Number.isInteger(port) || port <= 0) throw new Error(`PORT must be a positive integer, got ${process.env.PORT}`);
+const operationsPort = Number(process.env.OPERATIONS_PORT ?? 18789);
+for (const n of [port, operationsPort]) if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error("invalid solver HTTP port");
+if (port === operationsPort) throw new Error("solver and operations ports must differ");
 
-buildServer({
+const server = buildServer({
   connection,
   keypair,
   planner,
@@ -85,6 +90,33 @@ buildServer({
   allowUnpriced: process.env.SOLVER_ALLOW_UNPRICED === "1",
   createPocketAta: process.env.SOLVER_CREATE_POCKET_ATA === "1",
   trustProxy: process.env.TRUST_PROXY === "1",
-}).listen(port, () => {
+  minimumBalanceLamports: Number(process.env.SOLVER_MIN_BALANCE_LAMPORTS ?? 5_000_000),
+});
+const operator = operatorServer(server.operations, rpc.status);
+let stopping = false;
+function shutdown() {
+  if (stopping) return;
+  stopping = true; server.operations.drain();
+  // A forced stop leaves exact packets in the journal for reconciliation.
+  const deadline = setTimeout(() => {
+    clearInterval(drainCheck);
+    server.closeAllConnections(); operator.closeAllConnections(); rpc.close(); journal.close(); process.exit(1);
+  }, 30_000);
+  deadline.unref();
+  let httpClosed = false;
+  server.close(() => { httpClosed = true; });
+  // Disconnected clients can leave preparation/submission work running after
+  // Node's server-close callback. Keep its journal open until that work settles.
+  const drainCheck = setInterval(() => {
+    if (!httpClosed || server.operations.snapshot().active !== 0) return;
+    clearInterval(drainCheck); clearTimeout(deadline);
+    server.operations.stop(); rpc.close(); journal.close(); operator.close();
+  }, 50);
+  drainCheck.unref();
+}
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);
+operator.listen(operationsPort, "127.0.0.1");
+server.listen(port, () => {
   console.log(`ghostlink solver on :${port}, identity ${keypair.publicKey.toBase58()}`);
 });

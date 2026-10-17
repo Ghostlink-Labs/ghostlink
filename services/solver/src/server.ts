@@ -37,6 +37,7 @@ import { PriceReader, checkEconomics } from "./economics.js";
 import { NonceConflictError, SubmissionJournal } from "./journal.js";
 import { IntentAuthorizationError, SubmissionCoordinator } from "./submission.js";
 import { prepareVersionedTransaction, type LookupTableRequest, type TransactionLimits } from "./transactions.js";
+import { SolverOperations } from "./operations.js";
 
 export interface RoutePlan {
   instructions: TransactionInstruction[];
@@ -83,9 +84,11 @@ export interface SolverDeps {
    */
   createPocketAta?: boolean;
   trustProxy?: boolean;
+  /** Operational reserve, not a per-trade or aggregate spending permission. */
+  minimumBalanceLamports?: number;
 }
 
-export function buildServer(deps: SolverDeps): Server {
+export function buildServer(deps: SolverDeps): Server & { operations: SolverOperations } {
   const router = new Router({ exposeErrors: false, onError: () => console.error("solver request failed") });
   const solver = deps.keypair.publicKey;
   if (deps.journal.scope.solver !== solver.toBase58()) throw new Error("solver identity does not match journal");
@@ -93,57 +96,70 @@ export function buildServer(deps: SolverDeps): Server {
   const prices = new PriceReader(deps.connection, deps.priceAccounts);
   const ipLimiter = new RateLimiter(30, 60_000);
   const pocketLimiter = new RateLimiter(10, 60_000);
-  let inFlight = 0;
+  const minimumBalanceLamports = deps.minimumBalanceLamports ?? 5_000_000;
+  if (BigInt(minimumBalanceLamports) < (deps.transactionLimits?.maxNetworkFeeLamports ?? 20_000n)) throw new Error("solver reserve must cover the configured maximum network fee");
+  const operations = new SolverOperations({ connection: deps.connection, solver, genesisHash: deps.journal.scope.genesisHash,
+    checkWritable: () => deps.journal.checkWritable(), minimumBalanceLamports });
 
   router.get("/health", async () => ({ json: { ok: true, solver: solver.toBase58() } }));
+  router.get("/ready", async () => {
+    const { ready, checks } = operations.snapshot();
+    return { status: ready ? 200 : 503, json: { ready, checks }, headers: { "cache-control": "no-store", "retry-after": "1" } };
+  });
 
   router.get("/intents/:id", async ({ params, raw }) => {
     if (!ipLimiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
     if (!/^[0-9a-f]{64}$/.test(params.id ?? "")) throw new HttpError(400, "invalid intent hash");
-    if (!deps.journal.get(params.id!)) throw new HttpError(404, "intent not found");
-    if (inFlight >= 8) throw new HttpError(503, "solver busy");
-    inFlight += 1;
-    try { return { json: await submissions.status(params.id!), headers: { "cache-control": "no-store" } }; }
-    finally { inFlight -= 1; }
+    const release = operations.acquire("status");
+    if (!release) throw new HttpError(503, "solver busy");
+    try {
+      let exists: boolean;
+      try { exists = !!deps.journal.get(params.id!); }
+      catch { throw new HttpError(503, "intent journal unavailable"); }
+      if (!exists) throw new HttpError(404, "intent not found");
+      return { json: await submissions.status(params.id!), headers: { "cache-control": "no-store" } };
+    } finally { release(); }
   });
 
   router.post("/intent", async ({ body, raw }) => {
     if (!ipLimiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
-    const req = body as IntentRequest;
-    let v: ValidatedIntent;
+    const release = operations.acquire("intent");
+    if (!release) throw new HttpError(503, "solver not ready; retry the identical signed intent");
     try {
-      v = validateIntent(req);
-    } catch (e) {
-      return { status: 400, json: { error: e instanceof Error ? e.message : String(e) } };
-    }
+      const req = body as IntentRequest;
+      let v: ValidatedIntent;
+      try {
+        v = validateIntent(req);
+      } catch (e) {
+        return { status: 400, json: { error: e instanceof Error ? e.message : String(e) } };
+      }
 
-    const pocket = new PublicKey(v.intent.pocket);
-    const inMint = new PublicKey(v.intent.inMint);
-    const outMint = new PublicKey(v.intent.outMint);
-    if (!pocketLimiter.allow(pocket.toBase58())) throw new HttpError(429, "rate limited for this pocket");
+      const pocket = new PublicKey(v.intent.pocket);
+      const inMint = new PublicKey(v.intent.inMint);
+      const outMint = new PublicKey(v.intent.outMint);
+      if (!pocketLimiter.allow(pocket.toBase58())) throw new HttpError(429, "rate limited for this pocket");
 
-    if (inFlight >= 8) throw new HttpError(503, "solver busy; retry the same signed intent");
-    inFlight += 1;
-    try {
-      const result = await submissions.submit(v, async minimumSlot => {
-        const inPrice = await prices.priceFor(inMint);
-        const outPrice = await prices.priceFor(outMint);
-        if ((!inPrice || !outPrice) && (!deps.allowUnpriced || deps.planner.funding !== "intent-input")) {
-          throw new HttpError(400, "unpriced trades require an enabled intent-funded swap planner");
-        }
-        const economics = checkEconomics(v.intent, { in: inPrice, out: outPrice },
-          deps.maxQuoteSpreadBps ?? 100, deps.allowUnpriced ?? false);
-        if (!economics.ok) throw new HttpError(400, economics.reason ?? "quote refused");
-        return prepare(v, pocket, inMint, outMint, minimumSlot);
-      });
-      return { status: ["preparing", "pending", "unknown"].includes(result.state) ? 202 : 200,
-        json: result, headers: { "cache-control": "no-store" } };
-    } catch (error) {
-      if (error instanceof HttpError) throw error;
-      if (error instanceof NonceConflictError) throw new HttpError(409, error.message);
-      if (error instanceof IntentAuthorizationError) throw new HttpError(403, "intent is not authorized by the current pocket");
-      throw new HttpError(503, "intent preparation unavailable; retry the identical signed intent");
-    } finally { inFlight -= 1; }
+      try {
+        const result = await submissions.submit(v, async minimumSlot => {
+          const inPrice = await prices.priceFor(inMint);
+          const outPrice = await prices.priceFor(outMint);
+          if ((!inPrice || !outPrice) && (!deps.allowUnpriced || deps.planner.funding !== "intent-input")) {
+            throw new HttpError(400, "unpriced trades require an enabled intent-funded swap planner");
+          }
+          const economics = checkEconomics(v.intent, { in: inPrice, out: outPrice },
+            deps.maxQuoteSpreadBps ?? 100, deps.allowUnpriced ?? false);
+          if (!economics.ok) throw new HttpError(400, economics.reason ?? "quote refused");
+          return prepare(v, pocket, inMint, outMint, minimumSlot);
+        });
+        return { status: ["preparing", "pending", "unknown"].includes(result.state) ? 202 : 200,
+          json: result, headers: { "cache-control": "no-store" } };
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        if (error instanceof NonceConflictError) throw new HttpError(409, error.message);
+        if (error instanceof IntentAuthorizationError) throw new HttpError(403, "intent is not authorized by the current pocket");
+        throw new HttpError(503, "intent preparation unavailable; retry the identical signed intent");
+      }
+    } finally { release(); }
   });
 
   async function prepare(v: ValidatedIntent, pocket: PublicKey, inMint: PublicKey, outMint: PublicKey, minimumSlot: number) {
@@ -197,7 +213,10 @@ export function buildServer(deps: SolverDeps): Server {
     });
   }
 
-  return router.server();
+  const server = Object.assign(router.server(), { operations });
+  server.once("listening", () => operations.start());
+  server.once("close", () => operations.stop());
+  return server;
 }
 
 function webauthnMessage(v: ValidatedIntent): Uint8Array {

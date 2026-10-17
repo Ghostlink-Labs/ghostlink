@@ -1,6 +1,6 @@
 # Indexer recovery and operations
 
-The hosted indexer rebuilds registry/census trees and derived Pocket history from **finalized** RPC transactions. It captures one chain-head slot per scan, stages history in a scoped SQLite spool, and applies it in chronological order. Newer transactions wait for the next scan. The SDK must still verify served roots and current authorization against the chain; the indexer does not grant bot permission.
+The hosted indexer rebuilds registry/census trees and derived Pocket history from **finalized** RPC transactions. It reads both on-chain tree accounts in one contextual request and saves that slot, both leaf counts and both current roots as the scan's authenticated anchor. It stages history in a scoped SQLite spool and applies it in chronological order through that slot. Newer transactions wait for the next scan. The SDK must still verify served roots and current authorization against the chain; the indexer does not grant bot permission.
 
 ## Catch-up and consistency
 
@@ -12,7 +12,9 @@ Successful transaction reads must match the requested signature and saved slot. 
 
 The hosted `/webhook` requires the configured shared secret and returns HTTP 202 as a polling hint. It does **not** apply webhook logs to checkpoint state. This prevents late webhook delivery from reordering Pocket state around the ordered poller. The lower-level in-process server still supports direct fixture/offline ingestion, which has no hosted ordering/readiness guarantee.
 
-RPC pagination is provider evidence, not a proof that every historical transaction was returned. Fresh bootstrap needs an archival provider covering the deployment's complete history. Keep independent root/history reconciliation as a release gate. Do not reset cursors or delete state to conceal missing history.
+Before accepting a completed scan, both rebuilt tree counts and roots must exactly match the saved finalized anchor. A mismatch preserves the active scan and applied checkpoint, does not advance the completed-scan slot, and refuses readiness. The original anchor survives partial-scan restart; a later account read cannot replace it. Missing accounts, wrong owners/discriminators/layouts, invalid counts/cursors/field encodings and regressing RPC contexts are refused. This also catches a falsely empty history result when an on-chain tree is nonempty.
+
+RPC pagination and account responses are still provider evidence. Matching roots verifies the reconstructed tree contents, not every Pocket event, historical binding field, provider honesty or complete business history. Fresh bootstrap needs an archival provider covering the deployment's complete history. Independent provider/business-history reconciliation remains a release gate. Do not reset cursors or delete state to conceal missing history.
 
 ## Configuration and migration
 
@@ -43,7 +45,7 @@ INDEXER_GENESIS_HASH=<approved-local-validator-genesis> \
 
 The initializer writes a fresh key, database, scope and final `deployment.json` completion manifest. It makes no network calls and starts no service. Store the manifest's `stateId` independently in operator configuration; do not derive it from whichever database happens to be mounted at startup. Existing directories are refused. Preserve partial output after an interrupted initialization for inspection. Known devnet/mainnet genesis hashes are refused while this candidate has no verified public deployment.
 
-Older SQLite state without these records is also refused, rather than silently upgraded. This is a coordinated migration: preserve old state, rebuild/check the finalized roots and history independently, then switch clients. A JSON snapshot is not silently imported as a trusted production checkpoint. The existing V1 deployment is unchanged.
+Older SQLite state without these records is also refused, rather than silently upgraded. A legacy in-progress scan without a tree anchor is preserved and refused by the hosted poller; do not invent an anchor from today's accounts. Stop the old worker at an idle scan boundary before updating, or preserve its state and perform a reviewed rebuild separately. An idle compatible database takes a fresh anchor on its next scan and must reconcile before serving. A JSON snapshot is not silently imported as a trusted production checkpoint. The existing V1 deployment is unchanged.
 
 State is scoped to the genesis, ordered program IDs and commitment. Checkpoint, scan-position and ownership records are authenticated/encrypted; public signatures, slots and ordering indexes are stored as SQLite metadata. An idle scan has an explicit null checkpoint, so deletion cannot masquerade as inactivity. Authenticated counts of pending transactions, program memberships, scanned signatures and ordering edges are updated atomically with spool changes and checked before admission, application, completion and readiness. Missing rows stop progress instead of silently skipping history. A missing snapshot can never be replaced by the poller's empty in-memory store.
 
@@ -55,11 +57,13 @@ The default envelope is 1,000,000 pending transactions, up to three times that m
 
 ## Readiness and shutdown
 
-`/health` preserves diagnostic liveness/polling status. `/ready` returns 200 only when this worker still owns the pinned state with required checkpoint records and consistent spool counts, its last scan completed without a polling error, and both successful ingestion and observed head advancement are less than 30 seconds old. Missing state, catch-up, stale/frozen head, lost ownership and drain return 503. No fresh head does not prove an RPC is dishonest, but it is insufficient readiness evidence. These checks do not independently verify provider history completeness or current root-ring membership.
+`/health` preserves diagnostic liveness/polling status. `/ready` returns 200 only when this worker still owns the pinned state with required checkpoint records and consistent spool counts, its last scan matched its finalized anchor without a polling error, and successful ingestion, observed head advancement and root-availability checks are less than 30 seconds old. After a reconciled scan, one contextual **confirmed** account read verifies that both indexed roots still occupy their expected positions in the accepted 128-root rings. A root overwritten by 128 later appends is unavailable. Contradictory or regressing accounts fail closed. Confirmed availability does not replace finalized ingestion.
+
+The hosted roots, paths, leaves, bindings, census, Pocket/activity and stats routes return 503 while unready, including during a scan. They do not serve partially rebuilt state as usable proof inputs. Missing state, omitted tree history, expired roots, catch-up, stale/frozen head, lost ownership and drain all refuse admission. A root-probe outage retains an already reconciled checkpoint for the next scan; it does not discard history. `/health` exposes `rootReconciliationRequired`, `rootsUsable` and `rootsCheckedAt` for diagnosis, not a promise of future proof acceptance.
 
 SIGTERM/SIGINT stops new webhooks and polling admission. An already admitted page or transaction finishes and checkpoints; the service waits up to 30 seconds before forced termination. The durable checkpoint remains authoritative after either exit. The process does not save an unrelated final JSON snapshot while an asynchronous poll is still running.
 
-Finality introduces delay. High registry/census turnover can evict an indexed root from the program's accepted root ring before proof submission. Test root-ring availability, owner onboarding latency and required ingestion throughput under representative traffic; do not remove finality or change the ring merely to make a readiness endpoint green. Confirmed-fork rollback and production archival/provider guarantees are separate release requirements.
+Finality introduces delay. High registry/census turnover can evict an indexed root from the program's accepted root ring before proof submission, even after a successful availability check. Readiness is recent evidence, not a root reservation. Test sustained root-ring availability, owner onboarding latency and required ingestion throughput under representative traffic; do not remove finality or change the ring merely to make readiness green. Confirmed-fork rollback and production archival/provider guarantees are separate release requirements.
 
 ## Reproduction
 
@@ -72,6 +76,6 @@ node services/indexer/test/drain-drill.mjs
 INDEXER_FINALIZED_DRILL=1 bash scripts/localnet-e2e.sh
 ```
 
-Tests cover missing/truncated logs, repeated pages, bounded multi-tick history, restart during pagination, same-slot cross-program ordering, a real child exit after checkpoint, actual SQLite rollback, ownership takeover/fencing, readiness and hosted webhook hints. The Unix process drill holds a transaction read, sends SIGTERM, releases the response, then checks that restart retains the cursor without replay. The local validator verifies actual tree roots and the complete SDK/pocket flow. Live archival acceptance, production load/soak, alerts, coordinated migration and the [mainnet release gates](MAINNET-READINESS.md) remain open.
+Tests cover missing/truncated logs, repeated pages, bounded multi-tick history, restart with the original anchor while the chain advances, same-slot cross-program ordering, a real child exit after checkpoint, actual SQLite rollback, ownership takeover/fencing, omitted/conflicting trees, malformed accounts, stale contexts, ring eviction, HTTP refusal and hosted webhook hints. The Unix process drill holds a transaction read, sends SIGTERM, releases the response, then checks that restart retains the cursor without replay. The local validator rejects omitted history against actual finalized accounts, reconciles roots, and exercises the complete SDK/pocket flow. Live archival acceptance, production load/soak, alerts, coordinated migration and the [mainnet release gates](MAINNET-READINESS.md) remain open.
 
-RPC semantics: [signature pagination](https://solana.com/docs/rpc/http/getsignaturesforaddress) and [transaction identity and metadata](https://solana.com/docs/rpc/http/gettransaction).
+RPC semantics: [contextual account reads](https://solana.com/docs/rpc/http/getmultipleaccounts), [signature pagination](https://solana.com/docs/rpc/http/getsignaturesforaddress) and [transaction identity and metadata](https://solana.com/docs/rpc/http/gettransaction).

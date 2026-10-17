@@ -213,8 +213,8 @@ async function main() {
   const store = new IndexerStore();
   const finalizedIndexer = process.env.INDEXER_FINALIZED_DRILL === "1";
   const poller = new Poller(serviceConnection, store, undefined, undefined, finalizedIndexer ? "finalized" : "confirmed",
-    finalizedIndexer ? { maximumPages: 1, maximumTransactions: 1 } : {});
-  const indexerUrl = await listen(buildIndexer(store, { poller: poller.status }), 8787);
+    finalizedIndexer ? { maximumPages: 1, maximumTransactions: 1, reconcileRoots: true } : {});
+  const indexerUrl = await listen(buildIndexer(store, { poller: poller.status, database: poller.database }), 8787);
   relayerFixture = await startRelayerFixture(serviceConnection, payer, keepRunning ? demoPortBase + 1 : 0);
   const relayerUrl = relayerFixture.url;
   const relayerClient = new RelayerClient(relayerUrl);
@@ -337,6 +337,19 @@ async function main() {
       if (Date.now() > deadline) throw new Error("initial relayer transactions did not finalize");
       await new Promise(resolve => setTimeout(resolve, 250));
     }
+    // Keep real account evidence but omit provider history: the indexer must refuse false readiness.
+    const omittedStore = new IndexerStore();
+    const omittedConnection = {
+      getMultipleAccountsInfoAndContext: serviceConnection.getMultipleAccountsInfoAndContext.bind(serviceConnection),
+      getSignaturesForAddress: async () => [],
+    } as unknown as Connection;
+    const omitted = new Poller(omittedConnection, omittedStore, undefined, undefined, "finalized", { reconcileRoots: true, paceMs: 0 });
+    try {
+      let refused = false;
+      try { await omitted.tick(); } catch (error) { refused = error instanceof Error && /match finalized scan anchor/.test(error.message); }
+      if (!refused || omitted.database.through() !== 0 || !omitted.database.scan()?.treeAnchor) throw new Error("omitted real tree history was accepted");
+      ok("indexer refused omitted RPC history against actual finalized registry/census accounts");
+    } finally { omitted.database.close(); }
   }
   let initialHistoryReady = false;
   for (let ticks = 0; ticks < 100; ticks++) {
@@ -347,7 +360,10 @@ async function main() {
     if (!poller.status.catchingUp) await new Promise(resolve => setTimeout(resolve, 250));
   }
   if (!initialHistoryReady) throw new Error("indexer did not ingest the confirmed registration and census records");
-  if (finalizedIndexer) ok("finalized indexer caught up with one page/transaction per tick and preserved chronological roots");
+  if (finalizedIndexer) {
+    if (!poller.status.rootsUsable || (await fetch(`${indexerUrl}/ready`)).status !== 200) throw new Error("indexer finalized roots were not reconciled and usable");
+    ok("finalized indexer reconciled both trees at the saved scan slot and checked confirmed root-ring availability");
+  }
   ok(`indexer ingested ${store.registryLeaves.length} registry + ${store.censusLeaves.length} census leaves`);
 
   // ---- prove login (SDK + indexer witness) ---------------------------------

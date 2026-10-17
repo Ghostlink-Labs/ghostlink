@@ -22,7 +22,7 @@ async function main() {
     try { database = IndexerDatabase.openExisting(path, key, JSON.stringify({ genesisHash, programs: [REGISTRY, CENSUS, POCKET].map(p => p.toBase58()), commitment: "finalized" }), stateId); }
     finally { key.fill(0); }
     const store = new IndexerStore(undefined, snapshot => database!.save(snapshot));
-    const poller = new Poller(rpc.connection, store, undefined, undefined, "finalized", { database,
+    const poller = new Poller(rpc.connection, store, undefined, undefined, "finalized", { database, reconcileRoots: true,
       maximumPages: Number(process.env.INDEXER_PAGES_PER_TICK ?? 4),
       maximumTransactions: Number(process.env.INDEXER_TRANSACTIONS_PER_TICK ?? 32),
       maximumTickMs: Number(process.env.INDEXER_TICK_BUDGET_MS ?? 10_000),

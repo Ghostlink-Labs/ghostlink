@@ -15,6 +15,7 @@ import { POCKET, REGISTRY, CENSUS, POCKET_ACCOUNT_SIZE, pocketPda } from "@ghost
 import { RelayerJournal } from "@ghostlink/relayer/journal";
 import { WatcherState } from "@ghostlink/watcher";
 import { IndexerDatabase } from "../../indexer/dist/database.js";
+import { emptyTreeAccounts } from "../../indexer/test/tree-fixture.mjs";
 
 const marker = "SYNTHETIC_SERVICE_RPC_SECRET";
 const genesis = Keypair.generate().publicKey.toBase58();
@@ -64,7 +65,8 @@ async function provider() {
       if (call.method === "getSignaturesForAddress") return reply([]);
       if (call.method === "getLatestBlockhash") return reply({ context: { slot }, value: { blockhash: genesis, lastValidBlockHeight: 1000 } });
       if (call.method === "getSlot") return reply(++slot);
-      if (call.method === "getMultipleAccounts") return reply({ context: { slot }, value: [{ owner: POCKET.toBase58(), executable: false, lamports: 1, rentEpoch: 0, data: [pocketData.toString("base64"), "base64"] }] });
+      if (call.method === "getMultipleAccounts") return reply({ context: { slot: ++slot }, value: call.params[0].length === 2 ? emptyTreeAccounts(call.params[0]) :
+        [{ owner: POCKET.toBase58(), executable: false, lamports: 1, rentEpoch: 0, data: [pocketData.toString("base64"), "base64"] }] });
       if (call.method === "getBlockHeight") return reply(slot);
       if (call.method === "getFeeForMessage") return reply({ context: { slot }, value: 10000 });
       if (call.method === "sendTransaction") {
@@ -153,6 +155,7 @@ try {
   assert(!unfundedConfig.output.includes(marker), "funded watcher configuration failure exposed diagnostics");
   const indexer = await start("indexer");
   await until(async () => Boolean((await health(indexer))?.poller?.lastSuccessAt), "indexer did not ingest through fallback");
+  await until(() => ready(indexer), "indexer did not reconcile trees through fallback");
   assert(primary.calls.every(method => method === "getGenesisHash"), "wrong-chain provider received ingestion requests");
   secondary.mode = "semantic";
   await until(async () => (await health(indexer))?.ok === false, "indexer did not report polling refusal");

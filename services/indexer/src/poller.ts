@@ -4,16 +4,20 @@ import type { Connection, PublicKey } from "@solana/web3.js";
 import { CENSUS, POCKET, REGISTRY, decodeLogs, decodeEventData } from "@ghostlink/service-kit";
 import { IndexerDatabase } from "./database.js";
 import type { IndexerStore } from "./store.js";
+import { captureTreeAnchor, rootsUsable, storeHeads } from "./reconciliation.js";
 
 export interface PollerStatus {
   lastTickAt: string | null; lastSuccessAt: string | null; lastError: string | null;
   lastHeadAdvancedAt: string | null;
+  rootReconciliationRequired: boolean; rootsUsable: boolean; rootsCheckedAt: string | null;
   appliedTotal: number; inFlight: boolean; catchingUp: boolean; pendingTransactions: number; appliedThroughSlot: number;
 }
-export interface PollerOptions { database?: IndexerDatabase; maximumPages?: number; maximumTransactions?: number; maximumTickMs?: number; paceMs?: number }
+export interface PollerOptions { database?: IndexerDatabase; maximumPages?: number; maximumTransactions?: number; maximumTickMs?: number; paceMs?: number; reconcileRoots?: boolean }
 export class Poller {
   private head = -1;
+  private confirmedRootSlot = 0;
   readonly status: PollerStatus = { lastHeadAdvancedAt: null, lastTickAt: null, lastSuccessAt: null, lastError: null, appliedTotal: 0, inFlight: false,
+    rootReconciliationRequired: false, rootsUsable: false, rootsCheckedAt: null,
     catchingUp: true, pendingTransactions: 0, appliedThroughSlot: 0 };
   readonly database: IndexerDatabase;
   private draining = false;
@@ -25,6 +29,9 @@ export class Poller {
     private readonly programs: PublicKey[] = [REGISTRY, CENSUS, POCKET], private readonly pageSize = 1000,
     private readonly commitment: "confirmed" | "finalized" = "confirmed", options: PollerOptions = {}) {
     this.maximumPages = options.maximumPages ?? 4; this.maximumTransactions = options.maximumTransactions ?? 32;
+    this.status.rootReconciliationRequired = options.reconcileRoots === true;
+    if (options.reconcileRoots && (commitment !== "finalized" || programs.length !== 3 ||
+      ![REGISTRY, CENSUS, POCKET].every((p, i) => p.equals(programs[i]!)))) throw new Error("tree reconciliation requires the complete finalized protocol scan");
     this.maximumTickMs = options.maximumTickMs ?? 10_000; this.paceMs = options.paceMs ?? 120;
     for (const n of [pageSize, this.maximumPages, this.maximumTransactions, this.maximumTickMs]) if (!Number.isSafeInteger(n) || n < 1) throw new Error("invalid indexer work limits");
     if (this.maximumPages > 100 || this.maximumTransactions > 1000 || this.maximumTickMs > 30_000 || this.paceMs > 1000 || pageSize > 1000 || !programs.length || new Set(programs.map(p => p.toBase58())).size !== programs.length || !Number.isSafeInteger(this.paceMs) || this.paceMs < 0) throw new Error("invalid indexer scan configuration");
@@ -38,17 +45,20 @@ export class Poller {
   async tick(): Promise<number> {
     if (this.status.inFlight || this.draining) return 0;
     this.status.inFlight = true; this.status.lastTickAt = new Date().toISOString();
+    if (this.status.rootReconciliationRequired) { this.status.catchingUp = true; this.status.rootsUsable = false; }
     const deadline = Date.now() + this.maximumTickMs;
     const available = () => !this.draining && Date.now() < deadline;
     let applied = 0;
     try {
       this.database.renew();
       if (!this.database.scan()) {
-        const head = await this.connection.getSlot(this.commitment);
+        const anchor = this.status.rootReconciliationRequired ? await captureTreeAnchor(this.connection, this.database.through()) : undefined;
+        const head = anchor?.slot ?? await this.connection.getSlot(this.commitment);
         if (!available()) return 0;
         if (head > this.head) { this.head = head; this.status.lastHeadAdvancedAt = new Date().toISOString(); }
-        this.database.begin(head, this.programs.map(p => p.toBase58()), this.store.cursors);
+        this.database.begin(head, this.programs.map(p => p.toBase58()), this.store.cursors, anchor);
       }
+      if (this.status.rootReconciliationRequired && !this.database.scan()!.treeAnchor) throw new Error("legacy scan has no tree anchor; preserve state for reviewed rebuild");
       let pages = 0;
       while (pages < this.maximumPages && available()) {
         const scan = this.database.scan()!;
@@ -87,10 +97,18 @@ export class Poller {
           processed++;
         }
       }
-      const complete = this.database.finish();
+      const anchor = this.database.scan()!.treeAnchor;
+      const complete = this.database.finish(this.status.rootReconciliationRequired ? storeHeads(this.store) : undefined);
       this.status.pendingTransactions = this.database.pending(); this.status.catchingUp = !complete;
       this.status.appliedThroughSlot = this.database.through();
-      if (complete) this.status.lastSuccessAt = new Date().toISOString();
+      if (complete) {
+        if (this.status.rootReconciliationRequired && available()) {
+          const evidence = await rootsUsable(this.connection, anchor!, this.confirmedRootSlot);
+          this.confirmedRootSlot = evidence.slot; this.status.rootsUsable = evidence.usable;
+          this.status.rootsCheckedAt = new Date().toISOString();
+        }
+        this.status.lastSuccessAt = new Date().toISOString();
+      }
       this.status.lastError = null;
       return applied;
     } catch (error) { this.status.lastError = "ingestion failed; preserving the durable checkpoint"; this.status.catchingUp = true; throw error; }

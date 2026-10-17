@@ -25,14 +25,21 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   // Webhook batches can be large; everything else is tiny.
   const router = new Router({ maxBodyBytes: 1024 * 1024 });
   let draining = false, active = 0;
-  router.get("/ready", async () => {
+  const ready = () => {
     const status = options.poller;
-    let owned = false;
-    try { options.database?.assertOwned(); owned = Boolean(options.database); } catch { /* Fail closed without exposing storage diagnostics. */ }
     const fresh = (value: string | null) => value !== null && Date.now() - Date.parse(value) >= 0 && Date.now() - Date.parse(value) < 30_000;
-    const ready = !draining && owned && status && !status.catchingUp && status.lastError === null &&
-      fresh(status.lastSuccessAt) && fresh(status.lastHeadAdvancedAt);
-    return { status: ready ? 200 : 503, json: { ready: Boolean(ready) } };
+    // Refuse known catch-up before counting a potentially large spool on a public read.
+    if (draining || !status || status.catchingUp || status.lastError !== null ||
+      !fresh(status.lastSuccessAt) || !fresh(status.lastHeadAdvancedAt) ||
+      (status.rootReconciliationRequired && (!status.rootsUsable || !fresh(status.rootsCheckedAt)))) return false;
+    try { options.database?.assertOwned(); return Boolean(options.database); }
+    catch { return false; } // Keep storage diagnostics private.
+  };
+  const requireReconciled = () => {
+    if (options.poller?.rootReconciliationRequired && !ready()) throw new HttpError(503, "indexer is not ready; reconciled history and usable roots are required");
+  };
+  router.get("/ready", async () => {
+    const available = ready(); return { status: available ? 200 : 503, json: { ready: available } };
   });
 
   router.get("/health", async () => ({
@@ -46,6 +53,7 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   }));
 
   router.get("/roots/:tree", async ({ params }) => {
+    requireReconciled();
     const tree = params.tree === "registry" ? "registry" : params.tree === "census" ? "census" : null;
     if (!tree) return { status: 404, json: { error: "unknown tree" } };
     const t = tree === "registry" ? store.registry : store.census;
@@ -55,6 +63,7 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   });
 
   router.get("/path/:tree/:leafIndex", async ({ params }) => {
+    requireReconciled();
     const tree = params.tree === "registry" ? store.registry : params.tree === "census" ? store.census : null;
     if (!tree) return { status: 404, json: { error: "unknown tree" } };
     if (!/^(0|[1-9][0-9]{0,15})$/.test(params.leafIndex ?? "")) return { status: 400, json: { error: "bad leaf index" } };
@@ -76,6 +85,7 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
    * and compute its own path without ever naming the leaf it wants.
    */
   router.get("/leaves/:tree", async ({ params, query }) => {
+    requireReconciled();
     const leaves = params.tree === "registry" ? store.registryLeaves : params.tree === "census" ? store.censusLeaves : null;
     if (!leaves) return { status: 404, json: { error: "unknown tree" } };
     const from = pageInteger(query.get("from"), 0, 0, Number.MAX_SAFE_INTEGER, "from");
@@ -86,12 +96,14 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   });
 
   router.get("/registry/binding/:wallet", async ({ params }) => {
+    requireReconciled();
     const binding = store.bindings.get(params.wallet ?? "");
     if (!binding) return { status: 404, json: { error: "not registered" } };
     return { json: { leafIndex: binding.leafIndex, commitment: binding.commitmentHex, slot: "0" } };
   });
 
   router.get("/census/latest", async ({ query }) => {
+    requireReconciled();
     const wallet = query.get("wallet");
     const mint = query.get("mint");
     if (!wallet || !mint) return { status: 400, json: { error: "wallet and mint required" } };
@@ -103,24 +115,27 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   // ---- dashboard API -----------------------------------------------------
 
   router.get("/pockets/:appIdHex", async ({ params }) => {
+    requireReconciled();
     const entry = store.pocketByAppId(params.appIdHex ?? "");
     if (!entry) return { status: 404, json: { error: "no pocket for this app id" } };
     return { json: entry };
   });
 
   router.get("/activity/:pocket", async ({ params, query }) => {
+    requireReconciled();
     const limit = pageInteger(query.get("limit"), 50, 1, 200, "limit");
     return { json: { pocket: params.pocket, events: store.activityFor(params.pocket!, limit) } };
   });
 
-  router.get("/stats", async () => ({
-    json: {
+  router.get("/stats", async () => {
+    requireReconciled();
+    return { json: {
       registrations: store.registryLeaves.length,
       snapshots: store.censusLeaves.length,
       pockets: store.pockets.size,
       activity: store.activity.length,
-    },
-  }));
+    } };
+  });
 
   /**
    * Webhook ingestion: a Helius raw-transaction webhook array (each item

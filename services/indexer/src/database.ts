@@ -3,8 +3,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { EncryptedSqlite } from "@ghostlink/service-kit/storage";
 import type { ConfirmedSignatureInfo } from "@solana/web3.js";
 import { IndexerStore, type Snapshot } from "./store.js";
+import { assertAnchor, assertTreeMatch, type TreeAnchor, type TreeHeads } from "./reconciliation.js";
 
 export interface Scan { upperSlot: number; programs: string[]; nextProgram: number;
+  treeAnchor?: TreeAnchor;
   counts: Record<SpoolTable, number>;
   positions: Record<string, { until?: string; before?: string; previous?: { signature: string; slot: number }; done: boolean }> }
 const spoolTables = ["pending", "members", "scanned", "edges"] as const;
@@ -84,6 +86,7 @@ export class IndexerDatabase {
     if (scan !== null && (!scan.counts || !Array.isArray(scan.programs) || !scan.programs.length ||
       !Number.isInteger(scan.nextProgram) || scan.nextProgram < 0 || scan.nextProgram > scan.programs.length ||
       slotValue(scan.upperSlot) < through || !scan.positions || scan.programs.some(program => !scan.positions[program]))) throw new Error("invalid indexer scan checkpoint");
+    if (scan?.treeAnchor !== undefined) { assertAnchor(scan.treeAnchor); if (scan.treeAnchor.slot !== scan.upperSlot) throw new Error("indexer anchor slot mismatch"); }
     for (const table of spoolTables) {
       const expected = scan === null ? 0 : scan.counts[table];
       const actual = Number(this.#storage.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!.n);
@@ -120,12 +123,13 @@ export class IndexerDatabase {
   scan(): Scan | undefined { this.#owned(); return this.#get<Scan | null>("scan") ?? undefined; }
   through(): number { this.#owned(); return slotValue(this.#get<number>("through")!); }
   pending(): number { this.#owned(); return Number(this.#storage.db.prepare("SELECT COUNT(*) AS n FROM pending").get()!.n); }
-  begin(upperSlot: number, programs: string[], cursors: Map<string, string>): void {
+  begin(upperSlot: number, programs: string[], cursors: Map<string, string>, treeAnchor?: TreeAnchor): void {
     this.#storage.transaction(() => {
       this.assertOwned(); slotValue(upperSlot);
       if (this.scan() || this.pending()) throw new Error("indexer scan already active");
       if (upperSlot < this.through()) throw new Error("indexer chain head regressed");
-      this.#put("scan", { upperSlot, programs, nextProgram: 0, counts: emptyCounts(),
+      if (treeAnchor) { assertAnchor(treeAnchor); if (treeAnchor.slot !== upperSlot) throw new Error("indexer anchor slot mismatch"); }
+      this.#put("scan", { upperSlot, programs, treeAnchor, nextProgram: 0, counts: emptyCounts(),
         positions: Object.fromEntries(programs.map(p => [p, { until: cursors.get(p), done: false }])) } satisfies Scan);
     });
   }
@@ -196,9 +200,15 @@ export class IndexerDatabase {
       scan.counts.pending--; this.#put("scan", scan);
     });
   }
-  finish(): boolean {
+  finish(heads?: TreeHeads): boolean {
     return this.#storage.transaction(() => {
       this.assertOwned(); const scan = this.scan(); if (!scan || scan.nextProgram < scan.programs.length || this.pending()) return false;
+      if (scan.treeAnchor) {
+        if (!heads) throw new Error("indexer tree reconciliation required");
+        assertTreeMatch(scan.treeAnchor, heads);
+        const snapshot = this.#checkpoint();
+        if (snapshot.registryLeaves.length !== heads.registry.nextIndex || snapshot.censusLeaves.length !== heads.census.nextIndex) throw new Error("indexer snapshot changed during reconciliation");
+      }
       this.#storage.db.prepare("DELETE FROM scanned").run(); this.#put("through", scan.upperSlot); this.#put("scan", null); return true;
     });
   }

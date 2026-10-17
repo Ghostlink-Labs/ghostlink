@@ -13,6 +13,7 @@ import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { REGISTRY, CENSUS, POCKET } from "@ghostlink/service-kit";
 import { IndexerDatabase } from "../dist/database.js";
+import { emptyTreeAccounts } from "./tree-fixture.mjs";
 
 if (process.platform === "win32") throw new Error("This drill requires real Unix signal delivery");
 const dir = mkdtempSync(join(tmpdir(), "indexer-drain-")), key = randomBytes(32), genesisHash = Keypair.generate().publicKey.toBase58();
@@ -26,6 +27,7 @@ const provider = createServer(async (req, res) => {
   const call = JSON.parse(raw), reply = result => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result })); };
   if (call.method === "getGenesisHash") return reply(genesisHash);
   if (call.method === "getSlot") return reply(10);
+  if (call.method === "getMultipleAccounts") return reply({ context: { slot: 10 }, value: emptyTreeAccounts(call.params[0]) });
   if (call.method === "getSignaturesForAddress") return reply(call.params[0] === REGISTRY.toBase58() ? [{ signature, slot: 10, err: null, memo: null, blockTime: null, confirmationStatus: "finalized" }] : []);
   if (call.method === "getTransaction") {
     transactionReads++;

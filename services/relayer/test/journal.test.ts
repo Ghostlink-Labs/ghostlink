@@ -158,7 +158,7 @@ describe("relayer backup quarantine and retained-history reconciliation", () => 
     expect(cli(["rotate", nextFile], file).status).toBe(0);
     expect(() => stale.get(id)).toThrow();
     expect(cli(["inspect", join(w.dir, "new-report.json")], file, nextFile).status).toBe(0);
-  });
+  }, 30_000); // Sequential real process startup needs its own budget on shared CI runners.
 });
 
 describe("durable relayer submissions", () => {

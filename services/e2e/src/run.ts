@@ -45,6 +45,10 @@ import {
 } from "@ghostlink/common";
 import {
   GhostLink,
+  ApplicationRegistry,
+  applicationRegistryDigest,
+  OwnerConsentController,
+  policyToDto,
   buildLoginInput,
   buildRegistration,
   deriveIdentity,
@@ -52,6 +56,7 @@ import {
   sweepDigest,
   revokeDigest,
   type Prover,
+  type ApplicationManifest,
 } from "@ghostlink/sdk";
 import { verifyLogin } from "@ghostlink/verify";
 import {
@@ -317,7 +322,8 @@ async function main() {
   botFixture = await startBotFixture(connection, origin, policy);
   const request = { requestKey: "ab".repeat(16), appId: deriveAppId(identity.sField, deriveDomainHash(origin)).toString(),
     home: home.toBase58(), sessionExpirySlot: expirySlot.toString() };
-  let { consent } = await botFixture.create(request);
+  const consentStatus = await botFixture.create(request);
+  let { consent } = consentStatus;
   const session = sessionPublicKey(0, hexToBytes(consent.sessionKeyHex));
   ok("authenticated bot request created; owner received only the public session key");
   const loginInputFor = (signer: typeof session, expires: bigint) => buildLoginInput({
@@ -346,21 +352,31 @@ async function main() {
     },
   });
   const { input, appId, domainHash } = loginInputFor(session, expirySlot);
-  const rawLogin = await prover.prove("login", input);
-  const loginProof = {
-    appId,
-    proof: proofToBytes(rawLogin.proof as SnarkjsProof),
-    snarkjsProof: rawLogin.proof as object,
-    publicSignals: rawLogin.publicSignals,
-    publicInputBytes: publicSignalsToBytes(rawLogin.publicSignals),
-  };
-  ok("login proof made on this machine");
+  const now = Math.floor(Date.now() / 1000);
+  let ownerManifest: ApplicationManifest = { version: 1, revision: 1, ownerOrigin: botFixture.ownerOrigin,
+    deployment: botFixture.deployment, issuedAt: now, expiresAt: now + 3600, applications: [{
+      id: "fixture-bot", name: "Fixture Bot", appOrigin: origin, authorizationBaseUrl: botFixture.authorizationBaseUrl,
+      telegramBotId: botFixture.botId, status: "enabled", policy: policyToDto(policy),
+    }] };
+  const ownerRegistry = new ApplicationRegistry(ownerManifest, applicationRegistryDigest(ownerManifest));
+  const ownerConsent = new OwnerConsentController({ registry: ownerRegistry, nodeOwnerOrigin: botFixture.ownerOrigin,
+    readChainContext: async minContextSlot => ({ genesisHash: await connection.getGenesisHash(),
+      slot: await connection.getSlot({ commitment: "confirmed", minContextSlot }) }) });
+  const ownerExpectations = { applicationId: "fixture-bot", telegramUserId: botFixture.userId, identity, home: home.toBytes(), expirySlot };
+  const ownerProofParams = { identity, prover, claim, minSlot, witness: {
+    registry: { walletPubkey: wallet.publicKey.toBytes(), ...regPath },
+    census: { ...cenPath, amount: BigInt(census.amount), slot: BigInt(census.slot) },
+  } };
+  const ownerReview = await ownerConsent.review(consentStatus, ownerExpectations);
+  const glSession = await ownerConsent.prove(ownerReview, ownerProofParams);
+  const loginProof = glSession.proof;
+  ok("pinned owner registry reviewed bot permissions; local owner controller produced login proof");
 
   // ---- server-side verification -------------------------------------------
   const vk = JSON.parse(readFileSync(join(ROOT, "circuits/keys/login_vk.json"), "utf8"));
   const verdict = await verifyLogin({
-    proof: rawLogin.proof as object,
-    publicSignals: rawLogin.publicSignals,
+    proof: loginProof.snarkjsProof,
+    publicSignals: loginProof.publicSignals,
     expectedDomain: origin,
     verificationKey: vk,
     indexer: indexerUrl,
@@ -370,13 +386,6 @@ async function main() {
   ok(`server-side verifyLogin ok, appId ${verdict.appId!.slice(0, 12)}…`);
 
   // ---- open the pocket session ---------------------------------------------
-  const glSession = {
-    appId,
-    appIdBase58: bs58.encode(fieldToBytes32(appId)),
-    proof: loginProof,
-    signer: session,
-    expirySlot,
-  };
   const pocketHandle = gl.pocketFor(glSession, home.toBytes(), policy);
   await gl.openSession(
     glSession,
@@ -460,11 +469,12 @@ async function main() {
       await solverFixture.prepareRecovery(pocket.toBase58(), { sessionKind: 0, sessionKeyHex: next.consent.sessionKeyHex + "00" });
       if ((await submitOld()).ok) throw new Error("restored solver traded before owner rotation");
       solverFixture.assertNoTransactions();
-      const nextSigner = sessionPublicKey(0, hexToBytes(next.consent.sessionKeyHex));
-      const nextRaw = await prover.prove("login", loginInputFor(nextSigner, nextExpiry).input);
-      const nextSession = { ...glSession, signer: nextSigner, expirySlot: nextExpiry,
-        proof: { ...loginProof, proof: proofToBytes(nextRaw.proof as SnarkjsProof), snarkjsProof: nextRaw.proof as object,
-          publicSignals: nextRaw.publicSignals, publicInputBytes: publicSignalsToBytes(nextRaw.publicSignals) } };
+      // Fixture restarts allocate a new local port. Approve that endpoint change as a linked registry revision.
+      ownerManifest = { ...ownerManifest, revision: ownerManifest.revision + 1, previousDigest: ownerRegistry.digest,
+        applications: ownerManifest.applications.map(a => ({ ...a, authorizationBaseUrl: botFixture!.authorizationBaseUrl })) };
+      ownerRegistry.update(ownerManifest, applicationRegistryDigest(ownerManifest));
+      const nextReview = await ownerConsent.review(next, { ...ownerExpectations, expirySlot: nextExpiry });
+      const nextSession = await ownerConsent.prove(nextReview, ownerProofParams);
       await gl.openSession(nextSession, gl.pocketFor(nextSession, home.toBytes(), policy),
         { mint: inputMint.toBytes(), threshold: claim.amount, minSlot, claim: true }, { registry: regPath.root, census: cenPath.root }, domainHash);
       const until = Date.now() + 60_000;

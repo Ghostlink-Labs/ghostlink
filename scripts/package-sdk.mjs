@@ -45,7 +45,8 @@ if (process.argv.includes("--test")) {
   writeFileSync(join(consumer, "check.mjs"), `
 import assert from 'node:assert/strict';
 import { createPublicKey, verify } from 'node:crypto';
-import { GhostLink, softwareSession, sessionPublicKey, derivePocket, signIntent, policyToDto, policyFromDto } from '@ghostlink/sdk';
+import { GhostLink, softwareSession, sessionPublicKey, derivePocket, signIntent, policyToDto, policyFromDto,
+  ApplicationRegistry, applicationRegistryDigest, OwnerConsentController, verifyTelegramOwnerInitData } from '@ghostlink/sdk';
 import { intentHash, conservativePolicy, policyHash } from '@ghostlink/common';
 const bot = softwareSession();
 const publicKey = sessionPublicKey(0, bot.key32);
@@ -65,6 +66,8 @@ const key = createPublicKey({ format: 'der', type: 'spki', key: Buffer.concat([
 assert.equal(verify(null, intentHash(signed.intent), key, signed.signature.signature), true);
 assert.deepEqual(signed.intent.policyHash, policyHash(policy));
 await assert.rejects(GhostLink.init({ cluster: 'mainnet-beta', indexer: 'https://example.invalid' }), /no verified devnet or mainnet/);
+for (const api of [ApplicationRegistry, applicationRegistryDigest, OwnerConsentController, verifyTelegramOwnerInitData]) assert.equal(typeof api, 'function');
+assert.throws(() => verifyTelegramOwnerInitData('user=forged', '12345'));
 console.log('Installed SDK: ESM import, public delegation and real intent signature verified. No network transaction sent.');
 `);
   execFileSync(process.execPath, [join(consumer, "check.mjs")], { cwd: consumer, stdio: "inherit" });
@@ -108,7 +111,11 @@ console.log('Installed bot package: dependencies, encrypted backup/restore, key 
   writeFileSync(join(consumer, "check.cjs"), "import('@ghostlink/sdk').then(sdk => { if (typeof sdk.GhostLink !== 'function') process.exit(1); console.log('CommonJS dynamic import verified'); });\n");
   execFileSync(process.execPath, [join(consumer, "check.cjs")], { cwd: consumer, stdio: "inherit" });
   writeFileSync(join(consumer, "check.mts"), `
-import { GhostLink, sessionPublicKey, type SessionAuthorizationParams, type SessionPublicKey } from '@ghostlink/sdk';
+import { GhostLink, sessionPublicKey, OwnerConsentController, type OwnerConsentOptions, type OwnerConsentExpectations,
+  type SessionAuthorizationParams, type SessionPublicKey } from '@ghostlink/sdk';
+import type { BotConsentStatus } from '@ghostlink/common';
+const review = (options: OwnerConsentOptions, status: BotConsentStatus, expected: OwnerConsentExpectations) => new OwnerConsentController(options).review(status, expected);
+void review;
 const authorize = (client: GhostLink, params: SessionAuthorizationParams) => client.authorizeSession(params);
 const key: SessionPublicKey = sessionPublicKey(0, new Uint8Array(32));
 void authorize; void key;

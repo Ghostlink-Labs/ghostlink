@@ -40,6 +40,8 @@ ES modules use `import`. CommonJS applications can use `await import('@ghostlink
 
 ## Authorize a bot without sharing the owner's secret
 
+For a shared owner application approving several bots, use the [pinned application registry and owner consent controller](../../docs/OWNER-CONSENT.md). They validate the request and derive a separate pocket for each vetted bot origin. `verifyTelegramOwnerInitData` checks Telegram's third-party signature without exposing a bot token. The product UI and real device handoff remain release gates.
+
 The bot creates a temporary session key. Only its public key crosses to the user's trusted authorization interface:
 
 ```ts
@@ -51,7 +53,7 @@ const publicSession = sessionPublicKey(0, botSigner.key32);
 const publicKeyBytes = Array.from(publicSession.key32);
 ```
 
-On the user's trusted device, after authenticating the handoff and showing the bot, pocket policy, home and expiry:
+The lower-level API below is for an application authorizing its own origin. In browsers, `client.authorizeSession` uses the current page origin; a shared owner page must use the controller linked above. After authenticating the handoff and showing the bot, policy, home and expiry:
 
 ```ts
 import { sessionPublicKey } from '@ghostlink/sdk';

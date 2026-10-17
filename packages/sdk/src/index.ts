@@ -6,4 +6,7 @@ export * from "./pocket.js";
 export * from "./ghostlink.js";
 export * from "./wallet-standard.js";
 export * from "./domains.js";
+export { ApplicationRegistry, applicationRegistryDigest, type ApplicationManifest, type TrustedApplication } from "./applications.js";
+export * from "./owner-consent.js";
+export * from "./telegram.js";
 export type { IntentSubmission } from "@ghostlink/common";

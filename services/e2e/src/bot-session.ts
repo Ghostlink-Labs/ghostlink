@@ -69,6 +69,11 @@ export async function startBotFixture(connection: Connection, appOrigin: string,
     return { body, signed, who, requestKey };
   };
   return {
+    ownerOrigin,
+    botId: "12345",
+    userId: "42",
+    get authorizationBaseUrl() { return url + "/"; },
+    get deployment() { return structuredClone(options.deployment); },
     create: (input: CreateConsent) => post("/requests", input),
     confirm: (id: string) => post(`/requests/${id}/confirm`, {}),
     restart,

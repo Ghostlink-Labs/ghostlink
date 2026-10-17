@@ -45,6 +45,9 @@ import {
 } from "@ghostlink/common";
 import {
   GhostLink,
+  RelayerClient,
+  prepareRelayerOperation,
+  type PreparedRelayerOperation,
   ApplicationRegistry,
   applicationRegistryDigest,
   OwnerConsentController,
@@ -212,6 +215,18 @@ async function main() {
   const indexerUrl = await listen(buildIndexer(store, { poller: poller.status }), 8787);
   relayerFixture = await startRelayerFixture(serviceConnection, payer, keepRunning ? demoPortBase + 1 : 0);
   const relayerUrl = relayerFixture.url;
+  const relayerClient = new RelayerClient(relayerUrl);
+  const settleRelayer = async (operation: PreparedRelayerOperation) => {
+    let receipt = await relayerClient.submit(operation);
+    const deadline = Date.now() + 60_000;
+    while (!["confirmed", "finalized", "failed"].includes(receipt.state)) {
+      if (Date.now() > deadline) throw new Error(`relayer ${operation.route} did not settle its original request`);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      receipt = await relayerClient.status(operation.requestIdHex);
+    }
+    if (receipt.state === "failed") throw new Error(`relayer ${operation.route} failed on-chain`);
+    return receipt;
+  };
   // Synthetic Pyth accounts loaded by this disposable validator's genesis.
   const priceAccounts: Record<string, string> = {
     [inputMint.toBase58()]: priceAccountFor("e2e usdc price acct").toBase58(),
@@ -268,17 +283,10 @@ async function main() {
     "devnet",
     signMessage,
   );
-  const regRes = await fetch(`${relayerUrl}/register`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      walletPubkey: wallet.publicKey.toBase58(),
-      messageHex: bytesToHex(reg.message),
-      signatureHex: bytesToHex(reg.signature),
-      commitmentHex: bytesToHex(fieldToBytes32(identity.commitment)),
-    }),
-  });
-  if (!regRes.ok) throw new Error(`register: ${await regRes.text()}`);
+  const registrationReceipt = await settleRelayer(prepareRelayerOperation("/register", {
+    walletPubkey: wallet.publicKey.toBase58(), messageHex: bytesToHex(reg.message), signatureHex: bytesToHex(reg.signature),
+    commitmentHex: bytesToHex(fieldToBytes32(identity.commitment)),
+  }));
   if (serviceRpcFixture) {
     serviceRpcFixture.assertRecovered();
     ok("relayer lost acceptance reply; fallback preserved exact signed bytes and confirmed over HTTP");
@@ -287,12 +295,9 @@ async function main() {
 
   // ---- census snapshot -----------------------------------------------------
   const holding = ataAddress(wallet.publicKey, inputMint);
-  const snapRes = await fetch(`${relayerUrl}/snapshot`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ requestIdHex: bytesToHex(label("initial census snapshot")), wallet: wallet.publicKey.toBase58(), holding: holding.toBase58() }),
-  });
-  if (!snapRes.ok) throw new Error(`snapshot: ${await snapRes.text()}`);
+  const snapshotReceipt = await settleRelayer(prepareRelayerOperation("/snapshot", {
+    wallet: wallet.publicKey.toBase58(), holding: holding.toBase58(),
+  }, bytesToHex(label("initial census snapshot"))));
   if (serviceRpcFixture) {
     const before = JSON.stringify([...store.cursors]);
     serviceRpcFixture.outage(true);
@@ -306,18 +311,25 @@ async function main() {
     ok("indexer refused provider outage without advancing its saved cursors");
   }
   if (finalizedIndexer) {
-    const target = await connection.getSlot("confirmed"), deadline = Date.now() + 60_000;
-    while (await connection.getSlot("finalized") < target) {
-      if (Date.now() > deadline) throw new Error("indexer fixture did not finalize");
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      const statuses = await connection.getSignatureStatuses([registrationReceipt.signature!, snapshotReceipt.signature!], { searchTransactionHistory: true });
+      if (statuses.value.some(status => status?.err)) throw new Error("initial relayer transaction failed before finality");
+      if (statuses.value.every(status => status?.confirmationStatus === "finalized")) break;
+      if (Date.now() > deadline) throw new Error("initial relayer transactions did not finalize");
       await new Promise(resolve => setTimeout(resolve, 250));
     }
-    for (let ticks = 0; ticks < 100; ticks++) {
-      await poller.tick();
-      if (!poller.status.catchingUp) break;
-      if (ticks === 99) throw new Error("bounded indexer backfill did not finish");
-    }
-    ok("finalized indexer caught up with one page/transaction per tick and preserved chronological roots");
-  } else await poller.tick();
+  }
+  let initialHistoryReady = false;
+  for (let ticks = 0; ticks < 100; ticks++) {
+    await poller.tick();
+    // A completed RPC scan is not proof of archival completeness. Require the known fixture effects too.
+    if (!poller.status.catchingUp && store.bindings.has(wallet.publicKey.toBase58()) &&
+        store.latestCensus.has(`${wallet.publicKey.toBase58()}:${inputMint.toBase58()}`)) { initialHistoryReady = true; break; }
+    if (!poller.status.catchingUp) await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  if (!initialHistoryReady) throw new Error("indexer did not ingest the confirmed registration and census records");
+  if (finalizedIndexer) ok("finalized indexer caught up with one page/transaction per tick and preserved chronological roots");
   ok(`indexer ingested ${store.registryLeaves.length} registry + ${store.censusLeaves.length} census leaves`);
 
   // ---- prove login (SDK + indexer witness) ---------------------------------

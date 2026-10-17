@@ -65,7 +65,7 @@ If those service ports are occupied, set `GHOSTLINK_DEMO_PORT_BASE` to a free st
 
 The headless runner provides a working integration example in `services/e2e/src/run.ts`; `bot-session.ts` exercises the bot HTTP contract and encrypted store. See the [bot integration guide](../packages/bot/README.md). The temporary bot database is cleaned up on a normal test exit; inspect and remove stale test directories after an interrupted run.
 
-Hosted service entry points have additional durable-state and approved-chain requirements; the in-process local fixture is not a production deployment. See [indexer](INDEXER-OPERATIONS.md), [relayer](RELAYER-OPERATIONS.md), [solver](SOLVER-OPERATIONS.md) and [watcher](WATCHER-OPERATIONS.md) operations before deploying them.
+Hosted service entry points have additional durable-state and approved-chain requirements; the in-process local fixture is not a production deployment. See [indexer](INDEXER-OPERATIONS.md), [relayer](RELAYER-OPERATIONS.md), [solver](SOLVER-OPERATIONS.md), [Actions](ACTIONS-OPERATIONS.md) and [watcher](WATCHER-OPERATIONS.md) operations before deploying them.
 
 ## Credentials and identity
 

@@ -11,48 +11,63 @@ import type { Server } from "node:http";
 import {
   Connection,
   PublicKey,
-  SystemProgram,
-  Transaction,
 } from "@solana/web3.js";
 import { hexToBytes } from "@ghostlink/common";
 import {
   Router,
-  ataAddress,
+  HttpError,
+  RateLimiter,
+  clientIp,
   badRequest,
-  createAtaIdempotentIx,
-  isPocketAccount,
   pocketPda,
-  splTransferIx,
 } from "@ghostlink/service-kit";
+
+import { ActionsOperations, type OperationsOptions } from "./operations.js";
+import { depositTransaction } from "./funding.js";
 
 export interface ActionsDeps {
   connection: Connection;
   /** Public origin of this endpoint, for icon/link URLs. */
   baseUrl: string;
-  /** Which chain the transactions are for; sets the X-Blockchain-Ids header. */
-  cluster?: "devnet" | "mainnet-beta";
+  /** Independently approved chain; never selected by a deposit request. */
+  genesisHash: string;
+  maxInFlight?: number;
+  trustProxy?: boolean;
+  probe?: Pick<OperationsOptions, "probeIntervalMs" | "probeTimeoutMs" | "freshnessMs" | "progressTimeoutMs" | "clock">;
 }
 
-/** CAIP-2 ids the Actions spec expects in X-Blockchain-Ids. */
-const BLOCKCHAIN_IDS = {
-  "mainnet-beta": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-  devnet: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
-};
-
-const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const MAX_SOL_DEPOSIT = 1_000_000n * 1_000_000_000n;
 
 const ICON_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="8" fill="#555"/>' +
   '<path d="M16 32h32M32 16v32" stroke="#fff" stroke-width="4"/></svg>';
 
-export function buildServer(deps: ActionsDeps): Server {
-  const router = new Router();
+export function buildServer(deps: ActionsDeps): Server & { operations: ActionsOperations } {
+  const operations = new ActionsOperations({ connection: deps.connection, genesisHash: deps.genesisHash,
+    maxInFlight: deps.maxInFlight, ...deps.probe });
+  const origin = new URL(deps.baseUrl);
+  if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/" ||
+      (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname)))) {
+    throw new Error("Actions BASE_URL must be an HTTPS origin or loopback HTTP origin");
+  }
+  const baseUrl = origin.origin;
+  const router = new Router({ errorProperty: "message" }), limiter = new RateLimiter(30, 60_000);
   const spec = {
     "x-action-version": "2.4",
-    "x-blockchain-ids": BLOCKCHAIN_IDS[deps.cluster ?? "devnet"],
+    "x-blockchain-ids": `solana:${deps.genesisHash.slice(0, 32)}`,
+    "cache-control": "no-store",
     "access-control-expose-headers": "x-action-version,x-blockchain-ids",
   };
+
+  router.get("/health", async () => ({ json: { ok: true } }));
+  router.get("/ready", async () => {
+    const { ready, checks } = operations.snapshot();
+    return { status: ready ? 200 : 503, json: { ready, checks }, headers: { "cache-control": "no-store", "retry-after": "1" } };
+  });
+  for (const path of ["/actions.json", "/actions/fund/:appIdHex"]) router.options(path, async () => ({ status: 204, headers: {
+    ...spec, "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
+    "access-control-allow-headers": "content-type,authorization,content-encoding,accept-encoding,x-action-version,x-blockchain-ids,x-accept-action-version,x-accept-blockchain-ids",
+  } }));
 
   router.get("/actions.json", async () => ({
     json: { rules: [{ pathPattern: "/actions/**", apiPath: "/actions/**" }] },
@@ -72,7 +87,8 @@ export function buildServer(deps: ActionsDeps): Server {
       headers: spec,
       json: {
         type: "action",
-        icon: `${deps.baseUrl}/icon.svg`,
+        disabled: !operations.snapshot().ready,
+        icon: `${baseUrl}/icon.svg`,
         /** The destination, so clients can compare it with their own derivation. */
         pocket,
         title: "Fund a GhostLink pocket",
@@ -85,7 +101,7 @@ export function buildServer(deps: ActionsDeps): Server {
             {
               type: "transaction",
               label: "Deposit SOL",
-              href: `${deps.baseUrl}/actions/fund/${params.appIdHex}?amount={amount}`,
+              href: `${baseUrl}/actions/fund/${params.appIdHex}?amount={amount}`,
               parameters: [{ name: "amount", label: "Amount in SOL", required: true }],
             },
           ],
@@ -94,59 +110,43 @@ export function buildServer(deps: ActionsDeps): Server {
     };
   });
 
-  router.post("/actions/fund/:appIdHex", async ({ params, query, body }) => {
-    const appId = safeAppId(params.appIdHex);
-    if (!appId) throw badRequest("bad app id");
-    const req = body as { account?: string } | undefined;
-    let user: PublicKey;
+  router.post("/actions/fund/:appIdHex", async ({ params, query, body, raw }) => {
+    if (!limiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
+    const release = operations.acquire();
+    if (!release) throw new HttpError(503, "funding service not ready or busy");
     try {
-      user = new PublicKey(req?.account ?? "");
-    } catch {
-      throw badRequest("account must be a base58 public key");
-    }
-    const pocket = pocketPda(appId);
-    if (!isPocketAccount(await deps.connection.getAccountInfo(pocket, "confirmed"), appId)) {
-      throw badRequest("no pocket is open for this app id; sign in to the app first");
-    }
-
-    const mintParam = query.get("mint");
-    const tx = new Transaction();
-    if (mintParam) {
-      // SPL deposit: user's ATA -> the pocket's ATA (created if missing).
-      let mint: PublicKey;
-      try {
-        mint = new PublicKey(mintParam);
-      } catch {
-        throw badRequest("mint must be a base58 public key");
-      }
-      const mintInfo = await deps.connection.getAccountInfo(mint, "confirmed");
-      if (!mintInfo || !mintInfo.owner.equals(TOKEN_PROGRAM)) {
-        throw badRequest("mint must be an SPL Token mint (Token-2022 is not supported in v1)");
-      }
-      const amount = parseRawAmount(query.get("rawAmount"));
-      tx.add(
-        createAtaIdempotentIx(user, pocket, mint),
-        splTransferIx(ataAddress(user, mint), ataAddress(pocket, mint), user, amount),
-      );
-    } else {
-      const lamports = parseSolAmount(query.get("amount"));
-      tx.add(SystemProgram.transfer({ fromPubkey: user, toPubkey: pocket, lamports }));
-    }
-
-    tx.feePayer = user;
-    tx.recentBlockhash = (await deps.connection.getLatestBlockhash()).blockhash;
-    const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
-    return {
-      headers: spec,
-      json: {
-        type: "transaction",
-        transaction: serialized.toString("base64"),
-        message: `Deposit into pocket ${pocket.toBase58()}`,
-      },
-    };
+      const appId = safeAppId(params.appIdHex);
+      if (!appId) throw badRequest("bad app id");
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw badRequest("account required");
+      const account = (body as { account?: unknown }).account;
+      let user: PublicKey;
+      try { if (typeof account !== "string") throw new Error(); user = new PublicKey(account); }
+      catch { throw badRequest("account must be a base58 public key"); }
+      for (const name of ["mint", "rawAmount", "amount"]) if (query.getAll(name).length > 1) throw badRequest("duplicate deposit parameter");
+      let mint: PublicKey | undefined;
+      if (query.has("mint")) {
+        try { mint = new PublicKey(query.get("mint")!); } catch { throw badRequest("mint must be a base58 public key"); }
+        if (query.has("amount")) throw badRequest("token deposits require rawAmount only");
+      } else if (query.has("rawAmount")) throw badRequest("rawAmount requires a mint");
+      const amount = mint ? parseRawAmount(query.get("rawAmount")) : parseSolAmount(query.get("amount"));
+      const tx = await depositTransaction(deps.connection, operations, user, appId, amount, mint);
+      return { headers: spec, json: { type: "transaction",
+        transaction: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64"),
+        message: `Deposit into pocket ${pocketPda(appId).toBase58()}` } };
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(503, "funding evidence unavailable; retry after checking the original request");
+    } finally { release(); }
   });
 
-  return router.server();
+  const server = Object.assign(router.server(), { operations });
+  // Chain/version headers also accompany parser/router errors and preflight responses.
+  server.prependListener("request", (_request, response) => {
+    for (const [name, value] of Object.entries(spec)) response.setHeader(name, value);
+  });
+  server.once("listening", () => operations.start());
+  server.once("close", () => operations.drain());
+  return server;
 }
 
 function safeAppId(hex: string | undefined): Uint8Array | null {

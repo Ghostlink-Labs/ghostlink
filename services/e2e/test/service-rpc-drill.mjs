@@ -1,6 +1,6 @@
 /** Synthetic providers, disposable payer, real service entry points and HTTP. No external network. */
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
@@ -11,11 +11,15 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { Keypair, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
+import { POCKET, POCKET_ACCOUNT_SIZE, pocketPda } from "@ghostlink/service-kit";
 
 const marker = "SYNTHETIC_SERVICE_RPC_SECRET";
 const genesis = Keypair.generate().publicKey.toBase58();
 const wrongGenesis = Keypair.generate().publicKey.toBase58();
 const payer = Keypair.generate();
+const appIdHex = "01".repeat(32), pocketData = Buffer.alloc(POCKET_ACCOUNT_SIZE);
+createHash("sha256").update("account:PocketV3").digest().copy(pocketData, 0, 0, 8);
+Buffer.from(appIdHex, "hex").copy(pocketData, 8); payer.publicKey.toBuffer().copy(pocketData, 72);
 const directory = mkdtempSync(join(tmpdir(), "ghostlink-service-rpc-"));
 const children = [], providers = [], accepted = new Set();
 const journalKeyPath = join(directory, "journal.key");
@@ -41,7 +45,8 @@ async function provider() {
       if (call.method === "getBalance") return reply({ context: { slot: ++slot }, value: 1_000_000_000 });
       if (call.method === "getSignaturesForAddress") return reply([]);
       if (call.method === "getLatestBlockhash") return reply({ context: { slot }, value: { blockhash: genesis, lastValidBlockHeight: 1000 } });
-      if (call.method === "getSlot") return reply(slot);
+      if (call.method === "getSlot") return reply(++slot);
+      if (call.method === "getMultipleAccounts") return reply({ context: { slot }, value: [{ owner: POCKET.toBase58(), executable: false, lamports: 1, rentEpoch: 0, data: [pocketData.toString("base64"), "base64"] }] });
       if (call.method === "getBlockHeight") return reply(slot);
       if (call.method === "getFeeForMessage") return reply({ context: { slot }, value: 10000 });
       if (call.method === "sendTransaction") {
@@ -73,7 +78,7 @@ async function start(name, extra = {}) {
   const listenPort = await port();
   let operationsPort = await port(); while (operationsPort === listenPort) operationsPort = await port();
   const env = { ...process.env, PORT: String(listenPort), OPERATIONS_PORT: String(operationsPort), NODE_ENV: "production", POLL_MS: "100",
-    RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
+    ACTIONS_GENESIS_HASH: genesis, CLUSTER: "localnet", BASE_URL: `http://localhost:${listenPort}`, RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
     GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: "", INDEXER_STATE_PATH: join(directory, "indexer.db"), INDEXER_STATE_KEY_PATH: journalKeyPath, RELAYER_BUDGET_PATH: "", RELAYER_JOURNAL_PATH: join(directory, "relayer.db"), RELAYER_JOURNAL_KEY_PATH: journalKeyPath,
     WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.sqlite"), WATCHER_STATE_KEY_PATH: journalKeyPath, WATCHER_PORT: String(listenPort), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
   const child = spawn(process.execPath, [fileURLToPath(new URL(`../../${name}/dist/index.js`, import.meta.url))], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
@@ -110,7 +115,7 @@ try {
   const primary = await provider(), secondary = await provider();
   writeFileSync(configPath, JSON.stringify([{ url: primary.url }, { url: secondary.url, headers: { authorization: marker } }]));
   primary.mode = "wrong"; secondary.mode = "wrong";
-  for (const name of ["indexer", "relayer", "watcher"]) {
+  for (const name of ["indexer", "relayer", "watcher", "actions"]) {
     const wrong = await start(name); await stopped(wrong);
     assert.notEqual(wrong.child.exitCode, 0, `${name} accepted wrong-chain startup`);
     assert.equal(await health(wrong), null);
@@ -145,6 +150,25 @@ try {
   await until(() => watcher.output.includes("watcher poll failed"), "watcher did not report polling failure");
   await stop(watcher); assert(!watcher.output.includes(marker), "watcher logs exposed provider diagnostics");
   secondary.mode = "normal";
+
+  const actions = await start("actions");
+  await until(() => ready(actions), "Actions did not establish chain readiness through fallback");
+  const fundingUrl = `${actions.url}/actions/fund/${appIdHex}?amount=1`;
+  const deposit = () => fetch(fundingUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account: payer.publicKey.toBase58() }) });
+  const funding = await deposit(); assert.equal(funding.status, 200);
+  assert.equal(funding.headers.get("x-blockchain-ids"), `solana:${genesis.slice(0, 32)}`);
+  const fundingTx = Transaction.from(Buffer.from((await funding.json()).transaction, "base64"));
+  assert.equal(fundingTx.instructions.length, 1);
+  assert(fundingTx.instructions[0].keys[1].pubkey.equals(pocketPda(Buffer.from(appIdHex, "hex"))));
+  assert(fundingTx.signatures.every(s => s.signature === null));
+  secondary.mode = "outage";
+  await until(async () => !await ready(actions), "Actions admission survived provider outage");
+  const refused = await deposit(); assert.equal(refused.status, 503); assert(!(await refused.text()).includes(marker));
+  assert.equal((await health(actions)).ok, true);
+  secondary.mode = "normal";
+  await until(() => ready(actions), "Actions did not recover readiness");
+  assert.equal((await deposit()).status, 200);
+  await stop(actions); assert(!actions.output.includes(marker), "Actions logs exposed credentials");
 
   primary.mode = "drop";
   let relayer = await start("relayer");

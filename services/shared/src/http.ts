@@ -35,6 +35,8 @@ interface Route {
 }
 
 export interface RouterOptions {
+  /** Actions clients require { message }; existing services retain { error }. */
+  errorProperty?: "error" | "message";
   /** Largest accepted request body; default 64 KiB. */
   maxBodyBytes?: number;
   /** Includes requests still reading a body and handlers whose client disconnected. */
@@ -50,6 +52,7 @@ export interface RouterOptions {
 }
 
 export class Router {
+  private readonly errorProperty: "error" | "message";
   private routes: Route[] = [];
   private readonly maxBodyBytes: number;
   private readonly allowOrigin: string;
@@ -59,6 +62,7 @@ export class Router {
   private readonly maxConnections: number;
 
   constructor(options: RouterOptions = {}) {
+    this.errorProperty = options.errorProperty ?? "error";
     this.maxBodyBytes = options.maxBodyBytes ?? 64 * 1024;
     this.maxInFlight = options.maxInFlight ?? 64;
     this.maxConnections = options.maxConnections ?? 512;
@@ -104,7 +108,7 @@ export class Router {
     const server = createServer((req, res) => {
       if (active >= this.maxInFlight) {
         res.once("finish", () => req.destroy());
-        send(res, 503, { error: "service busy; retry the same request" },
+        send(res, 503, { [this.errorProperty]: "service busy; retry the same request" },
           { ...this.corsHeaders(), connection: "close", "retry-after": "1" }, req.method === "HEAD");
         return;
       }
@@ -116,14 +120,14 @@ export class Router {
             res.setHeader("connection", "close");
             res.once("finish", () => req.destroy());
           }
-          send(res, e.status, { error: e.message }, this.corsHeaders());
+          send(res, e.status, { [this.errorProperty]: e.message }, this.corsHeaders());
           return;
         }
         this.onError(e, req);
         send(
           res,
           500,
-          { error: this.exposeErrors ? (e instanceof Error ? e.message : String(e)) : "internal error" },
+          { [this.errorProperty]: this.exposeErrors ? (e instanceof Error ? e.message : String(e)) : "internal error" },
           this.corsHeaders(),
         );
       }).finally(() => { active--; });
@@ -181,7 +185,7 @@ export class Router {
       res.end();
       return;
     }
-    send(res, 404, { error: "not found" }, cors);
+    send(res, 404, { [this.errorProperty]: "not found" }, cors);
   }
 
   private async readJson(req: IncomingMessage): Promise<unknown> {

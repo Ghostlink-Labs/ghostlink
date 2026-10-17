@@ -238,7 +238,13 @@ async function main() {
   solverFixture = await startSolverFixture(connection, solverKp, priceAccounts, keepRunning ? demoPortBase + 2 : 0,
     { planner: forkPlanner, lookupAddresses: forkPlanner?.lookupAddresses, allowUnpriced: speculative });
   let solverUrl = solverFixture.url;
-  const actionsUrl = await listen(buildActions({ connection, baseUrl: keepRunning ? `http://127.0.0.1:${demoPortBase + 3}` : "http://e2e.local" }), 8790);
+  const actionsUrl = await listen(buildActions({ connection: serviceConnection, genesisHash: await connection.getGenesisHash(),
+    baseUrl: `http://127.0.0.1:${demoPortBase + 3}` }), 8790);
+  const actionsDeadline = Date.now() + 20_000;
+  while ((await fetch(`${actionsUrl}/ready`)).status !== 200) {
+    if (Date.now() > actionsDeadline) throw new Error("Actions did not establish chain readiness");
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
   ok(`services up (indexer ${indexerUrl})`);
   if (process.env.OPERATIONS_DRILL === "1") {
     await solverFixture.readinessDrill();
@@ -496,6 +502,25 @@ async function main() {
   const fundStatus = await connection.confirmTransaction(fundSig, "confirmed");
   if (fundStatus.value.err) throw new Error(`funding failed: ${JSON.stringify(fundStatus.value.err)}`);
   ok("pocket funded through the Blink (wallet-signed deposit)");
+  const actionsDrill = process.env.ACTIONS_DRILL === "1";
+  if (actionsDrill) {
+    const before = await connection.getBalance(pocket, "confirmed");
+    const response = await fetch(`${actionsUrl}/actions/fund/${appIdHex}?amount=0.001`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account: wallet.publicKey.toBase58() }),
+    });
+    if (!response.ok) throw new Error(`native deposit refused: ${await response.text()}`);
+    if (response.headers.get("x-blockchain-ids") !== `solana:${(await connection.getGenesisHash()).slice(0, 32)}`) throw new Error("funding chain header mismatch");
+    const transaction = Transaction.from(Buffer.from(((await response.json()) as { transaction: string }).transaction, "base64"));
+    if (transaction.signatures.some(s => s.signature !== null) || transaction.instructions.length !== 1 ||
+      !transaction.instructions[0]!.programId.equals(SystemProgram.programId) || !transaction.instructions[0]!.keys[1]!.pubkey.equals(pocket) ||
+      transaction.instructions[0]!.data.readBigUInt64LE(4) !== 1_000_000n) throw new Error("native deposit transaction mismatch");
+    transaction.sign(wallet);
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    if ((await connection.confirmTransaction(signature, "confirmed")).value.err || await connection.getBalance(pocket, "confirmed") !== before + 1_000_000) {
+      throw new Error("native SOL deposit did not credit the exact pocket amount");
+    }
+    ok("Actions approved-chain header and unsigned native SOL deposit credited exactly 1,000,000 lamports");
+  }
 
   // ---- fill an intent through the solver ------------------------------------
   if (forkPlanner) {
@@ -576,22 +601,25 @@ async function main() {
   const sweepMints = fork ? [inputMint, outputMint] : [outputMint];
   const expectedHome = new Map<string, bigint>();
   await send(sweepMints.map(mint => createAtaIdempotentIx(payer.publicKey, wallet.publicKey, mint)), []);
+  let expectedHomeLamports: bigint | undefined;
+  if (actionsDrill) {
+    const state = await connection.getAccountInfo(pocket, "confirmed");
+    if (!state) throw new Error("pocket missing before native recovery");
+    const rent = await connection.getMinimumBalanceForRentExemption(state.data.length);
+    expectedHomeLamports = BigInt(await connection.getBalance(wallet.publicKey, "confirmed")) + BigInt(state.lamports - rent);
+  }
   for (const mint of sweepMints) {
     const held = BigInt((await connection.getTokenAccountBalance(ataAddress(pocket, mint))).value.amount);
     const homeHeld = BigInt((await connection.getTokenAccountBalance(ataAddress(wallet.publicKey, mint))).value.amount);
     expectedHome.set(mint.toBase58(), held + homeHeld);
+    if (expectedHomeLamports !== undefined) expectedHomeLamports += BigInt((await connection.getAccountInfo(ataAddress(pocket, mint), "confirmed"))!.lamports);
   }
-  const sweepRes = await fetch(`${relayerUrl}/owner-action`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
+  await settleRelayer(prepareRelayerOperation("/owner-action", {
       ...await ownerBody("sweep"),
       home: wallet.publicKey.toBase58(),
       tokenPairs: sweepMints.map(mint => ({ source: ataAddress(pocket, mint).toBase58(),
         destination: ataAddress(wallet.publicKey, mint).toBase58(), mint: mint.toBase58() })),
-    }),
-  });
-  if (!sweepRes.ok) throw new Error(`sweep: ${await sweepRes.text()}`);
+  }));
   for (const mint of sweepMints) {
     const homeBalance = await connection.getTokenAccountBalance(ataAddress(wallet.publicKey, mint));
     if (BigInt(homeBalance.value.amount) !== expectedHome.get(mint.toBase58()) || await connection.getAccountInfo(ataAddress(pocket, mint))) {
@@ -599,6 +627,10 @@ async function main() {
     }
   }
   ok(`owner proof recovered ${sweepMints.length} complete token balances and closed their pocket accounts`);
+  if (expectedHomeLamports !== undefined) {
+    if (BigInt(await connection.getBalance(wallet.publicKey, "confirmed")) !== expectedHomeLamports) throw new Error("native surplus or closed-account rent did not return exactly home");
+    ok("owner recovery returned the complete native SOL surplus and closed-account rent exactly home");
+  }
   const recoveredPocket = await connection.getAccountInfo(pocket, "confirmed");
   if (!recoveredPocket || readPocketAccount(recoveredPocket).speculativePositions.length !== 0) {
     throw new Error("owner recovery retained speculative trading permission");

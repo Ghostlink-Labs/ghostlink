@@ -2,7 +2,7 @@
 
 The solver and relayer add cached readiness, authenticated journal write probes, bounded admission, private provider metrics and graceful draining around this transport. See [solver operations](SOLVER-OPERATIONS.md) and [relayer operations](RELAYER-OPERATIONS.md).
 
-`@ghostlink/service-kit/rpc` provides a Node-only `createRpcPool` factory. The solver, relayer, watcher and RPC-enabled indexer entry points use it. It accepts one to four **operator-approved** endpoints and an independently approved genesis hash. Never accept an endpoint or expected genesis from a trade request or Telegram user. Existing candidate public-chain guards still apply.
+`@ghostlink/service-kit/rpc` provides a Node-only `createRpcPool` factory. The solver, relayer, Actions, watcher and RPC-enabled indexer entry points use it. It accepts one to four **operator-approved** endpoints and an independently approved genesis hash. Never accept an endpoint or expected genesis from a trade request or Telegram user. Existing candidate public-chain guards still apply.
 
 Set `RPC_ENDPOINTS_PATH` to a private JSON file outside the repository. It overrides `RPC_URL`; without it, each service uses its single URL. The shared `loadRpcEndpoints` reader rejects missing, oversized or malformed files without including their path, contents or parser diagnostics in errors. The file is bounded to 16 KiB and has this shape:
 
@@ -69,6 +69,8 @@ The separate `SERVICE_RPC_DRILL=1 bash scripts/localnet-e2e.sh` runs actual regi
 
 The watcher adds a bounded encrypted delivery queue, fenced checkpoint ownership/readiness, an encrypted exact-packet journal, cumulative fee reservations, private diagnostics and notification retry checks described in [watcher operations](WATCHER-OPERATIONS.md). Its validator drill uses real owner proofs for proposal/revocation/cancellation, plus an explicitly synthetic mature genesis account to exercise timelock execution without waiting a day.
 
-This does not establish hosted-provider capacity, independent failure domains, account consistency under actual provider lag, real Telegram/device acceptance, production alerts or public-chain readiness. Actions and browser connections retain their existing transports. Their availability and subscription recovery need separate integration evidence. Production deployment still requires the [release gates](MAINNET-READINESS.md), provider contract/quotas, monitoring for prolonged cooldown or quarantine, and a rehearsed incident procedure. No public-chain deployment is part of these drills.
+The Actions service now uses this pool with approved-genesis headers, full contextual account checks, cached readiness, bounded preparation, private metrics and Unix drain. Its disposable-validator drill verifies actual token/native deposits and exact native surplus recovery. See [Actions operations](ACTIONS-OPERATIONS.md).
+
+This does not establish hosted-provider capacity, independent failure domains, account consistency under actual provider lag, real Telegram/device acceptance, production alerts or public-chain readiness. Browser connections retain their existing transports; their availability and subscription recovery need separate integration evidence. Production deployment still requires the [release gates](MAINNET-READINESS.md), provider contract/quotas, monitoring for prolonged cooldown or quarantine, and a rehearsed incident procedure. No public-chain deployment is part of these drills.
 
 Protocol references: [genesis identity](https://solana.com/docs/rpc/http/getgenesishash), [signed submission and acknowledgment](https://solana.com/docs/rpc/http/sendtransaction), [signature history and commitment](https://solana.com/docs/rpc/http/getsignaturestatuses).

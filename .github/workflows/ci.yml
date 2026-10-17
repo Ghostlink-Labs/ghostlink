@@ -21,8 +21,11 @@ jobs:
           for commit in $(git rev-list HEAD); do
             git ls-tree -r --name-only "$commit"
           done | sort -u > "$RUNNER_TEMP/source-files.txt"
-          if grep -Ei '^(apps/|docs/design/|bug-knowledge/|docs/AUDIT-|docs/build-plan\.md$|\.githooks/)|(^|/)(\.(claude|codex|cursor|continue|gemini)(/|$)|\.env($|\.)|(agents|claude|codex|code|gemini|copilot-instructions|memory|skill)\.md$)|\.(png|jpe?g|webp|gif|svg|mp4|woff2?|ttf|otf|css|html|zkey|ptau|keypair\.json)$' "$RUNNER_TEMP/source-files.txt"; then
-            echo "Only public technology source, tests and technical documentation may be committed." >&2
+          # Only these four reviewed documentation images may accompany public source.
+          grep -Ev '^docs/media/screenshots/(01-sign-in|02-overview|03-pocket-controls|04-activity-and-limits)\.jpg$' \
+            "$RUNNER_TEMP/source-files.txt" > "$RUNNER_TEMP/source-files-filtered.txt"
+          if grep -Ei '^(apps/|docs/design/|bug-knowledge/|docs/AUDIT-|docs/build-plan\.md$|\.githooks/)|(^|/)(\.(claude|codex|cursor|continue|gemini)(/|$)|\.env($|\.)|(agents|claude|codex|code|gemini|copilot-instructions|memory|skill)\.md$)|\.(png|jpe?g|webp|gif|svg|mp4|woff2?|ttf|otf|css|html|zkey|ptau|keypair\.json|key|pem|p12|pfx|enc|sqlite(-[a-z]+)?|db(-[a-z]+)?)$' "$RUNNER_TEMP/source-files-filtered.txt"; then
+            echo "Only public technology, technical documentation and the four reviewed screenshots may be committed." >&2
             exit 1
           fi
 

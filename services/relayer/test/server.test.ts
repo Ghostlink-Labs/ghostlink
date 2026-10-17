@@ -1,33 +1,45 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { RelayerJournal } from "../src/journal.js";
 import { once } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { Connection, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
-import { POCKET_ACCOUNT_SIZE } from "@ghostlink/service-kit";
+import { POCKET_ACCOUNT_SIZE, POCKET, CENSUS, REGISTRY } from "@ghostlink/service-kit";
 import { buildServer, type RelayerDeps } from "../src/server.js";
 
 const payer = Keypair.generate();
+const genesisHash = Keypair.generate().publicKey.toBase58();
 function rpc() {
+  const accepted = new Set<string>();
   return {
+    getGenesisHash: vi.fn(async () => genesisHash),
+    getBlockHeight: vi.fn(async () => 50),
+    getSignatureStatuses: vi.fn(async (ids: string[]) => ({ context: { slot: 50 }, value: ids.map(id => accepted.has(id) ? { slot: 50, confirmationStatus: "confirmed", err: null } : null) })),
     getAccountInfo: vi.fn(async () => ({ owner: SystemProgram.programId, data: Buffer.alloc(0), executable: false })),
-    getLatestBlockhash: vi.fn(async () => ({ blockhash: SystemProgram.programId.toBase58(), lastValidBlockHeight: 100 })),
-    getFeeForMessage: vi.fn(async () => ({ value: 10_000 })),
+    getLatestBlockhashAndContext: vi.fn(async () => ({ context: { slot: 50 }, value: { blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: 100 } })),
+    getFeeForMessage: vi.fn(async () => ({ context: { slot: 50 }, value: 10_000 })),
     getMinimumBalanceForRentExemption: vi.fn(async () => 30_000_000),
-    sendRawTransaction: vi.fn(async (bytes: Uint8Array) => bs58.encode(Transaction.from(bytes).signature!)),
+    sendRawTransaction: vi.fn(async (bytes: Uint8Array) => { const signature = bs58.encode(Transaction.from(bytes).signature!); accepted.add(signature); return signature; }),
     confirmTransaction: vi.fn(async () => ({ value: { err: null } })),
   };
 }
-async function withServer(deps: Partial<RelayerDeps>, run: (base: string) => Promise<void>) {
-  const server = buildServer({ connection: rpc() as unknown as Connection, payer, ...deps });
+async function withServer(deps: Partial<RelayerDeps> & { dailyBudgetLamports?: bigint }, run: (base: string, server: ReturnType<typeof buildServer>) => Promise<void>) {
+  const dir = mkdtempSync(join(tmpdir(), "relayer-http-"));
+  const journal = new RelayerJournal(join(dir, "journal.db"), randomBytes(32), { genesisHash, payer: payer.publicKey.toBase58(), pocket: POCKET.toBase58(), registry: REGISTRY.toBase58(), census: CENSUS.toBase58() }, deps.dailyBudgetLamports);
+  const server = buildServer({ connection: rpc() as unknown as Connection, payer, journal, ...deps });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address() as { port: number };
-  try { await run(`http://127.0.0.1:${address.port}`); }
-  finally { server.closeAllConnections(); server.close(); }
+  try { await run(`http://127.0.0.1:${address.port}`, server); }
+  finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); journal.close(); rmSync(dir, { recursive: true, force: true }); }
 }
 function post(base: string, path: string, body: unknown) {
   return fetch(`${base}/${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 }
-const snapshot = () => ({ wallet: Keypair.generate().publicKey.toBase58(), holding: payer.publicKey.toBase58() });
+const snapshot = () => ({ requestIdHex: randomBytes(32).toString("hex"), wallet: Keypair.generate().publicKey.toBase58(), holding: payer.publicKey.toBase58() });
 const opening = () => ({
   appIdHex: "01".repeat(32), domainHashHex: "02".repeat(32), sessionKind: 0,
   proofAHex: "00".repeat(64), proofBHex: "00".repeat(128), proofCHex: "00".repeat(64),
@@ -39,6 +51,15 @@ const opening = () => ({
 });
 
 describe("relayer fee and creation boundary", () => {
+  it("keeps one paid transaction when an opening is retried after a lost send reply", async () => {
+    const connection = rpc();
+    connection.sendRawTransaction.mockRejectedValue(new Error("accepted response lost"));
+    await withServer({ connection: connection as unknown as Connection }, async base => {
+      const body = opening();
+      await post(base, "open-session", body); await post(base, "open-session", body);
+      expect(new Set(connection.sendRawTransaction.mock.calls.map(call => Buffer.from(call[0]).toString("base64"))).size).toBe(1);
+    });
+  });
   it("reserves current-layout quoted rent before funding pocket creation", async () => {
     const connection = rpc();
     await withServer({ connection: connection as unknown as Connection, dailyBudgetLamports: 20_000_000n }, async base => {
@@ -56,12 +77,11 @@ describe("relayer fee and creation boundary", () => {
     const marker = "SYNTHETIC_RELAYER_PROVIDER_SECRET";
     const connection = rpc();
     connection.sendRawTransaction.mockRejectedValueOnce(new Error(`provider ${marker}`));
-    connection.confirmTransaction.mockRejectedValueOnce(new Error(`confirmation ${marker}`))
-      .mockResolvedValueOnce({ value: { err: { InstructionError: [0, marker] } } } as never);
+    connection.sendRawTransaction.mockRejectedValue(new Error(`provider ${marker}`));
     await withServer({ connection: connection as unknown as Connection }, async base => {
       for (let i = 0; i < 3; i++) {
         const response = await post(base, "snapshot", snapshot());
-        expect(response.status).toBe(502);
+        expect(response.status).toBe(202);
         const body = await response.text();
         expect(body).not.toContain(marker);
         const signature = bs58.encode(Transaction.from(connection.sendRawTransaction.mock.calls[i]![0]).signature!);
@@ -77,7 +97,7 @@ describe("relayer fee and creation boundary", () => {
     connection.sendRawTransaction.mockResolvedValueOnce(substituted);
     await withServer({ connection: connection as unknown as Connection }, async base => {
       const response = await post(base, "snapshot", snapshot());
-      expect(response.status).toBe(502);
+      expect(response.status).toBe(202);
       const body = await response.text();
       const expected = bs58.encode(Transaction.from(connection.sendRawTransaction.mock.calls[0]![0]).signature!);
       expect(body).toContain(expected);
@@ -108,13 +128,31 @@ describe("relayer fee and creation boundary", () => {
 
   it("keeps an ambiguous broadcast charged, but does not charge a preparation failure", async () => {
     const connection = rpc();
-    connection.getLatestBlockhash.mockRejectedValueOnce(new Error("RPC unavailable"));
+    connection.getLatestBlockhashAndContext.mockRejectedValueOnce(new Error("RPC unavailable"));
     connection.sendRawTransaction.mockRejectedValueOnce(new Error("response lost after broadcast"));
     await withServer({ connection: connection as unknown as Connection, dailyBudgetLamports: 10_000n }, async (base) => {
       expect((await post(base, "snapshot", snapshot())).status).toBe(500);
       expect((await (await fetch(`${base}/health`)).json()).spentLamports24h).toBe("0");
-      expect((await post(base, "snapshot", snapshot())).status).toBe(502);
+      expect((await post(base, "snapshot", snapshot())).status).toBe(202);
       expect((await post(base, "snapshot", snapshot())).status).toBe(503);
+      expect(connection.sendRawTransaction).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("refuses changed request content, oversized fees and new admission during drain", async () => {
+    const connection = rpc();
+    await withServer({ connection: connection as unknown as Connection }, async (base, server) => {
+      const body = snapshot();
+      expect((await post(base, "snapshot", body)).status).toBe(200);
+      expect((await post(base, "snapshot", { ...body, holding: Keypair.generate().publicKey.toBase58() })).status).toBe(409);
+      expect((await post(base, "snapshot", body)).status).toBe(200);
+      expect(connection.sendRawTransaction).toHaveBeenCalledTimes(1);
+      connection.getFeeForMessage.mockResolvedValueOnce({ context: { slot: 50 }, value: 20_001 });
+      expect((await post(base, "snapshot", snapshot())).status).toBe(503);
+      server.drain();
+      expect((await post(base, "snapshot", snapshot())).status).toBe(503);
+      expect((await fetch(`${base}/submissions/${body.requestIdHex}`)).status).toBe(503);
+      expect(server.active).toBe(0);
       expect(connection.sendRawTransaction).toHaveBeenCalledTimes(1);
     });
   });

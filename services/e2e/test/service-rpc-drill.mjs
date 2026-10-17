@@ -1,5 +1,6 @@
 /** Synthetic providers, disposable payer, real service entry points and HTTP. No external network. */
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
@@ -16,7 +17,9 @@ const genesis = Keypair.generate().publicKey.toBase58();
 const wrongGenesis = Keypair.generate().publicKey.toBase58();
 const payer = Keypair.generate();
 const directory = mkdtempSync(join(tmpdir(), "ghostlink-service-rpc-"));
-const children = [], providers = [];
+const children = [], providers = [], accepted = new Set();
+const journalKeyPath = join(directory, "journal.key");
+writeFileSync(journalKeyPath, randomBytes(32));
 const payerPath = join(directory, "payer.json");
 const configPath = join(directory, "providers.json");
 writeFileSync(payerPath, JSON.stringify([...payer.secretKey]));
@@ -36,17 +39,18 @@ async function provider() {
       if (state.mode === "semantic") return res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, error: { code: -32602, message: marker, data: { token: marker } } }));
       if (call.method === "getSignaturesForAddress") return reply([]);
       if (call.method === "getLatestBlockhash") return reply({ context: { slot: 50 }, value: { blockhash: genesis, lastValidBlockHeight: 1000 } });
+      if (call.method === "getBlockHeight") return reply(50);
       if (call.method === "getFeeForMessage") return reply({ context: { slot: 50 }, value: 10000 });
       if (call.method === "sendTransaction") {
         state.packets.push(raw);
         const signature = bs58.encode(Transaction.from(Buffer.from(call.params[0], "base64")).signature);
         if (state.mode === "drop") { res.destroy(); return; }
         if (state.mode === "reject-send") return res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, error: { code: -32002, message: marker, data: { logs: [marker] } } }));
-        return reply(signature);
+        accepted.add(signature); return reply(signature);
       }
       if (call.method === "getSignatureStatuses") {
         state.statuses++;
-        return reply({ context: { slot: 50 }, value: [{ slot: 50, confirmations: 1, err: null, confirmationStatus: "confirmed" }] });
+        return reply({ context: { slot: 50 }, value: call.params[0].map(id => accepted.has(id) ? { slot: 50, confirmations: 1, err: null, confirmationStatus: "confirmed" } : null) });
       }
       throw new Error("unexpected test method");
     } catch { res.writeHead(500); res.end(marker); }
@@ -66,7 +70,7 @@ async function start(name, extra = {}) {
   const listenPort = await port();
   const env = { ...process.env, PORT: String(listenPort), NODE_ENV: "production", POLL_MS: "100",
     RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
-    GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: join(directory, "indexer.json"), RELAYER_BUDGET_PATH: join(directory, "budget.json"),
+    GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: join(directory, "indexer.json"), RELAYER_BUDGET_PATH: "", RELAYER_JOURNAL_PATH: join(directory, "relayer.db"), RELAYER_JOURNAL_KEY_PATH: journalKeyPath,
     WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.json"), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
   const child = spawn(process.execPath, [fileURLToPath(new URL(`../../${name}/dist/index.js`, import.meta.url))], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   const state = { child, output: "", url: `http://127.0.0.1:${listenPort}` };
@@ -89,9 +93,10 @@ async function stopped(state) {
 async function stop(state) {
   if (state.child.exitCode === null && state.child.signalCode === null) { state.child.kill(); await stopped(state); }
 }
-async function snapshot(process) {
+const snapshotBody = () => ({ requestIdHex: randomBytes(32).toString("hex"), wallet: Keypair.generate().publicKey.toBase58(), holding: payer.publicKey.toBase58() });
+async function snapshot(process, body = snapshotBody()) {
   return fetch(`${process.url}/snapshot`, { method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ wallet: Keypair.generate().publicKey.toBase58(), holding: payer.publicKey.toBase58() }), signal: AbortSignal.timeout(10000) });
+    body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
 }
 
 try {
@@ -135,18 +140,25 @@ try {
   secondary.mode = "normal";
 
   primary.mode = "drop";
-  const relayer = await start("relayer");
+  let relayer = await start("relayer");
   await until(async () => Boolean(await health(relayer)), "relayer did not start");
-  const submitted = await snapshot(relayer); assert.equal(submitted.status, 200);
+  const originalBody = snapshotBody();
+  const submitted = await snapshot(relayer, originalBody); assert.equal(submitted.status, 200);
   const receipt = await submitted.json();
   assert.equal(primary.packets.length, 1); assert.equal(secondary.packets.length, 1);
   assert.equal(primary.packets[0], secondary.packets[0], "fallback changed the signed request");
   assert.equal(receipt.signature, bs58.encode(Transaction.from(Buffer.from(JSON.parse(primary.packets[0]).params[0], "base64")).signature));
   assert(secondary.statuses > 0, "confirmation bypassed fallback HTTP");
   assert.equal((await health(relayer)).spentLamports24h, "10000");
+  await stop(relayer); relayer = await start("relayer");
+  await until(async () => Boolean(await health(relayer)), "relayer did not reopen its journal");
+  const repeated = await snapshot(relayer, originalBody); assert.equal(repeated.status, 200);
+  assert.equal((await repeated.json()).signature, receipt.signature);
+  assert.equal(primary.packets.length, 1); assert.equal(secondary.packets.length, 1);
+  assert.equal((await health(relayer)).spentLamports24h, "10000");
   secondary.mode = "reject-send";
-  const rejectedSend = await snapshot(relayer); assert.equal(rejectedSend.status, 502);
-  const rejectedBody = await rejectedSend.text(); assert(!rejectedBody.includes(marker)); assert(rejectedBody.includes("outcome unknown"));
+  const rejectedSend = await snapshot(relayer); assert.equal(rejectedSend.status, 202);
+  const rejectedBody = await rejectedSend.text(); assert(!rejectedBody.includes(marker)); assert.equal(JSON.parse(rejectedBody).state, "pending");
   assert.equal((await health(relayer)).spentLamports24h, "20000");
   primary.mode = "outage"; secondary.mode = "outage";
   const unavailable = await snapshot(relayer); assert.equal(unavailable.status, 500);

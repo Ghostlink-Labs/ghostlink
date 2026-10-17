@@ -46,7 +46,7 @@ describe("public bot session authorization", () => {
       expect(body).not.toHaveProperty("identity");
       expect(body).not.toHaveProperty("witness");
       expect(JSON.stringify(body)).not.toContain(vectors.identity.sBytes);
-      return Response.json({ signature: "test-transport-only" });
+      return Response.json({ requestIdHex: body.requestIdHex, signature: "1".repeat(64), state: "confirmed", confirmationStatus: "confirmed", slot: 100 });
     });
     const client = await GhostLink.init({ cluster: "localnet", indexer: "https://indexer.test", relayer: "https://relayer.test", origin: vectors.identity.origin, prover, fetchFn });
     const authorization = await client.authorizeSession(params);

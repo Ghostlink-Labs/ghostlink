@@ -10,3 +10,4 @@ export * from "./api.js";
 export * from "./login.js";
 export * from "./authorization.js";
 export * from "./consent.js";
+export * from "./relayer.js";

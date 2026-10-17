@@ -74,7 +74,7 @@ import {
 import { IndexerStore } from "@ghostlink/indexer/store";
 import { buildServer as buildIndexer } from "@ghostlink/indexer/server";
 import { Poller } from "@ghostlink/indexer/poller";
-import { buildServer as buildRelayer } from "@ghostlink/relayer/server";
+import { startRelayerFixture } from "./relayer-session.js";
 import { buildServer as buildActions } from "@ghostlink/actions/server";
 import { label, priceAccountFor } from "./genesis.js";
 import { startBotFixture } from "./bot-session.js";
@@ -86,6 +86,7 @@ import { startRpcFaultFixture } from "./rpc-fault.js";
 const RPC = process.env.RPC_URL ?? "http://127.0.0.1:8899";
 const ROOT = process.env.REPO_ROOT ?? join(process.cwd(), "..", "..");
 let botFixture: Awaited<ReturnType<typeof startBotFixture>> | undefined;
+let relayerFixture: Awaited<ReturnType<typeof startRelayerFixture>> | undefined;
 let solverFixture: Awaited<ReturnType<typeof startSolverFixture>> | undefined;
 let serviceRpcFixture: Awaited<ReturnType<typeof startRpcFaultFixture>> | undefined;
 
@@ -207,9 +208,8 @@ async function main() {
   const store = new IndexerStore();
   const poller = new Poller(serviceConnection, store);
   const indexerUrl = await listen(buildIndexer(store, { poller: poller.status }), 8787);
-  const relayerUrl = await listen(
-    buildRelayer({ connection: serviceConnection, payer, minWalletLamports: 1n }), 8788,
-  );
+  relayerFixture = await startRelayerFixture(serviceConnection, payer, keepRunning ? demoPortBase + 1 : 0);
+  const relayerUrl = relayerFixture.url;
   // Synthetic Pyth accounts loaded by this disposable validator's genesis.
   const priceAccounts: Record<string, string> = {
     [inputMint.toBase58()]: priceAccountFor("e2e usdc price acct").toBase58(),
@@ -288,7 +288,7 @@ async function main() {
   const snapRes = await fetch(`${relayerUrl}/snapshot`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ wallet: wallet.publicKey.toBase58(), holding: holding.toBase58() }),
+    body: JSON.stringify({ requestIdHex: bytesToHex(label("initial census snapshot")), wallet: wallet.publicKey.toBase58(), holding: holding.toBase58() }),
   });
   if (!snapRes.ok) throw new Error(`snapshot: ${await snapRes.text()}`);
   if (serviceRpcFixture) {
@@ -580,7 +580,7 @@ async function main() {
 
   if (process.env.RECOVERY_DESTINATION_DRILL === "1") {
     const {exerciseRecoveryDestinations}=await import("./recovery-destinations.js");
-    await exerciseRecoveryDestinations({connection,payer,wallet,pocket,relayerUrl,send,ownerBody:()=>ownerBody("sweep")});
+    await exerciseRecoveryDestinations({connection,payer,wallet,pocket,relayerUrl,send,ownerBody:()=>ownerBody("sweep"), recovery: process.env.RELAYER_JOURNAL_DRILL === "1" ? relayerFixture : undefined});
   }
   if (process.env.WATCHER_DRILL === "1") {
     const { exerciseWatcher } = await import("./watcher-drill.js");
@@ -601,12 +601,14 @@ async function main() {
 main().then(async () => {
   await botFixture?.close();
   await solverFixture?.close();
+  await relayerFixture?.close();
   await serviceRpcFixture?.close();
   process.exit(0);
 }).catch(async (e) => {
   console.error("E2E FAILED:", e);
   await botFixture?.close().catch(() => {});
   await solverFixture?.close().catch(() => {});
+  await relayerFixture?.close().catch(() => {});
   await serviceRpcFixture?.close().catch(() => {});
   process.exit(1);
 });

@@ -26,6 +26,7 @@ export async function exerciseRecoveryDestinations(options: {
     signers: Keypair[],
   ) => Promise<unknown>;
   ownerBody: () => Promise<object>;
+  recovery?: { arm(): void; restart(): Promise<string>; spent(): bigint; assertSinglePacket(): void };
 }) {
   const { connection, payer, wallet, pocket, relayerUrl, send, ownerBody } =
     options;
@@ -93,6 +94,7 @@ export async function exerciseRecoveryDestinations(options: {
   console.log(
     "✓ reproduced recovery refusal after real SPL owner change of the home's ATA",
   );
+  options.recovery?.arm();
   const result = await post(
     [source, homeAta].map((address) => ({
       source: address.toBase58(),
@@ -104,9 +106,27 @@ export async function exerciseRecoveryDestinations(options: {
     true,
     `automatic safe destination failed: ${await result.clone().text()}`,
   );
-  const response = (await result.json()) as {
+  let response = (await result.json()) as {
+    state: string; requestIdHex: string; signature: string;
     tokenPairs: { source: string; destination: string; mint: string }[];
   };
+  if (options.recovery) {
+    assert.equal(response.state, "unknown");
+    const before = options.recovery.spent(), signature = response.signature, pairs = response.tokenPairs;
+    await options.recovery.restart();
+    // Wait for this exact signature without preparing a replacement transaction.
+    const expires = Date.now() + 15_000;
+    while (Date.now() < expires) {
+      const status = (await connection.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
+      if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    const retried = await post([source, homeAta].map(address => ({ source: address.toBase58(), mint: mint.publicKey.toBase58() })));
+    assert.equal(retried.status, 200); response = await retried.json() as typeof response;
+    assert.equal(response.signature, signature); assert.deepEqual(response.tokenPairs, pairs);
+    assert.equal(options.recovery.spent(), before); options.recovery.assertSinglePacket();
+    console.log("Relayer lost accepted sweep reply; restart retained exact auxiliary destination, signed packet and single charge.");
+  }
   assert.equal(response.tokenPairs.length, 2);
   assert.equal(
     response.tokenPairs[0]!.destination,
@@ -133,12 +153,13 @@ export async function exerciseRecoveryDestinations(options: {
     })),
   );
   assert.equal(
-    replay.ok,
-    false,
-    "the same owner proof must not create another recovery account",
+    replay.status,
+    200,
+    "the same request must return its original receipt",
   );
+  assert.deepEqual((await replay.json() as typeof response).tokenPairs, response.tokenPairs);
   console.log(
-    "✓ recovered both pocket balances into one new clean home-owned account; replay refused",
+    "✓ recovered both pocket balances into one new clean home-owned account; retry retained original receipt",
   );
 
   const locked: {

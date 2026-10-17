@@ -17,6 +17,7 @@ import {
   homeHash,
   intentHash,
   pocketAuthorizationContext,
+  relayerRequestDigest,
   toBase58,
   type CensusLatestResponse,
   type IntentRequest,
@@ -48,6 +49,7 @@ import {
   type PocketHandle,
   type SignedIntent,
 } from "./pocket.js";
+import { RelayerClient, RelayerOperationPendingError, prepareRelayerOperation } from "./relayer.js";
 
 export interface GhostLinkConfig {
   /** V2 is localnet-only until a fresh deployment and migration are verified. */
@@ -369,7 +371,11 @@ export class GhostLink {
       home: toBase58(pocket.home),
       policy: policyToDto(pocket.policy),
     };
-    return this.postJson(this.config.relayer, "/open-session", req);
+    // Same authorization/body keeps one identity even when this convenience method is called again after a lost reply.
+    const operation = prepareRelayerOperation("/open-session", req, relayerRequestDigest("/open-session", req));
+    const receipt = await new RelayerClient(this.config.relayer, this.fetchFn).submit(operation);
+    if (receipt.state !== "confirmed" && receipt.state !== "finalized") throw new RelayerOperationPendingError(operation, receipt);
+    return { signature: receipt.signature! };
   }
 
   async submitIntent(

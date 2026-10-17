@@ -88,3 +88,21 @@ Trade submission returns explicit states. Inspect `tx.state`; `pending`, `prepar
 - The SDK does not expose arbitrary wallet transaction signing or unrestricted withdrawals. A pocket is a program account, not an ordinary keypair wallet.
 
 See the repository's `docs/INTEGRATIONS.md` and `docs/MAINNET-READINESS.md` for the supported boundaries and release gates.
+
+
+## Durable relayer requests
+
+`prepareRelayerOperation`, `RelayerClient.submit` and `RelayerClient.status` cover registration, snapshots, session opening and owner actions. Save the complete prepared operation in your encrypted durable store **before** sending it. Reuse the same object and ID after a lost response; generating another proof or ID creates another operation.
+
+```ts
+import { prepareRelayerOperation, RelayerClient } from "@ghostlink/sdk";
+
+const client = new RelayerClient(approvedRelayerUrl);
+const operation = prepareRelayerOperation("/snapshot", { wallet, holding });
+await encryptedStore.save(operation.requestIdHex, operation);
+const receipt = await client.submit(operation);
+// A 202 receipt is pending/unknown, not confirmation. Preserve the operation.
+const latest = await client.status(operation.requestIdHex);
+```
+
+`RelayerOperationPendingError` preserves the submitted operation after transport failure or invalid receipt. The `openSession` facade uses a deterministic request ID for the exact authorization and throws this error unless the receipt is confirmed/finalized. A bot must still independently verify the reviewed on-chain permissions. Receipts are provider evidence, not proof of authority. See [relayer operations](../../docs/RELAYER-OPERATIONS.md) for expiry, budgets, retention and migration limits.

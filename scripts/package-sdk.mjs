@@ -47,8 +47,12 @@ import assert from 'node:assert/strict';
 import { createPublicKey, verify } from 'node:crypto';
 import { GhostLink, softwareSession, sessionPublicKey, derivePocket, signIntent, policyToDto, policyFromDto,
   ApplicationRegistry, applicationRegistryDigest, OwnerConsentController, verifyTelegramOwnerInitData,
-  prepareTelegramPairing, parseTelegramPairingCode, verifyTelegramPairingClaim } from '@ghostlink/sdk';
+  prepareTelegramPairing, parseTelegramPairingCode, verifyTelegramPairingClaim,
+  RelayerClient, prepareRelayerOperation, RelayerOperationPendingError } from '@ghostlink/sdk';
 import { intentHash, conservativePolicy, policyHash } from '@ghostlink/common';
+const relayerOperation = prepareRelayerOperation('/snapshot', {wallet:'wallet',holding:'holding'});
+const relayerClient = new RelayerClient('https://relayer.invalid', async () => { throw new Error('synthetic offline'); });
+await assert.rejects(relayerClient.submit(relayerOperation), e => e instanceof RelayerOperationPendingError && e.operation.digestHex === relayerOperation.digestHex);
 const bot = softwareSession();
 const publicKey = sessionPublicKey(0, bot.key32);
 assert.equal('sign' in publicKey, false);

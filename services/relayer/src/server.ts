@@ -32,6 +32,7 @@ import {
 } from "@ghostlink/common";
 import {
   HttpError,
+  type Handler,
   RateLimiter,
   Router,
   Semaphore,
@@ -52,17 +53,15 @@ import {
 } from "@ghostlink/service-kit";
 import { policyFromDtoBytes } from "./policy.js";
 import { prepareRecoverySweep } from "./recovery.js";
-import { SpendMeter } from "./budget.js";
+import { RelayerJournal } from "./journal.js";
+import { RelayerSubmission, requestIdentity } from "./submission.js";
 
 export interface RelayerDeps {
+  journal: RelayerJournal;
   connection: Connection;
   payer: Keypair;
   /** Lamports a wallet must hold before we pay for its registration. */
   minWalletLamports?: bigint;
-  /** Rolling 24 h spend ceiling; default 2 SOL. */
-  dailyBudgetLamports?: bigint;
-  /** Atomic spend snapshot; use one file per payer process for restart durability. */
-  budgetPersistPath?: string;
   /** Lowercase hex domain hashes whose pockets this relayer creates; unset = any. */
   allowedDomainHashes?: Set<string>;
   /** Honour X-Forwarded-For (only behind a proxy you control). */
@@ -73,10 +72,12 @@ export interface RelayerDeps {
 
 const MAX_TOKEN_PAIRS = 16;
 
-export function buildServer(deps: RelayerDeps): Server {
+export function buildServer(deps: RelayerDeps): Server & { drain(): void; readonly active: number } {
   const { connection, payer } = deps;
+  if (!deps.journal || deps.journal.scope.payer !== payer.publicKey.toBase58()) throw new Error("relayer requires a journal bound to its payer");
+  const submissions = new RelayerSubmission(connection, deps.journal);
+  let draining = false, active = 0;
   const minLamports = deps.minWalletLamports ?? 10_000_000n; // 0.01 SOL
-  const meter = new SpendMeter(deps.dailyBudgetLamports ?? 2_000_000_000n, undefined, deps.budgetPersistPath);
   const ipLimiter = new RateLimiter(30, 60_000);
   const walletLimiter = new RateLimiter(3, 60_000);
   const snapshotLimiter = new RateLimiter(1, 60_000);
@@ -87,68 +88,65 @@ export function buildServer(deps: RelayerDeps): Server {
     if (!ipLimiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
   }
 
-  function charge(lamports: bigint): void {
-    if (!meter.tryCharge(lamports)) {
-      throw new HttpError(503, "relayer daily budget exhausted; try again later");
-    }
-  }
-
   async function rentFor(size: number): Promise<bigint> {
     const rent = await connection.getMinimumBalanceForRentExemption(size, "confirmed");
     if (!Number.isSafeInteger(rent) || rent <= 0) throw new HttpError(503, "account rent unavailable; try again later");
     return BigInt(rent);
   }
 
-  async function sendTx(instructions: TransactionInstruction[], rent: bigint, signers: Keypair[] = []): Promise<{ signature: string }> {
-    return inFlight.run(async () => {
-      const tx = new Transaction().add(...instructions);
-      tx.feePayer = payer.publicKey;
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-      tx.recentBlockhash = blockhash;
-      tx.sign(payer, ...signers);
-      // Serialize and obtain the full fee (including signature precompiles)
-      // before reserving. Nothing asynchronous sits between charge and send.
-      const bytes = tx.serialize();
-      const signature = bs58.encode(tx.signature!);
-      const fee = (await connection.getFeeForMessage(tx.compileMessage(), "confirmed")).value;
-      if (fee === null) throw new HttpError(503, "transaction fee unavailable; try again later");
-      charge(rent + BigInt(fee));
+  interface Preparation { instructions: TransactionInstruction[]; rent: bigint; signers?: Keypair[];
+    tokenPairs?: { source: string; destination: string; mint: string }[] }
+  function paid(path: string, prepare: (request: Parameters<Handler>[0]) => Promise<Preparation>): void {
+    router.post(path, async request => {
+      throttle(request.raw);
+      if (draining) throw new HttpError(503, "relayer is draining");
+      active++;
       try {
-        const acknowledged = await connection.sendRawTransaction(bytes, { maxRetries: 0 });
-        if (acknowledged !== signature) throw new Error("unexpected transaction acknowledgment");
-      } catch {
-        // A timeout does not establish that the RPC failed to broadcast.
-        // Keep the charge until it ages out rather than risk overspending.
-        throw new HttpError(502, `transaction ${signature} outcome unknown; check the same transaction before retrying`);
-      }
-      let status;
-      try {
-        status = await connection.confirmTransaction(
-          { signature, blockhash, lastValidBlockHeight },
-          "confirmed",
-        );
-      } catch {
-        throw new HttpError(502, `transaction ${signature} outcome unknown; check the same transaction before retrying`);
-      }
-      if (status.value.err) {
-        throw new HttpError(502, `transaction ${signature} failed on-chain`);
-      }
-      return { signature };
+        const body = objectBody(request.body);
+        let identity: ReturnType<typeof requestIdentity>;
+        try { identity = requestIdentity(path, body); } catch { throw badRequest("valid requestIdHex required; snapshot retries must reuse their original ID"); }
+        const prior = deps.journal.get(identity.id);
+        if (prior && prior.digest !== identity.digest) throw new HttpError(409, "request ID is bound to different content");
+        const receipt = await inFlight.run(async () => {
+          if (draining) throw new HttpError(503, "relayer is draining");
+          return submissions.submit(identity.id, identity.digest, async () => {
+            const plan = await prepare(request);
+            const latest = await connection.getLatestBlockhashAndContext({ commitment: "confirmed" });
+            if (!Number.isSafeInteger(latest.context.slot) || latest.context.slot < 0) throw new HttpError(503, "transaction context unavailable");
+            const tx = new Transaction({ feePayer: payer.publicKey, ...latest.value }).add(...plan.instructions);
+            tx.sign(payer, ...(plan.signers ?? []));
+            const bytes = tx.serialize(), fee = await connection.getFeeForMessage(tx.compileMessage(), "confirmed");
+            if (!Number.isSafeInteger(fee.context.slot) || fee.context.slot < latest.context.slot ||
+              !Number.isSafeInteger(fee.value) || fee.value === null || fee.value < 0 || fee.value > 20_000) throw new HttpError(503, "transaction fee unavailable or excessive");
+            return { rawBase64: bytes.toString("base64"), signature: bs58.encode(tx.signature!), blockhash: latest.value.blockhash,
+              lastValidBlockHeight: latest.value.lastValidBlockHeight, minContextSlot: latest.context.slot,
+              feeLamports: fee.value.toString(), rentLamports: plan.rent.toString(), tokenPairs: plan.tokenPairs };
+          });
+        });
+        return { status: receipt.state === "failed" ? 502 : ["confirmed", "finalized"].includes(receipt.state) ? 200 : 202, json: receipt };
+      } finally { active--; }
     });
   }
-
+  router.get("/submissions/:requestIdHex", async ({ params, raw }) => {
+    throttle(raw);
+    if (draining) throw new HttpError(503, "relayer is draining");
+    const id = params.requestIdHex!;
+    if (!submissions || !/^[0-9a-f]{64}$/.test(id) || !deps.journal.get(id)) throw new HttpError(404, "submission not found");
+    active++;
+    try { return { json: await inFlight.run(() => submissions.status(id)) }; }
+    finally { active--; }
+  });
   router.get("/health", async () => ({
     json: {
       ok: true,
       payer: payer.publicKey.toBase58(),
-      spentLamports24h: meter.spentInWindow().toString(),
-      dailyBudgetLamports: meter.dailyBudgetLamports.toString(),
+      spentLamports24h: deps.journal.spent().toString(),
+      dailyBudgetLamports: deps.journal.dailyBudget.toString(),
       restrictedToPartners: Boolean(deps.allowedDomainHashes),
     },
   }));
 
-  router.post("/register", async ({ body, raw }) => {
-    throttle(raw);
+  paid("/register", async ({ body, raw }) => {
     const req = objectBody(body) as Partial<RegisterRequest>;
     const wallet = pubkey(req.walletPubkey, "walletPubkey");
     if (!walletLimiter.allow(wallet.toBase58())) throw new HttpError(429, "rate limited");
@@ -160,11 +158,10 @@ export function buildServer(deps: RelayerDeps): Server {
     const pre = ed25519Ix(wallet.toBytes(), signature, message);
     const reg = registerIx(payer.publicKey, wallet, commitment);
     // Registry Binding: discriminator + leaf index + commitment + slot.
-    return { json: await sendTx([pre, reg], await rentFor(8 + 8 + 32 + 8)) };
+    return { instructions: [pre, reg], rent: await rentFor(8 + 8 + 32 + 8) };
   });
 
-  router.post("/snapshot", async ({ body, raw }) => {
-    throttle(raw);
+  paid("/snapshot", async ({ body, raw }) => {
     const req = objectBody(body) as Partial<SnapshotRequest>;
     const wallet = pubkey(req.wallet, "wallet");
     const holding = pubkey(req.holding, "holding");
@@ -174,11 +171,10 @@ export function buildServer(deps: RelayerDeps): Server {
       throw new HttpError(429, "that holding was snapshotted less than a minute ago");
     }
     const ix = snapshotIx(payer.publicKey, wallet, holding);
-    return { json: await sendTx([ix], 0n) };
+    return { instructions: [ix], rent: 0n };
   });
 
-  router.post("/open-session", async ({ body, raw }) => {
-    throttle(raw);
+  paid("/open-session", async ({ body, raw }) => {
     const req = objectBody(body) as Partial<OpenSessionRequest>;
     const appId = hex(req.appIdHex, 32, "appIdHex");
     const domainHash = hex(req.domainHashHex, 32, "domainHashHex");
@@ -208,11 +204,10 @@ export function buildServer(deps: RelayerDeps): Server {
       home: pubkey(req.home, "home"),
       policy: req.policy ? policyFromDtoBytes(req.policy) : undefined,
     });
-    return { json: await sendTx([computeBudget(400_000), ix], exists ? 0n : await rentFor(POCKET_ACCOUNT_SIZE)) };
+    return { instructions: [computeBudget(400_000), ix], rent: exists ? 0n : await rentFor(POCKET_ACCOUNT_SIZE) };
   });
 
-  router.post("/owner-action", async ({ body, raw }) => {
-    throttle(raw);
+  paid("/owner-action", async ({ body, raw }) => {
     const req = objectBody(body) as Partial<OwnerActionRequest>;
     const pocket = pubkey(req.pocket, "pocket");
     const proof = {
@@ -279,7 +274,7 @@ export function buildServer(deps: RelayerDeps): Server {
       default:
         throw badRequest("unknown action");
     }
-    return { json: { ...await sendTx(instructions, cost, extraSigners), ...(tokenPairs ? {tokenPairs} : {}) } };
+    return { instructions, rent: cost, signers: extraSigners, tokenPairs };
   });
 
   // Convenience: derive a pocket address for an app id (read-only).
@@ -288,7 +283,8 @@ export function buildServer(deps: RelayerDeps): Server {
     return { json: { pocket: pocketPda(appId).toBase58() } };
   });
 
-  return router.server();
+  const server = Object.assign(router.server(), { drain: () => { draining = true; } });
+  return Object.defineProperty(server, "active", { get: () => active }) as Server & { drain(): void; readonly active: number };
 }
 
 function objectBody(value: unknown): Record<string, unknown> {

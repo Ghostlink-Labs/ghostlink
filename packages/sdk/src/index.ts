@@ -11,3 +11,4 @@ export * from "./owner-consent.js";
 export * from "./telegram.js";
 export * from "./pairing.js";
 export type { IntentSubmission } from "@ghostlink/common";
+export * from "./relayer.js";

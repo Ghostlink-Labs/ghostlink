@@ -11,6 +11,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Keypair } from "@solana/web3.js";
 import { sha256 } from "@noble/hashes/sha256";
+import { writeWatcherGenesis } from "./watcher-fixture.js";
 
 export const PYTH_RECEIVER = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
 const PRICE_UPDATE_V2_DISC = [34, 241, 35, 99, 157, 126, 244, 205];
@@ -87,5 +88,6 @@ const isMain = process.argv[1]?.endsWith("genesis.js");
 if (isMain) {
   const out = process.argv[2] ?? ".genesis";
   const accounts = writeGenesisAccounts(out);
+  if (process.env.WATCHER_DRILL === "1") writeWatcherGenesis(out);
   console.log(JSON.stringify(accounts, null, 2));
 }

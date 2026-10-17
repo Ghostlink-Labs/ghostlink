@@ -51,7 +51,7 @@ importers:
         version: link:../../services/shared
       '@solana/web3.js':
         specifier: ^1.98.0
-        version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
+        version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
     devDependencies:
       '@types/node':
         specifier: ^22
@@ -189,7 +189,7 @@ importers:
         version: link:../shared
       '@solana/web3.js':
         specifier: ^1.98.0
-        version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@6.0.6)
+        version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
       bs58:
         specifier: ^6.0.0
         version: 6.0.0
@@ -233,6 +233,9 @@ importers:
       '@ghostlink/verify':
         specifier: workspace:*
         version: link:../../packages/verify
+      '@ghostlink/watcher':
+        specifier: workspace:*
+        version: link:../watcher
       '@noble/curves':
         specifier: ^1.7.0
         version: 1.9.7
@@ -379,6 +382,9 @@ importers:
       '@solana/web3.js':
         specifier: ^1.98.0
         version: 1.99.0(bufferutil@4.1.0)(typescript@5.9.3)(utf-8-validate@5.0.10)
+      bs58:
+        specifier: ^6.0.0
+        version: 6.0.0
     devDependencies:
       '@types/node':
         specifier: ^22

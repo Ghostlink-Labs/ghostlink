@@ -55,6 +55,8 @@ import {
   sessionPublicKey,
   sweepDigest,
   revokeDigest,
+  changeDigest,
+  cancelDigest,
   type Prover,
   type ApplicationManifest,
 } from "@ghostlink/sdk";
@@ -434,17 +436,19 @@ async function main() {
   await botFixture.confirm(consent.id);
   ok("bot permissions confirmed on-chain and encrypted session restored after server restart");
 
-  const ownerBody = async (action: "sweep" | "revoke") => {
+  const ownerBody = async (action: "sweep" | "revoke" | "propose" | "cancel", change?: Uint8Array) => {
     const account = await connection.getAccountInfo(pocket, "confirmed");
     if (!account) throw new Error("pocket missing before owner action");
     const nonce = readPocketAccount(account).ownerActionNonce;
-    const digest = action === "sweep" ? sweepDigest(pocket.toBytes(), nonce) : revokeDigest(pocket.toBytes(), nonce);
+    if ((action === "propose" || action === "cancel") && !change) throw new Error("fixture change bytes required");
+    const digest = action === "sweep" ? sweepDigest(pocket.toBytes(), nonce) : action === "revoke" ? revokeDigest(pocket.toBytes(), nonce)
+      : action === "propose" ? changeDigest(pocket.toBytes(), change!, nonce) : cancelDigest(pocket.toBytes(), change!, nonce);
     const ownerInput = { registry_root: regPath.root.toString(), domain_hash: input.domain_hash, app_id: input.app_id,
       action_hash: hashToField(digest).toString(), s: input.s, pk_hi: input.pk_hi, pk_lo: input.pk_lo, reg_index: input.reg_index, reg_siblings: input.reg_siblings };
     const proof = await prover.prove("owner", ownerInput as Record<string, string | string[]>);
     const bytes = proofToBytes(proof.proof as SnarkjsProof);
     return { pocket: pocket.toBase58(), action, proofAHex: bytesToHex(bytes.a), proofBHex: bytesToHex(bytes.b), proofCHex: bytesToHex(bytes.c),
-      registryRootHex: bytesToHex(fieldToBytes32(regPath.root)) };
+      registryRootHex: bytesToHex(fieldToBytes32(regPath.root)), ...(action === "propose" ? { changeHex: bytesToHex(change!) } : {}) };
   };
 
   // ---- fund through the Blink ----------------------------------------------
@@ -577,6 +581,10 @@ async function main() {
   if (process.env.RECOVERY_DESTINATION_DRILL === "1") {
     const {exerciseRecoveryDestinations}=await import("./recovery-destinations.js");
     await exerciseRecoveryDestinations({connection,payer,wallet,pocket,relayerUrl,send,ownerBody:()=>ownerBody("sweep")});
+  }
+  if (process.env.WATCHER_DRILL === "1") {
+    const { exerciseWatcher } = await import("./watcher-drill.js");
+    await exerciseWatcher({ connection, payer, pocket, relayerUrl, ownerBody });
   }
   console.log(
     "\nE2E PASSED — register, snapshot, bot consent, prove, verify, open, confirm, restart, fund, bot-signed fill, sweep.",

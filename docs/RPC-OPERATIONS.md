@@ -2,7 +2,7 @@
 
 The solver adds cached readiness, an authenticated journal write probe, bounded admission, private provider metrics and graceful draining around this transport. See [solver operations](SOLVER-OPERATIONS.md).
 
-`@ghostlink/service-kit/rpc` provides a Node-only `createRpcPool` factory. The solver, relayer and RPC-enabled indexer entry points use it. It accepts one to four **operator-approved** endpoints and an independently approved genesis hash. Never accept an endpoint or expected genesis from a trade request or Telegram user. Existing candidate public-chain guards still apply.
+`@ghostlink/service-kit/rpc` provides a Node-only `createRpcPool` factory. The solver, relayer, watcher and RPC-enabled indexer entry points use it. It accepts one to four **operator-approved** endpoints and an independently approved genesis hash. Never accept an endpoint or expected genesis from a trade request or Telegram user. Existing candidate public-chain guards still apply.
 
 Set `RPC_ENDPOINTS_PATH` to a private JSON file outside the repository. It overrides `RPC_URL`; without it, each service uses its single URL. The shared `loadRpcEndpoints` reader rejects missing, oversized or malformed files without including their path, contents or parser diagnostics in errors. The file is bounded to 16 KiB and has this shape:
 
@@ -35,6 +35,7 @@ Use the same supported Node versions as the bot's SQLite store. This subpath is 
 | Solver | `SOLVER_GENESIS_HASH` | Approved pool for authorization, planning, signed submission and HTTP confirmation |
 | Relayer | `RELAYER_GENESIS_HASH` | Approved pool for registration/snapshot/session/owner-action preparation, signed sends and HTTP confirmation |
 | Indexer with `RPC_URL` or `RPC_ENDPOINTS_PATH` | `INDEXER_GENESIS_HASH` | Approved pool for polling and on-chain webhook root checks |
+| Watcher | `WATCHER_GENESIS_HASH` | Approved pool for event polling and timelock crank submission/confirmation; also requires a scoped `WATCHER_STATE_PATH` |
 
 These services check the pool's approved chain before listening. Missing identity, unavailable providers or all providers returning a different genesis stop startup. Wrong-chain endpoints are quarantined before business RPC. Obtain the approved hash from the reviewed deployment configuration; do not copy a hash from an unverified provider merely to make startup pass. Configuring a hash does not approve the candidate for a public network.
 
@@ -66,6 +67,8 @@ After building the local programs/circuits and `@ghostlink/e2e` dependencies, ru
 
 The separate `SERVICE_RPC_DRILL=1 bash scripts/localnet-e2e.sh` runs actual registration through a dropped acceptance reply and identical fallback packet, then injects an indexer outage, verifies unchanged cursors and resumes ingestion. It continues through proving, session creation, confirmed trading and owner recovery using the relayer/indexer pool. `pnpm --filter @ghostlink/e2e test` also starts the real compiled service entry points against synthetic HTTP providers: missing/wrong genesis refusal, fallback ingestion, diagnostic confidentiality, retry, exact signed replay, HTTP confirmation and preserved spend reservations. Build the service dependencies first.
 
-This does not establish hosted-provider capacity, independent failure domains, account consistency under actual provider lag, real Telegram/device acceptance, production alerts or public-chain readiness. Watcher, actions and browser connections retain their existing transports. Their availability and subscription recovery need separate integration evidence. Production deployment still requires the [release gates](MAINNET-READINESS.md), provider contract/quotas, monitoring for prolonged cooldown or quarantine, and a rehearsed incident procedure. No public-chain deployment is part of these drills.
+The watcher adds scoped snapshots, private diagnostics, acknowledgment verification and notification retry checks described in [watcher operations](WATCHER-OPERATIONS.md). Its validator drill uses real owner proofs for proposal/revocation/cancellation, plus an explicitly synthetic mature genesis account to exercise timelock execution without waiting a day.
+
+This does not establish hosted-provider capacity, independent failure domains, account consistency under actual provider lag, real Telegram/device acceptance, production alerts or public-chain readiness. Actions and browser connections retain their existing transports. Their availability and subscription recovery need separate integration evidence. Production deployment still requires the [release gates](MAINNET-READINESS.md), provider contract/quotas, monitoring for prolonged cooldown or quarantine, and a rehearsed incident procedure. No public-chain deployment is part of these drills.
 
 Protocol references: [genesis identity](https://solana.com/docs/rpc/http/getgenesishash), [signed submission and acknowledgment](https://solana.com/docs/rpc/http/sendtransaction), [signature history and commitment](https://solana.com/docs/rpc/http/getsignaturestatuses).

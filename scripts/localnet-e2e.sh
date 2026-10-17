@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DEPLOY_DIR="${CARGO_TARGET_DIR:-target}/deploy"
-GENESIS_DIR="services/e2e/.genesis"
+GENESIS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ghostlink-genesis.XXXXXX")"
 LEDGER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ghostlink-ledger.XXXXXX")"
 
 # Never attach the test harness to a validator someone already started.

@@ -66,7 +66,8 @@ async function start(name, extra = {}) {
   const listenPort = await port();
   const env = { ...process.env, PORT: String(listenPort), NODE_ENV: "production", POLL_MS: "100",
     RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
-    GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: join(directory, "indexer.json"), RELAYER_BUDGET_PATH: join(directory, "budget.json"), ...extra };
+    GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: join(directory, "indexer.json"), RELAYER_BUDGET_PATH: join(directory, "budget.json"),
+    WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.json"), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
   const child = spawn(process.execPath, [fileURLToPath(new URL(`../../${name}/dist/index.js`, import.meta.url))], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   const state = { child, output: "", url: `http://127.0.0.1:${listenPort}` };
   child.stdout.on("data", data => { state.output += data; });
@@ -97,7 +98,7 @@ try {
   const primary = await provider(), secondary = await provider();
   writeFileSync(configPath, JSON.stringify([{ url: primary.url }, { url: secondary.url, headers: { authorization: marker } }]));
   primary.mode = "wrong"; secondary.mode = "wrong";
-  for (const name of ["indexer", "relayer"]) {
+  for (const name of ["indexer", "relayer", "watcher"]) {
     const wrong = await start(name); await stopped(wrong);
     assert.notEqual(wrong.child.exitCode, 0, `${name} accepted wrong-chain startup`);
     assert.equal(await health(wrong), null);
@@ -120,6 +121,14 @@ try {
   secondary.mode = "normal";
   await until(async () => (await health(indexer))?.ok === true, "indexer did not resume polling");
   await stop(indexer); assert(!indexer.output.includes(marker), "indexer logs exposed provider diagnostics");
+
+  const readCount = secondary.calls.filter(method => method === "getSignaturesForAddress").length;
+  const watcher = await start("watcher");
+  await until(() => secondary.calls.filter(method => method === "getSignaturesForAddress").length > readCount, "watcher did not poll through fallback");
+  secondary.mode = "semantic";
+  await until(() => watcher.output.includes("watcher poll failed"), "watcher did not report polling failure");
+  await stop(watcher); assert(!watcher.output.includes(marker), "watcher logs exposed provider diagnostics");
+  secondary.mode = "normal";
 
   primary.mode = "drop";
   const relayer = await start("relayer");

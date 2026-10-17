@@ -47,6 +47,7 @@ import {
   GhostLink,
   RelayerClient,
   prepareRelayerOperation,
+  prepareFundingTransaction,
   type PreparedRelayerOperation,
   ApplicationRegistry,
   applicationRegistryDigest,
@@ -494,14 +495,19 @@ async function main() {
     },
   );
   if (!fundRes.ok) throw new Error(`fund: ${await fundRes.text()}`);
-  const fundTx = Transaction.from(
-    Buffer.from(((await fundRes.json()) as { transaction: string }).transaction, "base64"),
-  );
+  if (fundRes.headers.get("x-blockchain-ids") !== `solana:${(await connection.getGenesisHash()).slice(0, 32)}`) throw new Error("funding chain header mismatch");
+  const fundBlockhash = await connection.getLatestBlockhash("confirmed");
+  const fundTx = Transaction.from(prepareFundingTransaction(
+    Buffer.from(((await fundRes.json()) as { transaction: string }).transaction, "base64"), {
+      appId, funder: wallet.publicKey.toBytes(), asset: { kind: "spl", mint: inputMint.toBytes(), rawAmount: 25_000_000n },
+      recentBlockhash: bs58.decode(fundBlockhash.blockhash),
+    },
+  ));
   fundTx.partialSign(wallet);
   const fundSig = await connection.sendRawTransaction(fundTx.serialize());
-  const fundStatus = await connection.confirmTransaction(fundSig, "confirmed");
+  const fundStatus = await connection.confirmTransaction({ signature: fundSig, ...fundBlockhash }, "confirmed");
   if (fundStatus.value.err) throw new Error(`funding failed: ${JSON.stringify(fundStatus.value.err)}`);
-  ok("pocket funded through the Blink (wallet-signed deposit)");
+  ok("pocket funded through the Blink (SDK-verified, wallet-signed SPL deposit)");
   const actionsDrill = process.env.ACTIONS_DRILL === "1";
   if (actionsDrill) {
     const before = await connection.getBalance(pocket, "confirmed");
@@ -510,16 +516,18 @@ async function main() {
     });
     if (!response.ok) throw new Error(`native deposit refused: ${await response.text()}`);
     if (response.headers.get("x-blockchain-ids") !== `solana:${(await connection.getGenesisHash()).slice(0, 32)}`) throw new Error("funding chain header mismatch");
-    const transaction = Transaction.from(Buffer.from(((await response.json()) as { transaction: string }).transaction, "base64"));
-    if (transaction.signatures.some(s => s.signature !== null) || transaction.instructions.length !== 1 ||
-      !transaction.instructions[0]!.programId.equals(SystemProgram.programId) || !transaction.instructions[0]!.keys[1]!.pubkey.equals(pocket) ||
-      transaction.instructions[0]!.data.readBigUInt64LE(4) !== 1_000_000n) throw new Error("native deposit transaction mismatch");
+    const blockhash = await connection.getLatestBlockhash("confirmed");
+    const transaction = Transaction.from(prepareFundingTransaction(
+      Buffer.from(((await response.json()) as { transaction: string }).transaction, "base64"), {
+        appId, funder: wallet.publicKey.toBytes(), asset: { kind: "sol", lamports: 1_000_000n }, recentBlockhash: bs58.decode(blockhash.blockhash),
+      },
+    ));
     transaction.sign(wallet);
     const signature = await connection.sendRawTransaction(transaction.serialize());
-    if ((await connection.confirmTransaction(signature, "confirmed")).value.err || await connection.getBalance(pocket, "confirmed") !== before + 1_000_000) {
+    if ((await connection.confirmTransaction({ signature, ...blockhash }, "confirmed")).value.err || await connection.getBalance(pocket, "confirmed") !== before + 1_000_000) {
       throw new Error("native SOL deposit did not credit the exact pocket amount");
     }
-    ok("Actions approved-chain header and unsigned native SOL deposit credited exactly 1,000,000 lamports");
+    ok("SDK-verified native SOL deposit credited exactly 1,000,000 lamports on the approved chain");
   }
 
   // ---- fill an intent through the solver ------------------------------------

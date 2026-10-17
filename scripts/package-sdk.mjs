@@ -48,8 +48,8 @@ import { createPublicKey, verify } from 'node:crypto';
 import { GhostLink, softwareSession, sessionPublicKey, derivePocket, signIntent, policyToDto, policyFromDto,
   ApplicationRegistry, applicationRegistryDigest, OwnerConsentController, verifyTelegramOwnerInitData,
   prepareTelegramPairing, parseTelegramPairingCode, verifyTelegramPairingClaim,
-  RelayerClient, prepareRelayerOperation, RelayerOperationPendingError } from '@ghostlink/sdk';
-import { intentHash, conservativePolicy, policyHash } from '@ghostlink/common';
+  RelayerClient, prepareRelayerOperation, RelayerOperationPendingError, prepareFundingTransaction } from '@ghostlink/sdk';
+import { intentHash, conservativePolicy, policyHash, u64le } from '@ghostlink/common';
 const relayerOperation = prepareRelayerOperation('/snapshot', {wallet:'wallet',holding:'holding'});
 const relayerClient = new RelayerClient('https://relayer.invalid', async () => { throw new Error('synthetic offline'); });
 await assert.rejects(relayerClient.submit(relayerOperation), e => e instanceof RelayerOperationPendingError && e.operation.digestHex === relayerOperation.digestHex);
@@ -61,6 +61,15 @@ const policy = { ...conservativePolicy(), oracleFeeds: [{ mint: base, feedId: ne
   speculative: { dailyBuyCapUsdE6: 30000000n, maxCostExposureUsdE6: 20000000n, maxPositions: 2, baseMints: [base] } };
 assert.deepEqual(policyFromDto(policyToDto(policy)), policy);
 const pocket = derivePocket(1n, new Uint8Array(32).fill(1), policy);
+// Legacy native deposit fixture, independently assembled from the wire format.
+const depositWire = Uint8Array.of(1, ...new Uint8Array(64), 1, 0, 1, 3,
+  ...publicKey.key32, ...pocket.address, ...new Uint8Array(32), ...new Uint8Array(32).fill(2),
+  1, 2, 2, 0, 1, 12, 2, 0, 0, 0, ...u64le(100n));
+const depositApproval = { appId: 1n, funder: publicKey.key32, asset: { kind: 'sol', lamports: 100n }, recentBlockhash: new Uint8Array(32).fill(3) };
+const expectedDeposit = Uint8Array.from(depositWire); expectedDeposit.set(depositApproval.recentBlockhash, 165);
+assert.deepEqual(prepareFundingTransaction(depositWire, depositApproval), expectedDeposit);
+assert.throws(() => prepareFundingTransaction(depositWire, { ...depositApproval, appId: 2n }));
+assert.throws(() => prepareFundingTransaction(depositWire, { ...depositApproval, asset: { kind: 'sol', lamports: 101n } }));
 const signed = await signIntent(pocket, bot, {
   nonce: 1n, inMint: new Uint8Array(32).fill(2), inMax: 100n,
   outMint: new Uint8Array(32).fill(3), outMin: 90n, deadlineSlot: 1000n,
@@ -78,7 +87,7 @@ assert.throws(() => prepareTelegramPairing('user=forged', '12345'));
 const code = 'GLP1.12345.42.' + 'ab'.repeat(32);
 assert.equal(parseTelegramPairingCode(code).userId, '42');
 assert.throws(() => verifyTelegramPairingClaim(code, '12345', { initData: 'user=forged', expiresAt: Math.floor(Date.now()/1000)+60 }));
-console.log('Installed SDK: ESM import, public delegation and real intent signature verified. No network transaction sent.');
+console.log('Installed SDK: ESM import, public delegation, real intent signature and exact funding validation verified. No network transaction sent.');
 `);
   execFileSync(process.execPath, [join(consumer, "check.mjs")], { cwd: consumer, stdio: "inherit" });
   if (includeBot) {
@@ -122,13 +131,14 @@ console.log('Installed bot package: dependencies, encrypted backup/restore, key 
   execFileSync(process.execPath, [join(consumer, "check.cjs")], { cwd: consumer, stdio: "inherit" });
   writeFileSync(join(consumer, "check.mts"), `
 import { GhostLink, sessionPublicKey, OwnerConsentController, type OwnerConsentOptions, type OwnerConsentExpectations,
-  type SessionAuthorizationParams, type SessionPublicKey } from '@ghostlink/sdk';
+  type SessionAuthorizationParams, type SessionPublicKey, prepareFundingTransaction, type FundingApproval } from '@ghostlink/sdk';
 import type { BotConsentStatus } from '@ghostlink/common';
 const review = (options: OwnerConsentOptions, status: BotConsentStatus, expected: OwnerConsentExpectations) => new OwnerConsentController(options).review(status, expected);
 void review;
 const authorize = (client: GhostLink, params: SessionAuthorizationParams) => client.authorizeSession(params);
 const key: SessionPublicKey = sessionPublicKey(0, new Uint8Array(32));
-void authorize; void key;
+const deposit = (bytes: Uint8Array, approval: FundingApproval): Uint8Array => prepareFundingTransaction(bytes, approval);
+void authorize; void key; void deposit;
 ${includeBot ? "import { BotOnboarding, type BotOnboardingOptions, type BotConsent, type BotIntentParams, type BotOrderStatus } from '@ghostlink/bot';\nconst initBot = (options: BotOnboardingOptions) => new BotOnboarding(options);\nconst prepare = (m: BotOnboarding, c: BotConsent, requestKey: string, params: BotIntentParams) => m.prepareIntent(c.id, c, { requestKey, params });\nconst status = (m: BotOnboarding, c: BotConsent, requestKey: string): BotOrderStatus => m.orderStatus(c.id, c, requestKey);\nvoid initBot; void prepare; void status;" : ""}
 `);
   const require = createRequire(join(root, "packages", "sdk", "package.json"));

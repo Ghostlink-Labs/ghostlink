@@ -44,6 +44,8 @@ SIGINT/SIGTERM closes new admission and periodic probing, then waits for admitte
 
 ## Verification and remaining acceptance
 
+Before a funding wallet signs, use the SDK's `prepareFundingTransaction` with independently approved values. It validates every account, privilege and instruction in the exact supported unsigned legacy deposit and replaces the server blockhash with a trusted fresh one. Metadata validation alone is insufficient. The helper cannot establish genesis, account state, fees or ATA rent; clients must check and show those independently. See the [SDK funding contract](../packages/sdk/README.md#validate-a-deposit-before-wallet-signing). The full local-validator flow uses this helper before both SOL and SPL wallet signatures and checks subsequent deposit/recovery balances.
+
 Focused tests cover wrong-chain labels, missing/public deployment refusal, metadata origin validation, full pocket/mint/token account checks, canonical unsigned instructions, amount ambiguity, stale and concurrent regressing contexts, opaque protocol errors, stalled/late probes, overload, cached readiness and private metrics. Real compiled services exercise wrong-chain startup, fallback, outage refusal and recovery. The Unix process drill disconnects a request during its account read, sends SIGTERM and verifies preparation completes before RPC closes.
 
 ```sh

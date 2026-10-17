@@ -74,6 +74,34 @@ After confirmed activation, the bot reads the pocket from the correct chain, che
 
 An authorization contains no signing function. `authorizeSession` accepts only Ed25519 bot keys: a remote P-256 public key is not evidence of a hardware passkey. The existing `client.prove` method still supports locally held software/passkey signers for interactive apps. `client.prove` without a policy creates a login-only proof that cannot open a pocket. Supply the current confirmed policy for pocket renewal. Existing pockets retain their original policy: passing a new policy to `pocketFor` does not update on-chain permissions.
 
+## Validate a deposit before wallet signing
+
+`client.verifyFunding` checks GET metadata only. An Actions endpoint can return different transaction instructions in its POST response. Use `prepareFundingTransaction` with the user's independently approved app ID, funding wallet, asset and amount. Never extract those approvals from the returned transaction or its display message.
+
+```ts
+import { prepareFundingTransaction } from '@ghostlink/sdk';
+import { pk } from '@ghostlink/common';
+
+// rpc is independently configured and its genesis matches your approved localnet.
+// Check the response's x-blockchain-ids against that genesis, and independently
+// read the confirmed PocketV3 account, mint and associated token accounts first.
+const blockhash = await rpc.getLatestBlockhash('confirmed');
+const checkedBytes = prepareFundingTransaction(decodedTransactionBytes, {
+  appId: approvedAppId,
+  funder: fundingWalletPublicKeyBytes,
+  asset: { kind: 'spl', mint: approvedMintBytes, rawAmount: 25_000_000n },
+  recentBlockhash: pk(blockhash.blockhash),
+});
+// For native SOL: asset: { kind: 'sol', lamports: 1_000_000n }.
+// Estimate the fee and any ATA creation rent, show the complete debit for consent,
+// then pass only checkedBytes to the funding wallet. Do not append instructions.
+// Retain blockhash.lastValidBlockHeight with the signature for confirmation.
+```
+
+The helper accepts exactly an unsigned legacy SOL transfer to the derived pocket, or idempotent creation of its classic SPL associated token account followed by an exact token transfer from the funder's associated account. It checks the fee payer, sole signer, every account and permission, instruction order and raw integer amount. Extra instructions (including priority-fee changes, tips, approvals and memos), signatures, versioned transactions and Token-2022 are refused. It returns a detached copy with the trusted blockhash substituted and does not require web3.js or Node globals at runtime. It never signs, broadcasts or confirms a transaction.
+
+This is structural validation. A transaction does not encode the RPC genesis, account state, rent or current network fee. Confirm those independently, display SOL fees/rent as well as the token amount, and follow the original signature after an uncertain submission. A SOL deposit is not automatically wrapped for a swap. V2 remains localnet only; see [Actions operations](../../docs/ACTIONS-OPERATIONS.md) and [Solana's client responsibilities](https://solana.com/docs/tools/actions#post-response---transaction).
+
 ## Current limits
 
 Trade submission returns explicit states. Inspect `tx.state`; `pending`, `preparing` and `unknown` are not successful settlement. Persist a signed intent before sending with `client.submitSignedIntent(signed, publicSession)`, and poll with `client.intentStatus(intentHashHex)` after a timeout. Retrying the identical intent reuses the solver's persisted transaction. Never allocate a fresh nonce simply because an HTTP call failed. See [the recovery contract](../../docs/TRANSACTION-RECOVERY.md).

@@ -324,6 +324,8 @@ export class GhostLink {
    * the very pocket address derived here. This detects metadata mismatches
    * only: the Actions server still supplies the eventual transaction, whose
    * destination and instructions must be checked before a wallet signs it.
+   * Use prepareFundingTransaction with independently approved values to check
+   * the eventual deposit; this method does not validate transaction bytes.
    */
   async verifyFunding(options: FundingOptions): Promise<FundingOptions> {
     const meta = await this.getJson<{ pocket?: string }>(options.blinkUrl, "");

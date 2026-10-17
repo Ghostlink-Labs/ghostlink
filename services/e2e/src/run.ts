@@ -439,7 +439,7 @@ async function main() {
   // ---- open the pocket session ---------------------------------------------
   const pocketHandle = gl.pocketFor(glSession, home.toBytes(), policy);
   const payerBeforeOpen = BigInt(await connection.getBalance(payer.publicKey, "confirmed"));
-  const reservedBeforeOpen = BigInt(((await (await fetch(`${relayerUrl}/health`)).json()) as { spentLamports24h: string }).spentLamports24h);
+  const reservedBeforeOpen = relayerFixture.spent();
   await gl.openSession(
     glSession,
     pocketHandle,
@@ -449,7 +449,7 @@ async function main() {
   );
   const pocket = pocketPda(fieldToBytes32(appId));
   const paidForOpen = payerBeforeOpen - BigInt(await connection.getBalance(payer.publicKey, "confirmed"));
-  const reservedForOpen = BigInt(((await (await fetch(`${relayerUrl}/health`)).json()) as { spentLamports24h: string }).spentLamports24h) - reservedBeforeOpen;
+  const reservedForOpen = relayerFixture.spent() - reservedBeforeOpen;
   if (paidForOpen !== reservedForOpen || paidForOpen <= 0n) {
     throw new Error(`pocket creation spend mismatch: paid ${paidForOpen}, reserved ${reservedForOpen}`);
   }

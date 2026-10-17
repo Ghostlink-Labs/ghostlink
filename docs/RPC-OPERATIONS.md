@@ -1,6 +1,6 @@
 # RPC failover for service and bot operations
 
-The solver adds cached readiness, an authenticated journal write probe, bounded admission, private provider metrics and graceful draining around this transport. See [solver operations](SOLVER-OPERATIONS.md).
+The solver and relayer add cached readiness, authenticated journal write probes, bounded admission, private provider metrics and graceful draining around this transport. See [solver operations](SOLVER-OPERATIONS.md) and [relayer operations](RELAYER-OPERATIONS.md).
 
 `@ghostlink/service-kit/rpc` provides a Node-only `createRpcPool` factory. The solver, relayer, watcher and RPC-enabled indexer entry points use it. It accepts one to four **operator-approved** endpoints and an independently approved genesis hash. Never accept an endpoint or expected genesis from a trade request or Telegram user. Existing candidate public-chain guards still apply.
 
@@ -39,7 +39,7 @@ Use the same supported Node versions as the bot's SQLite store. This subpath is 
 
 These services check the pool's approved chain before listening. Missing identity, unavailable providers or all providers returning a different genesis stop startup. Wrong-chain endpoints are quarantined before business RPC. Obtain the approved hash from the reviewed deployment configuration; do not copy a hash from an unverified provider merely to make startup pass. Configuring a hash does not approve the candidate for a public network.
 
-Keep indexer state and relayer journals specific to their approved deployments. The hosted indexer uses an atomic SQLite checkpoint and bounded scan spool, refuses unreviewed legacy JSON migration, fences worker ownership, drains active ingestion and exposes `/ready` for catch-up/head freshness. Its `/health` remains diagnostic liveness. See [indexer operations and finality/root-ring limitations](INDEXER-OPERATIONS.md). Relayer readiness, aggregate service budgets, installed alerts and hosted-provider/load acceptance remain open.
+Keep indexer state and relayer journals specific to their approved deployments. The hosted indexer uses an atomic SQLite checkpoint and bounded scan spool, refuses unreviewed legacy JSON migration, fences worker ownership, drains active ingestion and exposes `/ready` for catch-up/head freshness. Its `/health` remains diagnostic liveness. See [indexer operations and finality/root-ring limitations](INDEXER-OPERATIONS.md). Relayer `/ready` also checks chain progress, funding, authenticated storage, daily budget and admission capacity; exact fee/rent liquidity is reserved atomically before broadcast. Aggregate service budgets, installed alerts and hosted-provider/load acceptance remain open.
 
 The shared HTTP router now defaults to opaque unexpected-error responses and logs in every environment. Provider exceptions, request URLs, headers and bodies are not printed by its default logger. `exposeErrors: true` and a custom `onError` callback are explicit local debugging facilities; do not enable raw diagnostics in hosted services. Indexer startup/poll logs never print the configured RPC URL or provider exception text.
 

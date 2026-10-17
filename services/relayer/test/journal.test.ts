@@ -20,6 +20,7 @@ function world() {
   const scope = { genesisHash: Keypair.generate().publicKey.toBase58(), payer: payer.publicKey.toBase58(), pocket: POCKET.toBase58(), registry: REGISTRY.toBase58(), census: CENSUS.toBase58() };
   const open = (file = path, budget = 100000n) => { const j = new RelayerJournal(file, key, scope, budget); cleanup.push(() => j.close()); return j; };
   const chain = {
+    getBalanceAndContext: vi.fn(async () => ({ context: { slot: 50 }, value: 1_000_000_000 })),
     getGenesisHash: vi.fn(async () => scope.genesisHash),
     getSignatureStatuses: vi.fn(async () => ({ context: { slot: 50 }, value: [null] as any[] })),
     getBlockHeight: vi.fn(async () => 50),
@@ -56,7 +57,7 @@ describe("durable relayer submissions", () => {
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
       import {readFileSync} from 'node:fs'; import {RelayerJournal} from ${JSON.stringify(pathToFileURL(join(process.cwd(), "dist/journal.js")).href)};
       const f=JSON.parse(readFileSync(process.argv[1])); const j=new RelayerJournal(process.argv[2],Buffer.from(f.key,'hex'),f.scope);
-      const c=j.claim('${id}','${digest}'); j.prepare('${id}',c.token,f.packet); process.exit(23);
+      const c=j.claim('${id}','${digest}'); j.prepare('${id}',c.token,f.packet,{balanceLamports:1000000000n,slot:50,minimumReserveLamports:50000000n}); process.exit(23);
     `, fixture, w.path], { encoding: "utf8", timeout: 5000 });
     expect(child.status, child.stderr).toBe(23);
     const j = w.open(); w.make.mockClear(); await w.submit(j).submit(id, digest, w.make);
@@ -74,6 +75,39 @@ describe("durable relayer submissions", () => {
     await Promise.all([w.submit(a).submit(id, digest, w.make), w.submit(b).submit(id, digest, w.make)]);
     expect(w.make).toHaveBeenCalledOnce(); expect(a.spent()).toBe(10100n);
     await expect(w.submit(b).submit(id, "03".repeat(32), w.make)).rejects.toMatchObject({ status: 409 });
+  });
+  it("atomically reserves shared payer liquidity and only releases it after a covered finalized receipt", async () => {
+    const w = world(), a = w.open(), b = w.open();
+    w.chain.getBalanceAndContext.mockResolvedValue({ context: { slot: 50 }, value: 50_010_100 });
+    const other = "03".repeat(32);
+    const results = await Promise.allSettled([w.submit(a).submit(id, digest, w.make), w.submit(b).submit(other, digest, w.make)]);
+    expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
+    expect(results.find(r => r.status === "rejected")).toMatchObject({ reason: { status: 503 } });
+    expect(a.spent()).toBe(10100n); expect(w.chain.sendRawTransaction).toHaveBeenCalledOnce();
+    const winner = a.get(id)?.packet ? id : other, loser = winner === id ? other : id;
+    expect(a.inspect(50).unsettled).toBe(10100n);
+    expect(a.inspect(50, Date.now() + 86_400_001)).toMatchObject({ spent: 0n, unsettled: 10100n });
+    w.chain.getSignatureStatuses.mockResolvedValue({ context: { slot: 52 }, value: [{ slot: 51, confirmationStatus: "confirmed", err: null }] });
+    await w.submit(a).status(winner);
+    expect(a.inspect(52).unsettled).toBe(10100n);
+    w.chain.getSignatureStatuses.mockResolvedValue({ context: { slot: 53 }, value: [{ slot: 51, confirmationStatus: "finalized", err: null }] });
+    await w.submit(a).status(winner);
+    expect(a.inspect(50).unsettled).toBe(10100n);
+    expect(a.inspect(51).unsettled).toBe(0n);
+    await expect(w.submit(b).submit(loser, digest, w.make)).rejects.toMatchObject({ status: 503 });
+    w.chain.getBalanceAndContext.mockResolvedValue({ context: { slot: 53 }, value: 50_010_100 });
+    w.chain.getSignatureStatuses.mockResolvedValue({ context: { slot: 53 }, value: [null] });
+    await w.submit(b).submit(loser, digest, w.make);
+    expect(a.spent()).toBe(20200n); // Finality releases liquidity, never the 24-hour spending reservation.
+  });
+  it("refuses a stale or invalid payer balance before committing or broadcasting", async () => {
+    const w = world(), j = w.open();
+    for (const balance of [{ context: { slot: 49 }, value: 1_000_000_000 }, { context: { slot: 50 }, value: NaN }]) {
+      w.chain.getBalanceAndContext.mockResolvedValueOnce(balance);
+      await expect(w.submit(j).submit(id, digest, w.make)).rejects.toThrow();
+      expect(j.get(id)).toBeUndefined(); expect(j.spent()).toBe(0n);
+    }
+    expect(w.chain.sendRawTransaction).not.toHaveBeenCalled();
   });
   it("does not replace expired, stale, wrong-chain or failed operations", async () => {
     const w = world(), j = w.open(), service = w.submit(j);

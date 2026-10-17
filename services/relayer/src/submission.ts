@@ -18,7 +18,9 @@ function context(slot: number, minimum = 0): number {
 }
 
 export class RelayerSubmission {
-  constructor(private readonly chain: Connection, readonly journal: RelayerJournal) {
+  constructor(private readonly chain: Connection, readonly journal: RelayerJournal,
+    private readonly minimumReserveLamports = 50_000_000n, private readonly preparationGuard: () => void = () => {}) {
+    if (minimumReserveLamports < 0n) throw new Error("invalid relayer reserve");
     if (journal.scope.pocket !== POCKET.toBase58() || journal.scope.registry !== REGISTRY.toBase58() || journal.scope.census !== CENSUS.toBase58()) throw new Error("relayer journal program mismatch");
     if (["EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"].includes(journal.scope.genesisHash)) throw new Error("V2 relayer has no verified public deployment");
   }
@@ -60,7 +62,14 @@ export class RelayerSubmission {
     await this.#genesis(); this.journal.checkWritable();
     const claim = this.journal.claim(id, digest); let record: RelayerRecord = claim.record;
     if (claim.token) {
-      try { const packet = await prepare(); this.#validate(packet); record = this.journal.prepare(id, claim.token, packet); }
+      try {
+        this.preparationGuard(); const packet = await prepare(); this.#validate(packet);
+        const balance = await this.chain.getBalanceAndContext(new PublicKey(this.journal.scope.payer), { commitment: "confirmed", minContextSlot: packet.minContextSlot });
+        context(balance.context.slot, packet.minContextSlot);
+        if (!Number.isSafeInteger(balance.value) || balance.value < 0) throw new Error("invalid relayer payer balance");
+        this.preparationGuard();
+        record = this.journal.prepare(id, claim.token, packet, { balanceLamports: BigInt(balance.value), slot: balance.context.slot, minimumReserveLamports: this.minimumReserveLamports });
+      }
       catch (e) { this.journal.release(id, claim.token); throw e; }
     }
     if (!record.packet) return record.observation;

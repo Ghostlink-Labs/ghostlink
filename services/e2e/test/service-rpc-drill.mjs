@@ -24,6 +24,7 @@ const payerPath = join(directory, "payer.json");
 const configPath = join(directory, "providers.json");
 writeFileSync(payerPath, JSON.stringify([...payer.secretKey]));
 
+let slot = 50;
 async function provider() {
   const state = { mode: "normal", calls: [], packets: [], statuses: 0 };
   const server = createServer(async (req, res) => {
@@ -37,11 +38,12 @@ async function provider() {
       if (state.mode === "outage") { res.writeHead(503); res.end(marker); return; }
       if (call.method === "getGenesisHash") return reply(state.mode === "wrong" ? wrongGenesis : genesis);
       if (state.mode === "semantic") return res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, error: { code: -32602, message: marker, data: { token: marker } } }));
+      if (call.method === "getBalance") return reply({ context: { slot: ++slot }, value: 1_000_000_000 });
       if (call.method === "getSignaturesForAddress") return reply([]);
-      if (call.method === "getLatestBlockhash") return reply({ context: { slot: 50 }, value: { blockhash: genesis, lastValidBlockHeight: 1000 } });
-      if (call.method === "getSlot") return reply(50);
-      if (call.method === "getBlockHeight") return reply(50);
-      if (call.method === "getFeeForMessage") return reply({ context: { slot: 50 }, value: 10000 });
+      if (call.method === "getLatestBlockhash") return reply({ context: { slot }, value: { blockhash: genesis, lastValidBlockHeight: 1000 } });
+      if (call.method === "getSlot") return reply(slot);
+      if (call.method === "getBlockHeight") return reply(slot);
+      if (call.method === "getFeeForMessage") return reply({ context: { slot }, value: 10000 });
       if (call.method === "sendTransaction") {
         state.packets.push(raw);
         const signature = bs58.encode(Transaction.from(Buffer.from(call.params[0], "base64")).signature);
@@ -51,7 +53,7 @@ async function provider() {
       }
       if (call.method === "getSignatureStatuses") {
         state.statuses++;
-        return reply({ context: { slot: 50 }, value: call.params[0].map(id => accepted.has(id) ? { slot: 50, confirmations: 1, err: null, confirmationStatus: "confirmed" } : null) });
+        return reply({ context: { slot }, value: call.params[0].map(id => accepted.has(id) ? { slot, confirmations: 1, err: null, confirmationStatus: "confirmed" } : null) });
       }
       throw new Error("unexpected test method");
     } catch { res.writeHead(500); res.end(marker); }
@@ -69,7 +71,8 @@ async function port() {
 }
 async function start(name, extra = {}) {
   const listenPort = await port();
-  const env = { ...process.env, PORT: String(listenPort), NODE_ENV: "production", POLL_MS: "100",
+  let operationsPort = await port(); while (operationsPort === listenPort) operationsPort = await port();
+  const env = { ...process.env, PORT: String(listenPort), OPERATIONS_PORT: String(operationsPort), NODE_ENV: "production", POLL_MS: "100",
     RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
     GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: "", INDEXER_STATE_PATH: join(directory, "indexer.db"), INDEXER_STATE_KEY_PATH: journalKeyPath, RELAYER_BUDGET_PATH: "", RELAYER_JOURNAL_PATH: join(directory, "relayer.db"), RELAYER_JOURNAL_KEY_PATH: journalKeyPath,
     WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.sqlite"), WATCHER_STATE_KEY_PATH: journalKeyPath, WATCHER_PORT: String(listenPort), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
@@ -87,6 +90,9 @@ async function until(work, message) {
 async function health(process) {
   try { return await (await fetch(`${process.url}/health`, { signal: AbortSignal.timeout(500) })).json(); }
   catch { return null; }
+}
+async function ready(process) {
+  try { return (await fetch(`${process.url}/ready`, { signal: AbortSignal.timeout(500) })).status === 200; } catch { return false; }
 }
 async function stopped(state) {
   await until(() => state.child.exitCode !== null || state.child.signalCode !== null, "service did not stop");
@@ -142,7 +148,7 @@ try {
 
   primary.mode = "drop";
   let relayer = await start("relayer");
-  await until(async () => Boolean(await health(relayer)), "relayer did not start");
+  await until(async () => await ready(relayer), "relayer did not start");
   const originalBody = snapshotBody();
   const submitted = await snapshot(relayer, originalBody); assert.equal(submitted.status, 200);
   const receipt = await submitted.json();
@@ -150,19 +156,20 @@ try {
   assert.equal(primary.packets[0], secondary.packets[0], "fallback changed the signed request");
   assert.equal(receipt.signature, bs58.encode(Transaction.from(Buffer.from(JSON.parse(primary.packets[0]).params[0], "base64")).signature));
   assert(secondary.statuses > 0, "confirmation bypassed fallback HTTP");
-  assert.equal((await health(relayer)).spentLamports24h, "10000");
+  await until(async () => (await health(relayer))?.spentLamports24h === "10000", "cached spending did not refresh");
   await stop(relayer); relayer = await start("relayer");
-  await until(async () => Boolean(await health(relayer)), "relayer did not reopen its journal");
+  await until(async () => await ready(relayer), "relayer did not reopen its journal");
   const repeated = await snapshot(relayer, originalBody); assert.equal(repeated.status, 200);
   assert.equal((await repeated.json()).signature, receipt.signature);
   assert.equal(primary.packets.length, 1); assert.equal(secondary.packets.length, 1);
-  assert.equal((await health(relayer)).spentLamports24h, "10000");
+  await until(async () => (await health(relayer))?.spentLamports24h === "10000", "cached spending did not refresh");
   secondary.mode = "reject-send";
   const rejectedSend = await snapshot(relayer); assert.equal(rejectedSend.status, 202);
   const rejectedBody = await rejectedSend.text(); assert(!rejectedBody.includes(marker)); assert.equal(JSON.parse(rejectedBody).state, "pending");
-  assert.equal((await health(relayer)).spentLamports24h, "20000");
+  await until(async () => (await health(relayer))?.spentLamports24h === "20000", "cached spending did not refresh");
   primary.mode = "outage"; secondary.mode = "outage";
-  const unavailable = await snapshot(relayer); assert.equal(unavailable.status, 500);
+  await until(async () => !await ready(relayer), "relayer admission survived total outage");
+  const unavailable = await snapshot(relayer); assert.equal(unavailable.status, 503);
   assert(!JSON.stringify(await unavailable.json()).includes(marker));
   assert.equal((await health(relayer)).spentLamports24h, "20000", "preparation failure spent budget");
   await stop(relayer); assert(!relayer.output.includes(marker), "relayer logs exposed provider diagnostics");

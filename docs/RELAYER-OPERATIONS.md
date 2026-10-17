@@ -31,21 +31,51 @@ Use Node 22 with `node:sqlite`. Keep these paths and keys outside tracked source
 - `RELAYER_JOURNAL_PATH`: persistent journal on local durable storage.
 - `RELAYER_JOURNAL_KEY_PATH`: file containing exactly 32 raw random bytes, managed through the operator's secret system.
 - `RELAYER_DAILY_BUDGET_LAMPORTS`: conservative rolling 24-hour fee plus creation-rent ceiling, default 2 SOL. Complete message fees above 20,000 lamports are refused. Set an appropriate cap for the intended deployment.
+- `RELAYER_MIN_BALANCE_LAMPORTS`: operating reserve, default 50,000,000 lamports (0.05 SOL); must be at least the maximum 20,000-lamport network fee. This is separate from permission to spend the daily budget.
+- `RELAYER_MAX_IN_FLIGHT`: total paid/reconciliation handlers, default 8, allowed range 2–64. One slot is reserved for reconciliation; overload is refused without a waiting queue.
+- `OPERATIONS_PORT`: private metrics listener, default 18788, bound to `127.0.0.1`; must differ from the public HTTP port.
 - `RELAYER_ALLOWED_ORIGINS`, `TRUST_PROXY` and `PORT`: retain their existing meanings. Only trust forwarded addresses behind your controlled proxy.
 
 The journal is authenticated against genesis, payer and all three program IDs. A wrong key/scope refuses access. SQLite FULL transactions atomically save packet and reservation, including all auxiliary signatures. Multiple handles to that same database coordinate preparation leases and spending. Use one hosted instance per journal/payer: independent databases do not share a budget, and admission/rate controls are process-local. This is not multi-host availability.
 
 Legacy `RELAYER_BUDGET_PATH` configuration is refused. Before replacing an older service, stop admission and reconcile its outstanding transactions and spend window; do not erase old state or reset a funded payer's budget to make startup pass. Journal backup import, key rotation, coordinated cutover and history reconciliation need separate acceptance. Storage marked as restored is refused. Manual file rollback is not detected as a safe restore and must never be used to resume funded work.
 
-Reservations remain charged for 24 hours after preparation even if execution fails or is uncertain. Clock correctness matters. Receipts are retained with a 10,000-operation admission limit; capacity exhaustion refuses new operations. No automatic pruning/retention migration is implemented. Health reports budget/liveness only, not chain freshness, balance or readiness. SIGTERM/SIGINT stops new admission and waits up to 30 seconds for handlers; a forced stop leaves durable operations for reconciliation.
+Reservations remain charged for 24 hours after preparation even if execution fails or is uncertain. Clock correctness matters. Receipts are retained with a 10,000-operation admission limit; capacity exhaustion refuses new operations. No automatic pruning/retention migration is implemented.
+
+## Funding and admission
+
+Before saving a new packet, the relayer obtains the payer's confirmed balance at least as recent as the packet context. In the same SQLite transaction that saves the packet, it requires:
+
+```text
+quoted fee + quoted creation rent + unresolved reservations + operating reserve <= payer balance
+```
+
+The existing daily spending cap is checked independently in that same transaction. Concurrent preparation handles cannot each spend the same available balance. Invalid/stale balance evidence or insufficient funds prevents packet commit and broadcast. Existing saved packets retain their original reservation and may reconcile or rebroadcast unchanged; no additional fee is reserved merely for a retry.
+
+Liquidity reservations are conservative. A confirmed or uncertain transaction remains reserved even after 24 hours. Only a finalized receipt whose transaction slot is covered by the balance read releases its liquidity reservation; it does not refund the daily spending allowance. Already deducted but not finalized transactions may therefore be counted twice temporarily. Unknown expired packets need independent history reconciliation and never release liquidity automatically. External use of the same payer can still race a balance read; use a dedicated service payer and one journal.
+
+## Readiness, metrics and shutdown
+
+`GET /health` is diagnostic liveness, with a cached `spentLamports24h` (initially `null` before the first successful probe). It is not a transaction ledger read or settlement certificate. `GET /ready` returns 200 only when all cached checks pass; otherwise 503, with `Cache-Control: no-store`. Public HTTP polls trigger no RPC calls or journal scans.
+
+Every two seconds a bounded background probe checks approved genesis, confirmed payer balance, authenticated writable storage, retained-record capacity and remaining daily budget. It scans at most the journal's 10,000 retained operations, and reconciles up to four unfinished packets in round-robin order so finalized outcomes can eventually release liquidity without client polling. These scans require hosted load acceptance; readiness does not prove provider history completeness, future disk space or affordability of the next quoted transaction.
+
+Admission requires two advancing confirmed-context samples. Evidence expires after ten seconds; context must advance within fifteen seconds. Probes time out after seven seconds. A timed-out but still-running transport keeps its probe slot until settlement, and late success cannot restore readiness. Age/progress use monotonic elapsed time. Failed storage, wrong/stale/frozen chain, exhausted capacity/budget, insufficient reserve or drain close new admission. Actual fee, rent, balance, journal commit and permission checks remain mandatory per transaction.
+
+The HTTP router bounds bodies, connections and active handlers; IP/wallet quotas still apply. Paid work has no waiting queue. One of the configured handler slots is reserved for existing packet retries and status reconciliation. These remain available during dependency or funding refusal while capacity permits; unavailable chain/journal evidence can still return `unknown` or an error. A 503 never authorizes changing the request ID/body or assuming that earlier work did not execute. Controls are per-process, not distributed quotas.
+
+The loopback-only `GET /metrics` exposes readiness checks, active/accepted/rejected/completed handler counts, cached fee/rent reservations, retained-record count and bounded provider-index status. Labels contain no request IDs, signatures, payer identities, endpoint URLs, credentials or key paths. `completed` means handler completion, not successful settlement; counters reset on restart. Collect aggregate HTTP statuses at the trusted proxy and configure actual alert delivery separately.
+
+SIGTERM/SIGINT stops new HTTP admission and periodic probes, closes the public listener, and waits for admitted handlers (including disconnected clients) and the active probe before closing the journal/RPC transport. Healthy admitted preparation can finish during drain. The private metrics listener remains available during this wait. The deadline is 30 seconds; forced exit leaves committed packets for reconciliation. An unprepared claim can be retried with the original request after its lease expires.
 
 ## Verified boundary and remaining work
 
-The focused tests cover lost/substituted replies, same-packet retries, a real child exit immediately after the durable commit, SQLite transaction rollback, concurrent handles, budget limits, wrong/stale chain evidence, conservative expiry and SDK recovery-data retention. Real compiled service processes exercise HTTP failover and opaque diagnostics. The disposable-validator recovery drill loses an accepted withdrawal reply, reopens the journal, retains the generated home destination and original signature, and verifies the actual recovered balances without a second reservation:
+The focused tests cover lost/substituted replies, same-packet retries, a real child exit immediately after durable commit, SQLite transaction rollback/lock refusal, concurrent funding reservations, covered-finality liquidity release, budget limits, wrong/stale/frozen chain evidence, hung/late probes, bounded reconciliation batches, reserved status capacity, cached HTTP health, private metrics and conservative expiry. Real compiled service processes exercise HTTP failover, admission refusal and opaque diagnostics. The Unix shutdown drill disconnects a client during preparation, sends SIGTERM and verifies one confirmed packet and reservation after reopening the journal. The disposable-validator recovery drill loses an accepted withdrawal reply, reopens the journal, retains the generated home destination and original signature, and verifies actual recovered balances without a second reservation:
 
 ```sh
 # Build the packages/programs/circuits as described in SETUP.md first.
 RECOVERY_DESTINATION_DRILL=1 RELAYER_JOURNAL_DRILL=1 bash scripts/localnet-e2e.sh
+node services/relayer/test/shutdown-drill.mjs # Linux/WSL
 ```
 
-These checks do not establish production readiness. Remaining work includes funded-state migration/restore/rotation, independently reconciled history, readiness and private alerts, hosted-provider load/soak, aggregate budgets and the security/deployment gates in [mainnet readiness](MAINNET-READINESS.md).
+These checks do not establish production readiness. Remaining work includes funded-state migration/restore/rotation, independently reconciled history, retention/scaling, installed private alerts, hosted-provider load/soak, aggregate budgets and the security/deployment gates in [mainnet readiness](MAINNET-READINESS.md).

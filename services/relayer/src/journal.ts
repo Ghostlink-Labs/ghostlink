@@ -14,6 +14,7 @@ export interface RelayerRecord {
   id: string; digest: string; lease?: { token: string; until: number }; packet?: RelayerPacket;
   chargedAt?: number; observation: RelayerReceipt; observedSlot: number;
 }
+export interface FundingEvidence { balanceLamports: bigint; slot: number; minimumReserveLamports: bigint }
 const hex32 = (s: string) => typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
 
 export class RelayerJournal {
@@ -62,6 +63,20 @@ export class RelayerJournal {
     }
     return total;
   }
+  /** Bounded by maximumRecords. Called by periodic probes and atomic preparation, never by a public health poll. */
+  inspect(balanceSlot: number, now = this.#now()) {
+    let spent = 0n, unsettled = 0n;
+    const ids = this.#storage.db.prepare("SELECT id FROM operations ORDER BY id").all();
+    const reconcileIds: string[] = [];
+    for (const row of ids) {
+      const record = this.get(String(row.id))!; if (!record.packet) continue;
+      const cost = BigInt(record.packet.feeLamports) + BigInt(record.packet.rentLamports);
+      if (record.chargedAt !== undefined && now - record.chargedAt < 86_400_000) spent += cost;
+      if (record.observation.confirmationStatus !== "finalized" || (record.observation.slot ?? Infinity) > balanceSlot) unsettled += cost;
+      if (record.observation.confirmationStatus !== "finalized") reconcileIds.push(record.id);
+    }
+    return { records: ids.length, maximumRecords: this.maximumRecords, spent, unsettled, reconcileIds };
+  }
   claim(id: string, digest: string): { record: RelayerRecord; token?: string } {
     if (!hex32(id) || !hex32(digest)) throw new Error("invalid relayer request identity");
     return this.#storage.transaction(() => {
@@ -80,13 +95,17 @@ export class RelayerJournal {
       if (record?.lease?.token === token && !record.packet) this.#storage.db.prepare("DELETE FROM operations WHERE id=?").run(id);
     });
   }
-  prepare(id: string, token: string, packet: RelayerPacket): RelayerRecord {
+  prepare(id: string, token: string, packet: RelayerPacket, funding: FundingEvidence): RelayerRecord {
     return this.#storage.transaction(() => {
       const record = this.get(id), now = this.#now();
       if (!record || record.packet || record.lease?.token !== token || record.lease.until <= now) throw new Error("relayer preparation lease lost");
       for (const value of [packet.feeLamports, packet.rentLamports]) if (!/^(0|[1-9][0-9]{0,19})$/.test(value)) throw new Error("invalid relayer cost");
       const cost = BigInt(packet.feeLamports) + BigInt(packet.rentLamports);
-      if (cost > this.dailyBudget - this.spent(now)) throw new HttpError(503, "relayer daily budget exhausted");
+      if (!funding || !Number.isSafeInteger(funding.slot) || funding.slot < packet.minContextSlot || funding.balanceLamports < 0n ||
+        funding.minimumReserveLamports < 0n) throw new Error("invalid relayer funding evidence");
+      const budget = this.inspect(funding.slot, now);
+      if (cost > this.dailyBudget - budget.spent) throw new HttpError(503, "relayer daily budget exhausted");
+      if (cost + budget.unsettled + funding.minimumReserveLamports > funding.balanceLamports) throw new HttpError(503, "relayer funding reserve unavailable");
       record.packet = structuredClone(packet); record.chargedAt = now; delete record.lease;
       record.observedSlot = packet.minContextSlot;
       record.observation = { requestIdHex: id, state: "pending", signature: packet.signature, tokenPairs: packet.tokenPairs };

@@ -35,7 +35,6 @@ import {
   type Handler,
   RateLimiter,
   Router,
-  Semaphore,
   POCKET_ACCOUNT_SIZE,
   badRequest,
   cancelChangeIx,
@@ -55,6 +54,7 @@ import { policyFromDtoBytes } from "./policy.js";
 import { prepareRecoverySweep } from "./recovery.js";
 import { RelayerJournal } from "./journal.js";
 import { RelayerSubmission, requestIdentity } from "./submission.js";
+import { RelayerOperations, type OperationsOptions } from "./operations.js";
 
 export interface RelayerDeps {
   journal: RelayerJournal;
@@ -68,20 +68,29 @@ export interface RelayerDeps {
   trustProxy?: boolean;
   /** Transactions in flight at once; default 8. */
   maxInFlight?: number;
+  /** Operational SOL floor, independent of daily spending permission. */
+  minimumBalanceLamports?: number;
+  /** Probe timing overrides for controlled deployments and deterministic tests. */
+  probe?: Pick<OperationsOptions, "probeIntervalMs" | "probeTimeoutMs" | "freshnessMs" | "progressTimeoutMs" | "clock">;
 }
 
 const MAX_TOKEN_PAIRS = 16;
 
-export function buildServer(deps: RelayerDeps): Server & { drain(): void; readonly active: number } {
+export function buildServer(deps: RelayerDeps): Server & { drain(): void; readonly active: number; operations: RelayerOperations } {
   const { connection, payer } = deps;
   if (!deps.journal || deps.journal.scope.payer !== payer.publicKey.toBase58()) throw new Error("relayer requires a journal bound to its payer");
-  const submissions = new RelayerSubmission(connection, deps.journal);
-  let draining = false, active = 0;
+  const minimumBalanceLamports = deps.minimumBalanceLamports ?? 50_000_000;
+  if (!Number.isSafeInteger(minimumBalanceLamports) || minimumBalanceLamports < 20_000) throw new Error("relayer reserve must cover its maximum network fee");
+  let operations: RelayerOperations;
+  const submissions = new RelayerSubmission(connection, deps.journal, BigInt(minimumBalanceLamports), () => operations.assertPreparationReady());
+  operations = new RelayerOperations({ connection, payer: payer.publicKey, genesisHash: deps.journal.scope.genesisHash, journal: deps.journal,
+    minimumBalanceLamports, maxInFlight: deps.maxInFlight, ...deps.probe,
+    reconcile: async ids => { await Promise.allSettled(ids.map(id => submissions.status(id))); } });
+  let draining = false;
   const minLamports = deps.minWalletLamports ?? 10_000_000n; // 0.01 SOL
   const ipLimiter = new RateLimiter(30, 60_000);
   const walletLimiter = new RateLimiter(3, 60_000);
   const snapshotLimiter = new RateLimiter(1, 60_000);
-  const inFlight = new Semaphore(deps.maxInFlight ?? 8);
   const router = new Router();
 
   function throttle(raw: Parameters<typeof clientIp>[0]): void {
@@ -100,19 +109,19 @@ export function buildServer(deps: RelayerDeps): Server & { drain(): void; readon
     router.post(path, async request => {
       throttle(request.raw);
       if (draining) throw new HttpError(503, "relayer is draining");
-      active++;
+      let release: (() => void) | undefined;
       try {
         const body = objectBody(request.body);
         let identity: ReturnType<typeof requestIdentity>;
         try { identity = requestIdentity(path, body); } catch { throw badRequest("valid requestIdHex required; snapshot retries must reuse their original ID"); }
         const prior = deps.journal.get(identity.id);
         if (prior && prior.digest !== identity.digest) throw new HttpError(409, "request ID is bound to different content");
-        const receipt = await inFlight.run(async () => {
-          if (draining) throw new HttpError(503, "relayer is draining");
-          return submissions.submit(identity.id, identity.digest, async () => {
+        release = operations.acquire(prior?.packet ? "reconcile" : "new");
+        if (!release) throw new HttpError(503, "relayer not ready or busy; retain the original request");
+        const receipt = await submissions.submit(identity.id, identity.digest, async () => {
             const plan = await prepare(request);
-            const latest = await connection.getLatestBlockhashAndContext({ commitment: "confirmed" });
-            if (!Number.isSafeInteger(latest.context.slot) || latest.context.slot < 0) throw new HttpError(503, "transaction context unavailable");
+            const latest = await connection.getLatestBlockhashAndContext({ commitment: "confirmed", minContextSlot: operations.minimumSlot });
+            if (!Number.isSafeInteger(latest.context.slot) || latest.context.slot < operations.minimumSlot) throw new HttpError(503, "transaction context unavailable");
             const tx = new Transaction({ feePayer: payer.publicKey, ...latest.value }).add(...plan.instructions);
             tx.sign(payer, ...(plan.signers ?? []));
             const bytes = tx.serialize(), fee = await connection.getFeeForMessage(tx.compileMessage(), "confirmed");
@@ -121,10 +130,9 @@ export function buildServer(deps: RelayerDeps): Server & { drain(): void; readon
             return { rawBase64: bytes.toString("base64"), signature: bs58.encode(tx.signature!), blockhash: latest.value.blockhash,
               lastValidBlockHeight: latest.value.lastValidBlockHeight, minContextSlot: latest.context.slot,
               feeLamports: fee.value.toString(), rentLamports: plan.rent.toString(), tokenPairs: plan.tokenPairs };
-          });
         });
         return { status: receipt.state === "failed" ? 502 : ["confirmed", "finalized"].includes(receipt.state) ? 200 : 202, json: receipt };
-      } finally { active--; }
+      } finally { release?.(); }
     });
   }
   router.get("/submissions/:requestIdHex", async ({ params, raw }) => {
@@ -132,19 +140,24 @@ export function buildServer(deps: RelayerDeps): Server & { drain(): void; readon
     if (draining) throw new HttpError(503, "relayer is draining");
     const id = params.requestIdHex!;
     if (!submissions || !/^[0-9a-f]{64}$/.test(id) || !deps.journal.get(id)) throw new HttpError(404, "submission not found");
-    active++;
-    try { return { json: await inFlight.run(() => submissions.status(id)) }; }
-    finally { active--; }
+    const release = operations.acquire("reconcile");
+    if (!release) throw new HttpError(503, "relayer busy; retain the original request");
+    try { return { json: await submissions.status(id) }; }
+    finally { release(); }
   });
   router.get("/health", async () => ({
     json: {
       ok: true,
       payer: payer.publicKey.toBase58(),
-      spentLamports24h: deps.journal.spent().toString(),
+      spentLamports24h: operations.snapshot().spentLamports24h,
       dailyBudgetLamports: deps.journal.dailyBudget.toString(),
       restrictedToPartners: Boolean(deps.allowedDomainHashes),
     },
   }));
+  router.get("/ready", async () => {
+    const { ready, checks } = operations.snapshot();
+    return { status: ready ? 200 : 503, json: { ready, checks }, headers: { "cache-control": "no-store", "retry-after": "1" } };
+  });
 
   paid("/register", async ({ body, raw }) => {
     const req = objectBody(body) as Partial<RegisterRequest>;
@@ -283,8 +296,10 @@ export function buildServer(deps: RelayerDeps): Server & { drain(): void; readon
     return { json: { pocket: pocketPda(appId).toBase58() } };
   });
 
-  const server = Object.assign(router.server(), { drain: () => { draining = true; } });
-  return Object.defineProperty(server, "active", { get: () => active }) as Server & { drain(): void; readonly active: number };
+  const server = Object.assign(router.server(), { operations, drain: () => { draining = true; operations.drain(); } });
+  server.once("listening", () => operations.start());
+  server.once("close", () => operations.drain());
+  return Object.defineProperty(server, "active", { get: () => operations.snapshot().active }) as ReturnType<typeof buildServer>;
 }
 
 function objectBody(value: unknown): Record<string, unknown> {

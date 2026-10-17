@@ -46,6 +46,7 @@ import {
 import {
   GhostLink,
   RelayerClient,
+  RelayerOperationPendingError,
   prepareRelayerOperation,
   prepareFundingTransaction,
   type PreparedRelayerOperation,
@@ -224,9 +225,19 @@ async function main() {
       if (Date.now() > deadline) throw new Error(`relayer ${operation.route} did not settle its original request`);
       await new Promise(resolve => setTimeout(resolve, 500));
       receipt = await relayerClient.status(operation.requestIdHex);
+      // The original call may have saved a packet but lacked evidence to broadcast it.
+      // Retry only this immutable request after reconciliation permits pending/preparing work.
+      if (receipt.state === "pending" || receipt.state === "preparing") receipt = await relayerClient.submit(operation);
     }
     if (receipt.state === "failed") throw new Error(`relayer ${operation.route} failed on-chain`);
     return receipt;
+  };
+  const settleSession = async (open: () => Promise<unknown>) => {
+    try { await open(); }
+    catch (error) {
+      if (!(error instanceof RelayerOperationPendingError)) throw error;
+      await settleRelayer(error.operation);
+    }
   };
   // Synthetic Pyth accounts loaded by this disposable validator's genesis.
   const priceAccounts: Record<string, string> = {
@@ -447,13 +458,18 @@ async function main() {
   const pocketHandle = gl.pocketFor(glSession, home.toBytes(), policy);
   const payerBeforeOpen = BigInt(await connection.getBalance(payer.publicKey, "confirmed"));
   const reservedBeforeOpen = relayerFixture.spent();
-  await gl.openSession(
+  if (process.env.WATCHER_DRILL === "1") relayerFixture.refuseNextInitialStatus();
+  await settleSession(() => gl.openSession(
     glSession,
     pocketHandle,
     { mint: inputMint.toBytes(), threshold: claim.amount, minSlot, claim: true },
     { registry: regPath.root, census: cenPath.root },
     domainHash,
-  );
+  ));
+  if (process.env.WATCHER_DRILL === "1") {
+    relayerFixture.assertInitialStatusRefused();
+    ok("initial unknown opening receipt reconciled through the same saved request");
+  }
   const pocket = pocketPda(fieldToBytes32(appId));
   const paidForOpen = payerBeforeOpen - BigInt(await connection.getBalance(payer.publicKey, "confirmed"));
   const reservedForOpen = relayerFixture.spent() - reservedBeforeOpen;
@@ -569,8 +585,8 @@ async function main() {
       ownerRegistry.update(ownerManifest, applicationRegistryDigest(ownerManifest));
       const nextReview = await ownerConsent.review(next, { ...ownerExpectations, expirySlot: nextExpiry });
       const nextSession = await ownerConsent.prove(nextReview, ownerProofParams);
-      await gl.openSession(nextSession, gl.pocketFor(nextSession, home.toBytes(), policy),
-        { mint: inputMint.toBytes(), threshold: claim.amount, minSlot, claim: true }, { registry: regPath.root, census: cenPath.root }, domainHash);
+      await settleSession(() => gl.openSession(nextSession, gl.pocketFor(nextSession, home.toBytes(), policy),
+        { mint: inputMint.toBytes(), threshold: claim.amount, minSlot, claim: true }, { registry: regPath.root, census: cenPath.root }, domainHash));
       const until = Date.now() + 60_000;
       for (;;) {
         try { if (!(await solverFixture.prepareRecovery(pocket.toBase58())).rotationRequired) break; }

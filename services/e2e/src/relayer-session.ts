@@ -17,6 +17,8 @@ export async function startRelayerFixture(connection: Connection, payer: Keypair
   const dir = mkdtempSync(join(tmpdir(), "ghostlink-relayer-e2e-")), path = join(dir, "relayer.db"), key = randomBytes(32);
   const scope = { genesisHash: await connection.getGenesisHash(), payer: payer.publicKey.toBase58(), pocket: POCKET.toBase58(), registry: REGISTRY.toBase58(), census: CENSUS.toBase58() };
   let armed = false, hidden = false;
+  let refuseNextInitialStatus = false, initialStatusRefusals = 0;
+  const inspectedSignatures = new Set<string>();
   const packets: string[] = [];
   const transport = new Proxy(connection, { get(target, prop) {
     if (prop === "sendRawTransaction") return async (...args: Parameters<Connection["sendRawTransaction"]>) => {
@@ -27,6 +29,12 @@ export async function startRelayerFixture(connection: Connection, payer: Keypair
     };
     if (prop === "getSignatureStatuses") return async (...args: Parameters<Connection["getSignatureStatuses"]>) => {
       if (hidden) throw new Error("synthetic receipt outage");
+      const signature = args[0][0]!;
+      const firstInspection = !inspectedSignatures.has(signature); inspectedSignatures.add(signature);
+      if (refuseNextInitialStatus && firstInspection) {
+        refuseNextInitialStatus = false; initialStatusRefusals++;
+        throw new Error("synthetic initial status outage before broadcast");
+      }
       return target.getSignatureStatuses(...args);
     };
     const value = Reflect.get(target, prop, target); return typeof value === "function" ? value.bind(target) : value;
@@ -51,6 +59,8 @@ export async function startRelayerFixture(connection: Connection, payer: Keypair
     assert(server.operations.idle, "relayer probe did not drain"); server.operations.stop(); journal.close();
   }
   return { url,
+    refuseNextInitialStatus() { refuseNextInitialStatus = true; },
+    assertInitialStatusRefused() { assert.equal(initialStatusRefusals, 1); assert.equal(refuseNextInitialStatus, false); },
     backupForDrill: () => journal.backupTo(join(dir, "before-sweep.enc")),
     async verifyBackupDrill(historyConnection: Connection) {
       const target = await historyConnection.getSlot("confirmed"), deadline = Date.now() + 60_000;

@@ -22,8 +22,10 @@
  *   LARGE_FILL_USD_E6 — threshold for large-fill alerts (default $100)
  *   GHOSTLINK_WATCHER_KEYPAIR — optional fee payer; enables the crank
  *   WATCHER_STATE_PATH / WATCHER_STATE_KEY_PATH — durable scoped queue and raw 32-byte encryption key (required)
+ *   WATCHER_STATE_ID — independently pinned encrypted observation-state identity
  *   WATCHER_POLL_MS — polling interval, 100..30000 (default 5000)
  *   WATCHER_JOURNAL_PATH / WATCHER_JOURNAL_KEY_PATH — required for funded execution
+ *   WATCHER_JOURNAL_ID — independently pinned encrypted crank-journal identity (funded mode)
  *   WATCHER_TOTAL_BUDGET_LAMPORTS — explicit cumulative fee cap, never reset by restart
  *   WATCHER_MAX_FEE_LAMPORTS — per-packet cap (default 20000)
  */
@@ -270,7 +272,8 @@ export class Watcher {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 async function main() {
   const genesisHash = process.env.WATCHER_GENESIS_HASH, statePath = process.env.WATCHER_STATE_PATH, keyPath = process.env.WATCHER_STATE_KEY_PATH;
-  if (!genesisHash || !statePath || !keyPath) throw new Error("approved watcher chain, durable state and encryption key are required");
+  const stateId = process.env.WATCHER_STATE_ID;
+  if (!genesisHash || !statePath || !keyPath || !stateId || !/^[0-9a-f]{64}$/.test(stateId)) throw new Error("approved watcher chain, durable state, pinned identity and encryption key are required");
   const rpc = createRpcPool({ genesisHash, endpoints: loadRpcEndpoints(process.env.RPC_ENDPOINTS_PATH, process.env.RPC_URL) });
   let journal: CrankJournal | undefined, state: WatcherState | undefined;
   const server = createServer();
@@ -280,19 +283,18 @@ async function main() {
     const threshold = BigInt(process.env.LARGE_FILL_USD_E6 ?? "100000000");
     const cranker = process.env.GHOSTLINK_WATCHER_KEYPAIR
       ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.env.GHOSTLINK_WATCHER_KEYPAIR, "utf8")))) : undefined;
-    if (cranker && (!process.env.WATCHER_JOURNAL_PATH || !process.env.WATCHER_JOURNAL_KEY_PATH || !process.env.WATCHER_TOTAL_BUDGET_LAMPORTS)) throw new Error("funded watcher journal and budget are required");
-    const key = readFileSync(keyPath);
-    try { state = new WatcherState(statePath, key, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker?.publicKey.toBase58() ?? null,
-      receiver: createHash("sha256").update(process.env.NOTIFY_WEBHOOK ?? "console").digest("hex"), threshold: threshold.toString() }); }
-    finally { key.fill(0); }
     if (cranker) {
-      const journalPath = process.env.WATCHER_JOURNAL_PATH, journalKeyPath = process.env.WATCHER_JOURNAL_KEY_PATH;
-      if (!journalPath || !journalKeyPath || !process.env.WATCHER_TOTAL_BUDGET_LAMPORTS) throw new Error("funded watcher journal and budget are required");
+      const journalPath = process.env.WATCHER_JOURNAL_PATH, journalKeyPath = process.env.WATCHER_JOURNAL_KEY_PATH, journalId = process.env.WATCHER_JOURNAL_ID;
+      if (!journalPath || !journalKeyPath || !process.env.WATCHER_TOTAL_BUDGET_LAMPORTS || !journalId) throw new Error("funded watcher journal, pinned identity and budget are required");
       const journalKey = readFileSync(journalKeyPath);
-      try { journal = new CrankJournal(journalPath, journalKey, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker.publicKey.toBase58() }, {
+      try { journal = CrankJournal.openExisting(journalPath, journalKey, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker.publicKey.toBase58() }, {
         maximumFeeLamports: Number(process.env.WATCHER_MAX_FEE_LAMPORTS ?? 20_000), totalBudgetLamports: Number(process.env.WATCHER_TOTAL_BUDGET_LAMPORTS),
-      }); } finally { journalKey.fill(0); }
+      }, journalId); } finally { journalKey.fill(0); }
     }
+    const key = readFileSync(keyPath);
+    try { state = WatcherState.openExisting(statePath, key, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker?.publicKey.toBase58() ?? null,
+      receiver: createHash("sha256").update(process.env.NOTIFY_WEBHOOK ?? "console").digest("hex"), threshold: threshold.toString() }, stateId); }
+    finally { key.fill(0); }
     const watcher = new Watcher(rpc.connection, notifier, threshold, cranker, state, journal, {
       maximumPages: Number(process.env.WATCHER_PAGES_PER_TICK ?? 4), maximumTransactions: Number(process.env.WATCHER_TRANSACTIONS_PER_TICK ?? 32),
       maximumDeliveries: Number(process.env.WATCHER_DELIVERIES_PER_TICK ?? 32), maximumTickMs: Number(process.env.WATCHER_TICK_BUDGET_MS ?? 10_000),

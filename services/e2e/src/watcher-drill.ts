@@ -17,6 +17,12 @@ export async function exerciseWatcher(input: {
   const directory = mkdtempSync(join(tmpdir(), "ghostlink-watcher-validator-")), state = join(directory, "state.sqlite");
   const rpc = await startRpcFaultFixture(connection), genesis = await connection.getGenesisHash();
   const journalKey = randomBytes(32), journalPath = join(directory, "cranks.sqlite");
+  const journalScope = { genesisHash: genesis, pocketProgram: POCKET.toBase58(), payer: payer.publicKey.toBase58() };
+  const limits = { maximumFeeLamports: 20_000, totalBudgetLamports: 100_000 };
+  const stateScope = { ...journalScope, receiver: "validator-fixture", threshold: "1" };
+  const initialJournal = new CrankJournal(journalPath, journalKey, journalScope, limits), journalId = initialJournal.instanceId!;
+  initialJournal.close();
+  const initialState = new WatcherState(state, journalKey, stateScope), stateId = initialState.instanceId!; initialState.close();
   let journal: CrankJournal | undefined, runningWatcher: Watcher | undefined, broadcasts = 0;
   // The provider pool resends identical bytes; then lose the final reply at the process boundary too.
   const crankConnection = new Proxy(rpc.connection, { get(target, property) {
@@ -40,9 +46,8 @@ export async function exerciseWatcher(input: {
   };
   const restore = () => {
     runningWatcher?.close(); journal?.close();
-    journal = new CrankJournal(journalPath, journalKey, { genesisHash: genesis, pocketProgram: POCKET.toBase58(), payer: payer.publicKey.toBase58() },
-      { maximumFeeLamports: 20_000, totalBudgetLamports: 100_000 });
-    const database = new WatcherState(state, journalKey, { genesisHash: genesis, pocketProgram: POCKET.toBase58(), payer: payer.publicKey.toBase58(), receiver: "validator-fixture", threshold: "1" });
+    journal = CrankJournal.openExisting(journalPath, journalKey, journalScope, limits, journalId);
+    const database = WatcherState.openExisting(state, journalKey, stateScope, stateId);
     runningWatcher = new Watcher(crankConnection, { notify }, 1n, payer, database, journal);
     return runningWatcher;
   };

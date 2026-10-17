@@ -13,6 +13,7 @@ import { Keypair, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { POCKET, REGISTRY, CENSUS, POCKET_ACCOUNT_SIZE, pocketPda } from "@ghostlink/service-kit";
 import { RelayerJournal } from "@ghostlink/relayer/journal";
+import { WatcherState } from "@ghostlink/watcher";
 
 const marker = "SYNTHETIC_SERVICE_RPC_SECRET";
 const genesis = Keypair.generate().publicKey.toBase58();
@@ -30,7 +31,13 @@ const initializedJournal = new RelayerJournal(join(directory, "relayer.db"), jou
   genesisHash: genesis, payer: payer.publicKey.toBase58(), pocket: POCKET.toBase58(), registry: REGISTRY.toBase58(), census: CENSUS.toBase58(),
 });
 const relayerJournalId = initializedJournal.instanceId;
-initializedJournal.close(); journalKey.fill(0);
+initializedJournal.close();
+const initializedWatcher = new WatcherState(join(directory, "watcher.sqlite"), journalKey, {
+  genesisHash: genesis, pocketProgram: POCKET.toBase58(), payer: null,
+  receiver: createHash("sha256").update("").digest("hex"), threshold: "100000000",
+});
+const watcherStateId = initializedWatcher.instanceId;
+initializedWatcher.close(); journalKey.fill(0);
 const payerPath = join(directory, "payer.json");
 const configPath = join(directory, "providers.json");
 writeFileSync(payerPath, JSON.stringify([...payer.secretKey]));
@@ -87,7 +94,7 @@ async function start(name, extra = {}) {
   const env = { ...process.env, PORT: String(listenPort), OPERATIONS_PORT: String(operationsPort), NODE_ENV: "production", POLL_MS: "100",
     ACTIONS_GENESIS_HASH: genesis, CLUSTER: "localnet", BASE_URL: `http://localhost:${listenPort}`, RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
     GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: "", INDEXER_STATE_PATH: join(directory, "indexer.db"), INDEXER_STATE_KEY_PATH: journalKeyPath, RELAYER_BUDGET_PATH: "", RELAYER_JOURNAL_PATH: join(directory, "relayer.db"), RELAYER_JOURNAL_KEY_PATH: journalKeyPath, RELAYER_JOURNAL_ID: relayerJournalId,
-    WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.sqlite"), WATCHER_STATE_KEY_PATH: journalKeyPath, WATCHER_PORT: String(listenPort), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
+    WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.sqlite"), WATCHER_STATE_KEY_PATH: journalKeyPath, WATCHER_STATE_ID: watcherStateId, LARGE_FILL_USD_E6: "100000000", WATCHER_PORT: String(listenPort), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
   const child = spawn(process.execPath, [fileURLToPath(new URL(`../../${name}/dist/index.js`, import.meta.url))], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   const state = { child, output: "", url: `http://127.0.0.1:${listenPort}` };
   child.stdout.on("data", data => { state.output += data; });

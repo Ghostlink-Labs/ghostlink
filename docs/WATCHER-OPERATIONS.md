@@ -6,10 +6,12 @@ The watcher reads confirmed Pocket events, forwards proposal/large-fill/executio
 
 - `WATCHER_GENESIS_HASH`: independently approved chain identity; required.
 - `WATCHER_STATE_PATH` and `WATCHER_STATE_KEY_PATH`: required durable SQLite queue/checkpoint path and a private file of exactly 32 raw encryption-key bytes. Legacy JSON is refused; preserve it for an independently checked migration.
+- `WATCHER_STATE_ID`: required independently retained 64-character lowercase hex observation-state instance ID. Startup must match it before acquiring the worker lease.
 - `RPC_ENDPOINTS_PATH` or `RPC_URL`: approved providers, as described in [RPC operations](RPC-OPERATIONS.md).
 - `NOTIFY_WEBHOOK`: optional HTTPS receiver. Only local fixtures may use loopback HTTP. Without it, events are printed to the process console; that does not deliver them to an owner.
 - `GHOSTLINK_WATCHER_KEYPAIR`: optional fee-payer file outside the repository. Omitting it disables execution of pending changes.
 - `WATCHER_JOURNAL_PATH` and `WATCHER_JOURNAL_KEY_PATH`: required when a payer is configured. The first is a persistent SQLite path, the second a private file of 32 raw random encryption-key bytes. Keep both outside the repository, preserve the database and its WAL, and use the same database for every funded worker with this payer.
+- `WATCHER_JOURNAL_ID`: independently retained crank-journal instance ID, required in funded mode. It is separate from the observation-state ID and both encryption keys.
 - `WATCHER_TOTAL_BUDGET_LAMPORTS`: explicit positive cumulative fee cap required for funded execution. This cap does **not** renew daily or reset on restart. Raising it requires an operator configuration change after reviewing prior spending. `WATCHER_MAX_FEE_LAMPORTS` defaults to 20000 and cannot exceed the total cap.
 - `WATCHER_POLL_MS`: 100–30000 milliseconds, default 5000. `LARGE_FILL_USD_E6` defaults to 100000000 ($100).
 - `WATCHER_PORT`: readiness/liveness HTTP port, falling back to `PORT` or 8791. Keep it behind operator network controls.
@@ -17,6 +19,23 @@ The watcher reads confirmed Pocket events, forwards proposal/large-fill/executio
 - `WATCHER_TICK_BUDGET_MS`: default 10000, maximum 30000. This limits admission; an already admitted RPC, crank or receiver call finishes under its own transport deadline.
 
 The entry point verifies the approved chain before starting. The same bounded HTTP pool performs polling, submission and confirmation; it never switches to an unapproved WebSocket provider. Startup and polling diagnostics omit raw provider/receiver exceptions and credentials. Importing the watcher class does not start a process or deliver notifications.
+
+## Explicit initialization
+
+After building the watcher, initialize a new disposable development observer from the repository root:
+
+```sh
+WATCHER_GENESIS_HASH='<independently-approved-local-genesis>' \
+  node services/watcher/dist/initialize.js observer /private/new-watcher
+```
+
+Use `funded` instead of `observer` and provide `WATCHER_TOTAL_BUDGET_LAMPORTS` for a new fee-paying watcher. The initializer uses the same receiver and alert-threshold environment as the service. It validates a configured receiver URL without contacting it. It never funds an account, starts a service or adopts `GHOSTLINK_WATCHER_KEYPAIR` from the environment. Funded mode generates a fresh payer and independent state/journal encryption keys; observer mode generates no payer or crank journal.
+
+The output directory must not exist. `deployment.json` is written last and records the state ID, optional journal ID, scope, fee limits and relative filenames. Preserve partial output for inspection if initialization fails; an existing directory is never overwritten. Retain the manifest separately in protected operator configuration. Map its files to the path/key variables above and pin its IDs explicitly. Keep the same receiver, threshold, mode, genesis and fee-limit configuration. Verify the new payer before funding it. Generated keys, state, manifests and WAL files belong outside source control, with service-account-only permissions; use explicit ACLs on Windows.
+
+Hosted startup opens authenticated existing storage only. Missing/empty files, absent instance IDs, wrong instances, missing required tables, missing snapshot/progress records or a missing cumulative-spending record are refused. A different valid database with the same encryption key/scope cannot satisfy the original pin. Startup never discovers a replacement ID from the configured file, recreates history or assigns zero to an absent spending record. Observation-state identity is checked before taking its lease; a wrong pin cannot take ownership from another worker.
+
+The low-level constructors remain for explicit provisioning and disposable fixtures. Use `WatcherState.openExisting` and `CrankJournal.openExisting` for restart. Legacy state without pins needs independent history review and a controlled migration; do not use the initializer to reset an existing funded payer or notification queue. Both stores continue to refuse authenticated restore epochs. A pin detects substitution, not an authentic manual rollback of the same database. Coordinated backup reconciliation, key/payer migration and recovery tooling remain release gates.
 
 ## State, delivery and retries
 
@@ -36,7 +55,7 @@ The queue defaults to at most 1,000,000 staged observations and twice that many 
 
 The shared event decoder follows the current PocketV3 `Filled` layout, including trade `mode` and `releasedCostUsdE6`. Truncated/legacy layouts and unsupported modes are refused. Indexed activity retains both fields. Large-fill alerts use the recorded input USD value; an unpriced speculative exit records zero input valuation, and its released historical cost must not be presented as current market value. This is not full strategy P&L monitoring.
 
-Before funding a crank, the watcher requires fully acknowledged ingestion, renews state ownership and reads the current Pocket account through its approved provider. It checks program ownership, layout, PDA, current proposal and due slot. The encrypted journal is bound to genesis, program and payer. A SQLite FULL transaction saves the exact signed packet and reserves its quoted network fee atomically before broadcast. Write failure or an excessive/unavailable fee refuses the send. Two workers sharing that journal resolve to one packet and one reservation. Separate databases do not share a budget or transaction identity.
+Before funding a crank, the watcher requires fully acknowledged ingestion, renews state ownership and reads the current Pocket account through its approved provider. It checks program ownership, layout, PDA, current proposal and due slot. The encrypted journal is bound to genesis, program and payer. A SQLite FULL transaction saves the exact signed packet and reserves its quoted network fee atomically before broadcast. The cumulative record is explicitly initialized once, including its initial zero; deleting it is an error, never a fee reset. Identity/spending checks precede preparation and the final saved-row update before broadcast. Write failure or an excessive/unavailable fee refuses the send. Two workers sharing that journal resolve to one packet and one reservation. Separate databases do not share a budget or transaction identity.
 
 Retries and restarts reconcile the saved signature and can rebroadcast only its original bytes. The sender checks the packet's signature, payer and complete expected instruction message, compares the RPC acknowledgment and confirms only that locally known ID. A confirmed observation stops rebroadcast until finalized resolution or proven expiry; only actual successful `ChangeExecuted`/`ChangeCanceled` events clear pending notifications. A lost response does not authorize a fresh packet or refund the reserved fee.
 
@@ -46,7 +65,7 @@ SIGINT/SIGTERM stops admission and waits for the active tick before closing stor
 
 ## Verification
 
-Focused tests additionally cover missing logs, repeated/missing pages, bounded pagination restart, actual SQLite rollback, stable IDs after a real HTTP receiver loses its reply, a child exit after a partial durable acknowledgment, competing state owners, cross-scope ciphertext substitution, readiness and actual Unix receiver-drain/restart. Tests also cover identical packets after lost/substituted acknowledgments, abrupt child exit after durable preparation, competing journal handles, atomic write failure, persistent fee caps, expiry evidence, packet instruction validation, active-work drain, scope refusal, backlog/restart, redirect refusal, streaming-response cleanup and import side effects. The service-process RPC drill starts the compiled watcher against wrong-chain/failing synthetic providers and verifies fallback, required funded configuration and private logs.
+Focused tests additionally cover missing logs, repeated/missing pages, bounded pagination restart, actual SQLite rollback, stable IDs after a real HTTP receiver loses its reply, a child exit after a partial durable acknowledgment, competing state owners, cross-scope ciphertext substitution, readiness and actual Unix receiver-drain/restart. Actual initializer/startup tests cover both observer and funded mode, independent pins, fresh-payer provisioning, lost state/schema/checkpoint/spending refusal and retained delivery/fee history. Tests also cover identical packets after lost/substituted acknowledgments, abrupt child exit after durable preparation, competing journal handles, atomic write failure, persistent fee caps, expiry evidence, packet instruction validation, active-work drain, scope refusal, backlog/restart, redirect refusal, streaming-response cleanup and import side effects. The service-process RPC drill starts the compiled watcher against wrong-chain/failing synthetic providers and verifies fallback, required funded configuration and private logs.
 
 After building programs, circuits and the E2E dependency graph, run:
 

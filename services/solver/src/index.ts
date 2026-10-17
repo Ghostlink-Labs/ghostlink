@@ -8,6 +8,7 @@
  *   GHOSTLINK_SOLVER_KEYPAIR — path to the solver keypair JSON
  *   SOLVER_JOURNAL_PATH — persistent SQLite path outside the repository
  *   SOLVER_JOURNAL_KEY_PATH — file with 32 raw random encryption-key bytes
+ *   SOLVER_JOURNAL_ID — independently pinned 64-hex journal instance identity
  *   SOLVER_GENESIS_HASH — independently approved local-validator genesis
  *   PRICE_ACCOUNTS — JSON map of mint base58 -> Pyth price update account
  *   SOLVER_MAX_SPREAD_BPS — how far above the input's value a fill may go (default 100)
@@ -40,7 +41,10 @@ if (!keypairPath) {
 const journalPath = process.env.SOLVER_JOURNAL_PATH;
 const journalKeyPath = process.env.SOLVER_JOURNAL_KEY_PATH;
 const genesisHash = process.env.SOLVER_GENESIS_HASH;
-if (!journalPath || !journalKeyPath || !genesisHash) throw new Error("SOLVER_JOURNAL_PATH, SOLVER_JOURNAL_KEY_PATH and approved SOLVER_GENESIS_HASH are required");
+const journalId = process.env.SOLVER_JOURNAL_ID;
+if (!journalPath || !journalKeyPath || !genesisHash || !journalId || !/^[0-9a-f]{64}$/.test(journalId)) {
+  throw new Error("solver journal path, key, pinned identity and approved genesis are required");
+}
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(readFileSync(keypairPath, "utf8"))),
 );
@@ -60,8 +64,10 @@ const planner = router === "inventory" ? new MockPlanner() : new JupiterPlanner(
   slippageBps: Number(process.env.JUPITER_SLIPPAGE_BPS ?? 50),
 });
 const journalKey = readFileSync(journalKeyPath);
-const journal = new SubmissionJournal(journalPath, journalKey, { genesisHash, pocketProgram: POCKET_PROGRAM_ID, solver: keypair.publicKey.toBase58() });
-journalKey.fill(0);
+let journal: SubmissionJournal;
+try { journal = SubmissionJournal.openExisting(journalPath, journalKey,
+  { genesisHash, pocketProgram: POCKET_PROGRAM_ID, solver: keypair.publicKey.toBase58() }, journalId); }
+finally { journalKey.fill(0); }
 const priceAccounts = process.env.PRICE_ACCOUNTS
   ? (JSON.parse(process.env.PRICE_ACCOUNTS) as Record<string, string>)
   : {};

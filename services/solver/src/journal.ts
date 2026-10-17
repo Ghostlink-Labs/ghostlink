@@ -39,30 +39,68 @@ export class SubmissionJournal {
   #storage: EncryptedSqlite;
   #scope: Readonly<JournalScope>;
   #clock: () => number;
+  #openedInstanceId?: string;
+  #maintenance: boolean;
   get scope(): Readonly<JournalScope> { return this.#scope; }
 
-  constructor(path: string, key: Uint8Array, scope: JournalScope, clock = Date.now) {
+  constructor(path: string, key: Uint8Array, scope: JournalScope, clock = Date.now,
+    options: { existing?: boolean; maintenance?: boolean } = {}) {
     this.#scope = Object.freeze({ genesisHash: scope.genesisHash, pocketProgram: scope.pocketProgram, solver: scope.solver });
-    this.#storage = new EncryptedSqlite(path, key, journalNamespace(this.#scope));
+    this.#storage = new EncryptedSqlite(path, key, journalNamespace(this.#scope), { existing: options.existing });
     this.#clock = clock;
-    try { this.#storage.transaction(() => {
-      const hasContexts = this.#storage.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pocket_contexts'").get();
-      this.#storage.db.exec(`CREATE TABLE IF NOT EXISTS pocket_recovery (epoch TEXT NOT NULL, pocket TEXT NOT NULL, record BLOB NOT NULL, PRIMARY KEY(epoch,pocket)) STRICT;
-      CREATE TABLE IF NOT EXISTS pocket_contexts (pocket TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;
-      CREATE TABLE IF NOT EXISTS attempts (
-      id TEXT PRIMARY KEY, pocket TEXT NOT NULL, nonce TEXT NOT NULL, record BLOB NOT NULL,
-      UNIQUE(pocket, nonce)
-    ) STRICT;`);
-      if (!hasContexts) for (const row of this.#storage.db.prepare("SELECT * FROM attempts").all()) {
-        const record = this.#read(row)!;
-        this.#advanceContext(record.identity.pocket, Math.max(this.authorizationSlot(record.identity.pocket),
-          record.authorizationSlot ?? 0, record.transaction?.minContextSlot ?? 0));
-      }
-    }); } catch (error) { this.#storage.close(); throw error; }
+    this.#maintenance = options.maintenance === true;
+    try {
+      if (options.existing) {
+        // Hosted opening must not repair missing state or recreate lost context floors.
+        this.#storage.db.prepare("SELECT id,pocket,nonce,record FROM attempts LIMIT 0").all();
+        this.#storage.db.prepare("SELECT pocket,record FROM pocket_contexts LIMIT 0").all();
+        this.#storage.db.prepare("SELECT epoch,pocket,record FROM pocket_recovery LIMIT 0").all();
+      } else this.#storage.transaction(() => {
+        const hasContexts = this.#storage.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pocket_contexts'").get();
+        this.#storage.db.exec(`CREATE TABLE IF NOT EXISTS pocket_recovery (epoch TEXT NOT NULL, pocket TEXT NOT NULL, record BLOB NOT NULL, PRIMARY KEY(epoch,pocket)) STRICT;
+        CREATE TABLE IF NOT EXISTS pocket_contexts (pocket TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT;
+        CREATE TABLE IF NOT EXISTS attempts (
+          id TEXT PRIMARY KEY, pocket TEXT NOT NULL, nonce TEXT NOT NULL, record BLOB NOT NULL,
+          UNIQUE(pocket, nonce)
+        ) STRICT;`);
+        if (!hasContexts) for (const row of this.#storage.db.prepare("SELECT * FROM attempts").all()) {
+          const record = this.#read(row)!;
+          this.#advanceContext(record.identity.pocket, Math.max(this.authorizationSlot(record.identity.pocket),
+            record.authorizationSlot ?? 0, record.transaction?.minContextSlot ?? 0));
+        }
+        if (!this.instanceId) this.#storage.db.prepare("INSERT INTO metadata VALUES ('solver-instance-v1', ?)")
+          .run(this.#storage.seal(Buffer.from(randomBytes(32).toString("hex")), this.#instanceAad()));
+      });
+      this.#openedInstanceId = this.instanceId;
+      if (!this.#maintenance && !this.#openedInstanceId) throw new Error("solver journal identity missing; reconcile legacy state before cutover");
+    } catch (error) { this.#storage.close(); throw error; }
   }
 
   close(): void { this.#storage.close(); }
-  checkWritable(): void { this.#storage.checkWritable(); }
+  checkWritable(): void { this.#assertActive(); this.#storage.checkWritable(); }
+  #instanceAad(): string { return journalNamespace(this.#scope) + ":instance:v1"; }
+  get instanceId(): string | undefined {
+    const row = this.#storage.db.prepare("SELECT value FROM metadata WHERE name='solver-instance-v1'").get();
+    if (!row) return;
+    const plain = this.#storage.open(row.value as Uint8Array, this.#instanceAad());
+    try { const id = plain.toString(); if (!/^[0-9a-f]{64}$/.test(id)) throw new Error("invalid solver journal identity"); return id; }
+    finally { plain.fill(0); }
+  }
+  /** Authenticate existing state and match the independently retained deployment identity. */
+  static openExisting(path: string, key: Uint8Array, scope: JournalScope, expectedId: string): SubmissionJournal {
+    if (typeof expectedId !== "string" || !/^[0-9a-f]{64}$/.test(expectedId)) throw new Error("expected solver journal identity required");
+    const journal = new SubmissionJournal(path, key, scope, Date.now, { existing: true });
+    if (journal.instanceId !== expectedId) { journal.close(); throw new Error("solver journal identity mismatch"); }
+    return journal;
+  }
+  /** Read, back up and rotate legacy state without granting trade/preparation permission. */
+  static openForMaintenance(path: string, key: Uint8Array, scope: JournalScope): SubmissionJournal {
+    return new SubmissionJournal(path, key, scope, Date.now, { existing: true, maintenance: true });
+  }
+  #assertActive(): void {
+    if (this.#maintenance) throw new Error("solver maintenance forbids transaction work");
+    if (!this.#openedInstanceId || this.instanceId !== this.#openedInstanceId) throw new Error("solver journal identity changed");
+  }
   backupTo(destination: string): Promise<void> { return this.#storage.backupTo(destination); }
   static restoreBackup(archive: string, newDirectory: string, key: Uint8Array, scope: JournalScope): string {
     return EncryptedSqlite.restoreBackup(archive, newDirectory, key, journalNamespace(scope));
@@ -78,7 +116,7 @@ export class SubmissionJournal {
         encrypted: { record: row => this.#contextAad(String(row.pocket)) } },
       { name: "pocket_recovery", primaryKey: ["epoch", "pocket"], columns: ["epoch", "pocket", "record"],
         encrypted: { record: row => JSON.stringify([this.#scope, "recovery-plan:v1", String(row.epoch), String(row.pocket)]) } },
-    ]);
+    ], { "solver-instance-v1": this.#instanceAad() });
   }
 
   #validateAuthority(authority: RecoveryAuthority): void {
@@ -108,6 +146,7 @@ export class SubmissionJournal {
     if (![0, 1].includes(expected.sessionKind) || !/^[0-9a-f]{66}$/.test(expected.sessionKeyHex) ||
       (expected.sessionKind === 0 && !expected.sessionKeyHex.endsWith("00"))) throw new Error("invalid expected recovery key");
     this.#storage.transaction(() => {
+      this.#assertActive();
       this.#advanceContext(pocket, authority.slot);
       const prior = this.#recoveryPlan(pocket);
       if (prior?.expected.sessionKind === expected.sessionKind && prior.expected.sessionKeyHex === expected.sessionKeyHex) return;
@@ -117,6 +156,7 @@ export class SubmissionJournal {
   }
   /** Caller must verify finalized account ownership, layout, PDA and RPC genesis first. */
   recoveredAuthority(pocket: string, authority: RecoveryAuthority): boolean {
+    this.#assertActive();
     if (!this.recoveryId) return true;
     this.#validateAuthority(authority);
     return this.#storage.transaction(() => {
@@ -146,7 +186,7 @@ export class SubmissionJournal {
   }
   /** Call only after checking the account's program, layout and PDA, even when its session is refused. */
   observePocketContext(pocket: string, slot: number): void {
-    this.#storage.transaction(() => this.#advanceContext(pocket, slot));
+    this.#storage.transaction(() => { this.#assertActive(); this.#advanceContext(pocket, slot); });
   }
   #aad(id: string, pocket: string, nonce: string): string { return JSON.stringify([this.#scope, id, pocket, nonce]); }
   #read(row: Record<string, unknown> | undefined): Attempt | undefined {
@@ -177,6 +217,7 @@ export class SubmissionJournal {
 
   claim(identity: IntentIdentity): { record: Attempt; token?: string } {
     return this.#storage.transaction(() => {
+      this.#assertActive();
       const now = this.#clock();
       if (!Number.isSafeInteger(now) || now < 0) throw new Error("invalid journal clock");
       const found = this.matching(identity);
@@ -192,6 +233,7 @@ export class SubmissionJournal {
 
   prepared(id: string, token: string, transaction: PreparedTransaction): Attempt {
     return this.#storage.transaction(() => {
+      this.#assertActive();
       const record = this.get(id);
       if (!record || record.transaction || record.lease?.token !== token || record.lease.until <= this.#clock()) throw new Error("preparation lease lost; do not broadcast");
       if (transaction.minContextSlot < Math.max(record.authorizationSlot ?? 0, this.authorizationSlot(record.identity.pocket))) throw new Error("prepared authorization context is stale");
@@ -206,6 +248,7 @@ export class SubmissionJournal {
 
   releasePreparation(id: string, token: string): void {
     this.#storage.transaction(() => {
+      this.#assertActive();
       const record = this.get(id);
       if (record && !record.transaction && record.lease?.token === token) { delete record.lease; this.#write(record); }
     });
@@ -213,6 +256,7 @@ export class SubmissionJournal {
 
   authorizedContext(id: string, slot: number): void {
     this.#storage.transaction(() => {
+      this.#assertActive();
       const record = this.get(id);
       if (!record) return;
       if (!Number.isSafeInteger(slot) || slot < Math.max(record.authorizationSlot ?? 0, record.transaction?.minContextSlot ?? 0)) {
@@ -225,6 +269,7 @@ export class SubmissionJournal {
 
   observe(id: string, observation: IntentSubmission, context: number): Attempt {
     return this.#storage.transaction(() => {
+      this.#assertActive();
       const record = this.get(id);
       if (!record?.transaction || observation.intentHashHex !== id || observation.signature !== record.transaction.signature) throw new Error("invalid journal observation");
       if (!Number.isSafeInteger(context) || context < record.observedContext) return record;

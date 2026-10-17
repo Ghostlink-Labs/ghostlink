@@ -2,6 +2,25 @@
 
 The candidate solver distinguishes process liveness from permission to accept new work. These are operating checks, not a mainnet release attestation. Program deployment, owner authorization, route validation, prices, simulation and durable transaction persistence still apply to each trade.
 
+## Initialization and existing state
+
+Hosted startup uses `SubmissionJournal.openExisting` and requires `SOLVER_JOURNAL_ID` alongside the journal path, storage key and independently approved genesis. The encrypted random instance ID is distinct from the encryption key and is pinned in operator configuration. Even another valid journal with the same scope/key/payer is refused when its ID differs. A missing or empty database, missing identity marker or missing history/context/recovery table is not initialized or repaired during startup. Readiness and transaction mutations also refuse a changed/deleted identity marker.
+
+For a new disposable development deployment, build the solver and run from the repository root:
+
+```sh
+SOLVER_GENESIS_HASH='<independently-approved-local-genesis>' \
+  node services/solver/dist/initialize.js /private/new-solver
+```
+
+The command exclusively creates a new directory with a fresh solver keypair, 32-byte storage key and authenticated journal. It never reads an existing configured solver keypair, funds the new payer or starts the service. It writes `payer.json`, `storage-key`, `journal.sqlite`, `scope.json` and finally `deployment.json`. Preserve a partial directory for inspection after failure; rerunning against an existing directory is refused. Files are private on Unix; configure explicit service-account-only ACLs on Windows.
+
+Retain the deployment manifest separately in protected operator configuration. Set `GHOSTLINK_SOLVER_KEYPAIR`, `SOLVER_JOURNAL_KEY_PATH`, `SOLVER_JOURNAL_PATH` to its files, `SOLVER_JOURNAL_ID` to its `journalId`, and `SOLVER_GENESIS_HASH` to its approved scope. Verify those values before funding the fresh payer. Do not rediscover the expected ID from whichever database happens to occupy the configured path on every restart. Keep all generated files and credentials outside source control.
+
+Legacy compatible-schema journals without an instance marker can be read/backed up/rotated through `openForMaintenance`; they cannot claim, prepare or update transactions. Older incompatible schemas need a reviewed migration. The general constructor remains for explicit provisioning and disposable fixtures, not hosted recovery. A legacy funded payer must not be paired with a newly created empty journal. Reconcile its full business/chain history and perform a controlled cutover before resuming jobs.
+
+The pin detects missing/substituted state, not authentic rollback of the same journal. Supported backup restores retain the ID and add quarantine; trade authority still requires the existing per-pocket finalized owner-session recovery. Complete history reconciliation, aggregate budgets and coordinated cutover remain release gates. See [backup and restore](BACKUP-RESTORE.md).
+
 ## Endpoints and admission
 
 - Public `GET /health`: process liveness only. A provider outage does not require repeatedly restarting a healthy process.
@@ -46,7 +65,7 @@ On `SIGTERM` or `SIGINT`, the entry point closes new admission and stops accepti
 
 ## Evidence and remaining release work
 
-Focused tests cover slow request bodies, disconnected handlers, rate-limit cardinality, waiting-queue refusal, stalled/late probes, chain progress, fee reserve, authenticated journal write failures, SQLite lock contention, drain behavior, cached readiness and bounded private metrics. A Unix child-process drill starts the real solver entry point, interrupts a request during an RPC read, disconnects its client, sends `SIGTERM`, verifies that work drains before exit, and reopens the encrypted journal.
+Focused tests cover slow request bodies, disconnected handlers, rate-limit cardinality, waiting-queue refusal, stalled/late probes, chain progress, fee reserve, authenticated journal write failures, SQLite lock contention, drain behavior, cached readiness and bounded private metrics. Actual initializer/startup processes verify refusal of missing/empty/substituted/legacy/incomplete-schema state and preserve packet identity, nonce ownership and authority floors across a valid restart. Backup/key rotation retain the pin and owner-recovery quarantine. A Unix child-process drill starts the real solver entry point, interrupts a request during an RPC read, disconnects its client, sends `SIGTERM`, verifies that work drains before exit, and reopens the pinned encrypted journal.
 
 Run `RPC_FAILOVER_DRILL=1 OPERATIONS_DRILL=1 bash scripts/localnet-e2e.sh` after building the programs, development circuits and E2E dependencies. The disposable validator drill takes both RPC proxies offline, observes readiness/admission refusal with liveness preserved, restores the providers, and completes owner consent, pocket creation, lost-acknowledgment recovery, settlement and owner withdrawal. It uses local development keys and synthetic Telegram authentication.
 

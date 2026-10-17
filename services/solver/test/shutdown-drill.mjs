@@ -47,11 +47,13 @@ try {
   while (operationsPort === port) operationsPort = await unusedPort();
   const keyFile = join(dir, "storage.key"), signerFile = join(dir, "solver.json"), journalFile = join(dir, "journal.sqlite");
   writeFileSync(keyFile, key, { mode: 0o600 }); writeFileSync(signerFile, JSON.stringify([...solver.secretKey]), { mode: 0o600 });
+  const initialized = new SubmissionJournal(journalFile, key, scope);
+  const journalId = initialized.instanceId; initialized.close();
   let output = "";
   child = spawn(process.execPath, [fileURLToPath(new URL("../dist/index.js", import.meta.url))], {
     env: { ...process.env, PORT: String(port), OPERATIONS_PORT: String(operationsPort), RPC_URL: `http://127.0.0.1:${rpcPort}`,
       RPC_ENDPOINTS_PATH: "", SOLVER_ROUTER: "inventory", SOLVER_MIN_BALANCE_LAMPORTS: "5000000", SOLVER_GENESIS_HASH: genesisHash,
-      GHOSTLINK_SOLVER_KEYPAIR: signerFile, SOLVER_JOURNAL_PATH: journalFile, SOLVER_JOURNAL_KEY_PATH: keyFile },
+      GHOSTLINK_SOLVER_KEYPAIR: signerFile, SOLVER_JOURNAL_PATH: journalFile, SOLVER_JOURNAL_KEY_PATH: keyFile, SOLVER_JOURNAL_ID: journalId },
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.on("data", chunk => { output = (output + chunk).slice(-8192); });
@@ -81,7 +83,7 @@ try {
   release();
   const [code, signal] = await Promise.race([outcome, delay(10_000, undefined, { ref: false }).then(() => { throw new Error("graceful shutdown timed out"); })]);
   assert.equal(signal, null); assert.equal(code, 0, output);
-  const reopened = new SubmissionJournal(journalFile, key, scope); reopened.checkWritable(); reopened.close();
+  const reopened = SubmissionJournal.openExisting(journalFile, key, scope, journalId); reopened.checkWritable(); reopened.close();
   console.log("SIGTERM drill passed: disconnected work drained before journal close; encrypted database reopened.");
 } finally {
   release(); client?.destroy();

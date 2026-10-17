@@ -41,7 +41,8 @@ await journal.backupTo(solverArchive);
 const botPath = BotKeyStore.restoreBackup(botArchive, newBotDirectory, botKey);
 const solverPath = SubmissionJournal.restoreBackup(solverArchive, newSolverDirectory, solverKey, scope);
 const restoredBot = new BotKeyStore(botPath, botKey);
-const restoredJournal = new SubmissionJournal(solverPath, solverKey, scope);
+// solverJournalId is retained independently from the original deployment.
+const restoredJournal = SubmissionJournal.openExisting(solverPath, solverKey, scope, solverJournalId);
 const recovery = new SubmissionCoordinator(connection, restoredJournal);
 
 // freshConsent comes from BotOnboarding using restoredBot.
@@ -55,6 +56,8 @@ const state = await recovery.prepareRecovery(freshConsent.pocket);
 if (state.rotationRequired) throw new Error('Owner rotation is not finalized yet');
 // Confirm consent through BotOnboarding before permitting signing.
 ```
+
+The solver instance ID survives backup/restore and storage-key rotation. The matching pin does not clear the restore epoch or authorize an old session. Legacy snapshots without a pin require reviewed reconciliation and cutover; do not invent an ID or use the general fixture/provisioning constructor to resume a funded solver. `SubmissionJournal.openForMaintenance` supports reading known records, backup and rotation for existing compatible-schema state without transaction work.
 
 The snippet shows APIs, not a distributed maintenance lock. Stop all source processes before cutover. Do not share SQLite files over a network filesystem. An operator holding the key can replay a valid old archive: authentication prevents tampering, not rollback. The independent log, fresh keys, on-chain rotation and business reconciliation are necessary.
 

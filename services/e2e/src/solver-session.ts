@@ -32,7 +32,9 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
   const dir = mkdtempSync(join(tmpdir(), "ghostlink-solver-e2e-"));
   let path = join(dir, "solver.sqlite"), key = randomBytes(32);
   const scope = { genesisHash: await connection.getGenesisHash(), pocketProgram: POCKET_PROGRAM_ID, solver: keypair.publicKey.toBase58() };
-  let journal = new SubmissionJournal(path, key, scope);
+  const initialized = new SubmissionJournal(path, key, scope);
+  const journalId = initialized.instanceId!; initialized.close();
+  let journal = SubmissionJournal.openExisting(path, key, scope, journalId);
   let first = true, plans = 0, simulations = 0, feeChecks = 0;
   let broadcastFailure: unknown;
   let beforeNextBroadcast: (() => Promise<void>) | undefined;
@@ -110,7 +112,9 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
     async restore() {
       await stop(); journal.close();
       path = SubmissionJournal.restoreBackup(join(dir, "backup.enc"), join(dir, "restored"), key, scope);
-      journal = new SubmissionJournal(path, key, scope); server = build(); return listen();
+      journal = SubmissionJournal.openExisting(path, key, scope, journalId);
+      if (!journal.recoveryId) throw new Error("restored pinned solver lost quarantine");
+      server = build(); return listen();
     },
     prepareRecovery: (pocket: string, expected?: RecoverySession) => new SubmissionCoordinator(connection, journal).prepareRecovery(pocket, expected),
     assertNoTransactions() {
@@ -123,7 +127,7 @@ export async function startSolverFixture(connection: Connection, keypair: Keypai
         const replacement = randomBytes(32); journal.rotateKey(replacement);
         key.fill(0); key = replacement;
       }
-      journal.close(); journal = new SubmissionJournal(path, key, scope); server = build(); return listen();
+      journal.close(); journal = SubmissionJournal.openExisting(path, key, scope, journalId); server = build(); return listen();
     },
     assertSingleTransaction(count = 1) {
       rpcFault?.assertRecovered();

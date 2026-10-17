@@ -16,6 +16,14 @@ export function requestIdentity(route: string, request: Record<string, unknown>)
 function context(slot: number, minimum = 0): number {
   if (!Number.isSafeInteger(slot) || slot < minimum) throw new Error("stale relayer context"); return slot;
 }
+export function validateRelayerPacket(packet: RelayerPacket, payer: string): Transaction {
+  const bytes = Buffer.from(packet.rawBase64, "base64"), tx = Transaction.from(bytes);
+  if (bytes.length > 1232 || bytes.toString("base64") !== packet.rawBase64 || !tx.verifySignatures() ||
+    !tx.feePayer?.equals(new PublicKey(payer)) || tx.recentBlockhash !== packet.blockhash ||
+    bs58.encode(tx.signature!) !== packet.signature) throw new Error("relayer packet identity mismatch");
+  context(packet.minContextSlot); context(packet.lastValidBlockHeight);
+  return tx;
+}
 
 export class RelayerSubmission {
   constructor(private readonly chain: Connection, readonly journal: RelayerJournal,
@@ -25,11 +33,7 @@ export class RelayerSubmission {
     if (["EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"].includes(journal.scope.genesisHash)) throw new Error("V2 relayer has no verified public deployment");
   }
   #validate(packet: RelayerPacket): void {
-    const bytes = Buffer.from(packet.rawBase64, "base64"), tx = Transaction.from(bytes);
-    if (bytes.length > 1232 || bytes.toString("base64") !== packet.rawBase64 || !tx.verifySignatures() ||
-      !tx.feePayer?.equals(new PublicKey(this.journal.scope.payer)) || tx.recentBlockhash !== packet.blockhash ||
-      bs58.encode(tx.signature!) !== packet.signature) throw new Error("relayer packet identity mismatch");
-    context(packet.minContextSlot); context(packet.lastValidBlockHeight);
+    validateRelayerPacket(packet, this.journal.scope.payer);
   }
   async #genesis() {
     if (await this.chain.getGenesisHash() !== this.journal.scope.genesisHash) throw new Error("relayer chain mismatch");
@@ -59,6 +63,7 @@ export class RelayerSubmission {
     } catch { return { ...base, state: "unknown", reason: "rpc_or_journal_evidence_unavailable" }; }
   }
   async submit(id: string, digest: string, prepare: () => Promise<RelayerPacket>): Promise<RelayerReceipt> {
+    this.journal.assertSubmissionAllowed();
     await this.#genesis(); this.journal.checkWritable();
     const claim = this.journal.claim(id, digest); let record: RelayerRecord = claim.record;
     if (claim.token) {

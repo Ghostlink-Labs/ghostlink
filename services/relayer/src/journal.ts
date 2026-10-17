@@ -16,25 +16,56 @@ export interface RelayerRecord {
 }
 export interface FundingEvidence { balanceLamports: bigint; slot: number; minimumReserveLamports: bigint }
 const hex32 = (s: string) => typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
+function journalNamespace(scope: RelayerScope): string {
+  const ordered = { genesisHash: scope.genesisHash, payer: scope.payer, pocket: scope.pocket, registry: scope.registry, census: scope.census };
+  for (const id of Object.values(ordered)) if (typeof id !== "string" || new PublicKey(id).toBase58() !== id) throw new Error("invalid relayer scope");
+  return "ghostlink:relayer:v1:" + createHash("sha256").update(JSON.stringify(ordered)).digest("hex");
+}
 
 export class RelayerJournal {
   readonly scope: Readonly<RelayerScope>;
   readonly dailyBudget: bigint;
   #storage: EncryptedSqlite;
   constructor(path: string, key: Uint8Array, scope: RelayerScope, dailyBudget = 2_000_000_000n,
-    private readonly clock = Date.now, private readonly maximumRecords = 10_000) {
+    private readonly clock = Date.now, private readonly maximumRecords = 10_000,
+    private readonly mode: "active" | "maintenance" = "active") {
     this.scope = Object.freeze({ genesisHash: scope.genesisHash, payer: scope.payer, pocket: scope.pocket, registry: scope.registry, census: scope.census }); this.dailyBudget = dailyBudget;
-    for (const id of Object.values(scope)) if (new PublicKey(id).toBase58() !== id) throw new Error("invalid relayer scope");
     if (dailyBudget < 0n || !Number.isSafeInteger(maximumRecords) || maximumRecords < 1) throw new Error("invalid relayer journal limits");
-    const namespace = "ghostlink:relayer:v1:" + createHash("sha256").update(JSON.stringify(this.scope)).digest("hex");
+    if (mode !== "active" && mode !== "maintenance") throw new Error("invalid relayer journal mode");
+    const namespace = journalNamespace(this.scope);
     this.#storage = new EncryptedSqlite(path, key, namespace);
     try {
-      if (this.#storage.recoveryId) throw new Error("restored relayer journal requires operator reconciliation");
+      if (this.#storage.recoveryId && mode !== "maintenance") throw new Error("restored relayer journal requires operator reconciliation");
       this.#storage.transaction(() => this.#storage.db.exec("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT"));
     } catch (e) { this.#storage.close(); throw e; }
   }
   close(): void { this.#storage.close(); }
   checkWritable(): void { this.#storage.checkWritable(); }
+  get recoveryId(): string | undefined { return this.#storage.recoveryId; }
+  /** Observation/backup/rotation only. There is deliberately no resume or clear-restore API. */
+  static openForMaintenance(path: string, key: Uint8Array, scope: RelayerScope): RelayerJournal {
+    return new RelayerJournal(path, key, scope, 2_000_000_000n, Date.now, 10_000, "maintenance");
+  }
+  assertSubmissionAllowed(): void {
+    if (this.mode !== "active" || this.recoveryId) throw new Error("relayer maintenance/restore forbids paid submissions");
+  }
+  backupTo(destination: string): Promise<void> { return this.#storage.backupTo(destination); }
+  static restoreBackup(archive: string, newDirectory: string, key: Uint8Array, scope: RelayerScope): string {
+    return EncryptedSqlite.restoreBackup(archive, newDirectory, key, journalNamespace(scope));
+  }
+  rotateKey(nextKey: Uint8Array): void {
+    this.#storage.rotateKey(nextKey, [{ name: "operations", columns: ["id", "record"], primaryKey: ["id"],
+      encrypted: { record: row => JSON.stringify([this.scope, String(row.id)]) } }]);
+  }
+  /** Bounded, authenticated inventory. A cursor is an ID, not evidence of complete chain history. */
+  page(afterId?: string, limit = 100): { records: RelayerRecord[]; nextCursor?: string } {
+    if ((afterId !== undefined && !hex32(afterId)) || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid relayer inventory page");
+    return this.#storage.transaction(() => {
+      const rows = this.#storage.db.prepare("SELECT id FROM operations WHERE id>? ORDER BY id LIMIT ?").all(afterId ?? "", limit + 1);
+      return { records: rows.slice(0, limit).map(row => this.get(String(row.id))!),
+        ...(rows.length > limit ? { nextCursor: String(rows[limit - 1]!.id) } : {}) };
+    });
+  }
   #now(): number {
     const now = this.clock(); if (!Number.isSafeInteger(now) || now < 0) throw new Error("invalid relayer clock"); return now;
   }
@@ -80,6 +111,7 @@ export class RelayerJournal {
   claim(id: string, digest: string): { record: RelayerRecord; token?: string } {
     if (!hex32(id) || !hex32(digest)) throw new Error("invalid relayer request identity");
     return this.#storage.transaction(() => {
+      this.assertSubmissionAllowed();
       const prior = this.get(id), now = this.#now();
       if (prior && prior.digest !== digest) throw new HttpError(409, "request ID is bound to different content");
       if (prior?.packet || (prior?.lease && prior.lease.until > now)) return { record: prior };
@@ -91,12 +123,14 @@ export class RelayerJournal {
   }
   release(id: string, token: string): void {
     this.#storage.transaction(() => {
+      this.assertSubmissionAllowed();
       const record = this.get(id);
       if (record?.lease?.token === token && !record.packet) this.#storage.db.prepare("DELETE FROM operations WHERE id=?").run(id);
     });
   }
   prepare(id: string, token: string, packet: RelayerPacket, funding: FundingEvidence): RelayerRecord {
     return this.#storage.transaction(() => {
+      this.assertSubmissionAllowed();
       const record = this.get(id), now = this.#now();
       if (!record || record.packet || record.lease?.token !== token || record.lease.until <= now) throw new Error("relayer preparation lease lost");
       for (const value of [packet.feeLamports, packet.rentLamports]) if (!/^(0|[1-9][0-9]{0,19})$/.test(value)) throw new Error("invalid relayer cost");

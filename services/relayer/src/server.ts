@@ -77,6 +77,7 @@ export interface RelayerDeps {
 const MAX_TOKEN_PAIRS = 16;
 
 export function buildServer(deps: RelayerDeps): Server & { drain(): void; readonly active: number; operations: RelayerOperations } {
+  deps.journal.assertSubmissionAllowed();
   const { connection, payer } = deps;
   if (!deps.journal || deps.journal.scope.payer !== payer.publicKey.toBase58()) throw new Error("relayer requires a journal bound to its payer");
   const minimumBalanceLamports = deps.minimumBalanceLamports ?? 50_000_000;

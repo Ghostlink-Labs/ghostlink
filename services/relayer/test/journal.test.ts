@@ -11,6 +11,8 @@ import bs58 from "bs58";
 import { POCKET, REGISTRY, CENSUS } from "@ghostlink/service-kit";
 import { RelayerJournal } from "../src/journal.js";
 import { RelayerSubmission, requestIdentity } from "../src/submission.js";
+import { reconcileRetainedRelayerOperations } from "../src/reconciliation.js";
+import { buildServer } from "../src/server.js";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const fn of cleanup.reverse()) fn(); cleanup.length = 0; });
@@ -38,6 +40,126 @@ function world() {
   return { dir, path, key, scope, open, chain, make, submit: (j: RelayerJournal) => new RelayerSubmission(chain as unknown as Connection, j) };
 }
 const id = "01".repeat(32), digest = "02".repeat(32);
+const transactionHistory = (packet: Awaited<ReturnType<ReturnType<typeof world>["make"]>>) => {
+  const tx = Transaction.from(Buffer.from(packet.rawBase64, "base64"));
+  return { slot: 60, transaction: { message: tx.compileMessage(), signatures: tx.signatures.map(s => bs58.encode(s.signature!)) },
+    meta: { err: null, fee: 10000 } };
+};
+
+describe("relayer backup quarantine and retained-history reconciliation", () => {
+  it("restores an old encrypted snapshot without enabling any paid submission", async () => {
+    const w = world(), live = w.open(), archive = join(w.dir, "backup.enc");
+    await w.submit(live).submit(id, digest, w.make);
+    await live.backupTo(archive);
+    const newer = "03".repeat(32);
+    await w.submit(live).submit(newer, digest, w.make);
+    const restored = RelayerJournal.restoreBackup(archive, join(w.dir, "restored"), w.key, w.scope);
+    expect(() => w.open(restored)).toThrow(/restored/);
+    const audit = RelayerJournal.openForMaintenance(restored, w.key, w.scope); cleanup.push(() => audit.close());
+    expect(audit.get(id)).toEqual(live.get(id)); expect(audit.get(newer)).toBeUndefined();
+    expect(audit.spent()).toBe(10100n); expect(live.spent()).toBe(20200n);
+    expect(audit.recoveryId).toMatch(/^[0-9a-f]{64}$/);
+    w.chain.sendRawTransaction.mockClear(); w.make.mockClear(); w.chain.getGenesisHash.mockClear();
+    for (const requestId of [id, newer]) await expect(w.submit(audit).submit(requestId, digest, w.make)).rejects.toThrow(/forbids/);
+    expect(() => audit.claim(id, digest)).toThrow(/forbids/);
+    expect(() => audit.prepare(id, "stale-lease", live.get(id)!.packet!, { balanceLamports: 999999999n, slot: 100, minimumReserveLamports: 0n })).toThrow(/forbids/);
+    expect(() => audit.release(id, "stale-lease")).toThrow(/forbids/);
+    expect(() => buildServer({ connection: w.chain as unknown as Connection, payer: Keypair.generate(), journal: audit })).toThrow(/forbids/);
+    expect(w.chain.sendRawTransaction).not.toHaveBeenCalled(); expect(w.chain.getGenesisHash).not.toHaveBeenCalled(); expect(w.make).not.toHaveBeenCalled();
+    expect(readFileSync(archive).includes(live.get(id)!.packet!.rawBase64)).toBe(false);
+    expect(() => RelayerJournal.restoreBackup(archive, join(w.dir, "wrong-key"), randomBytes(32), w.scope)).toThrow();
+    expect(() => RelayerJournal.restoreBackup(archive, join(w.dir, "wrong-scope"), w.key, { ...w.scope, genesisHash: Keypair.generate().publicKey.toBase58() })).toThrow();
+  });
+
+  it("independently verifies exact finalized packets but never certifies snapshot completeness or resumes payment", async () => {
+    const w = world(), j = w.open(); await w.submit(j).submit(id, digest, w.make);
+    const archive = join(w.dir, "backup.enc"); await j.backupTo(archive);
+    const file = RelayerJournal.restoreBackup(archive, join(w.dir, "restore"), w.key, w.scope);
+    const audit = RelayerJournal.openForMaintenance(file, w.key, w.scope); cleanup.push(() => audit.close());
+    const history = transactionHistory(j.get(id)!.packet!);
+    const chain = { ...w.chain, getSlot: vi.fn(async () => 100), getTransaction: vi.fn(async () => history) };
+    chain.sendRawTransaction.mockClear();
+    const report = await reconcileRetainedRelayerOperations(chain as unknown as Connection, audit);
+    expect(report).toMatchObject({ entries: [{ requestIdHex: id, outcome: "verified-finalized", slot: 60 }],
+      historyCompleteness: "not-established", paidResumptionAllowed: false });
+    expect(audit.inspect(100)).toMatchObject({ spent: 10100n, unsettled: 0n });
+    expect(audit.get(id)!.packet).toEqual(j.get(id)!.packet);
+    expect(chain.sendRawTransaction).not.toHaveBeenCalled();
+    expect(() => w.open(file)).toThrow(/restored/);
+    const next = randomBytes(32); audit.rotateKey(next);
+    expect(() => RelayerJournal.openForMaintenance(file, w.key, w.scope)).toThrow();
+    expect(() => new RelayerJournal(file, next, w.scope)).toThrow(/restored/);
+    const archive2 = join(w.dir, "backup2.enc"); await audit.backupTo(archive2);
+    const second = RelayerJournal.openForMaintenance(RelayerJournal.restoreBackup(archive2, join(w.dir, "restore2"), next, w.scope), next, w.scope);
+    cleanup.push(() => second.close()); expect(second.recoveryId).not.toBe(audit.recoveryId);
+    expect(second.get(id)).toEqual(audit.get(id)); expect(() => second.claim(id, digest)).toThrow(/forbids/);
+  });
+
+  it("keeps missing, substituted, conflicting and stale history unresolved without releasing funds", async () => {
+    const w = world(), j = w.open(); await w.submit(j).submit(id, digest, w.make);
+    const packet = j.get(id)!.packet!, good = transactionHistory(packet);
+    const getTransaction = vi.fn(async (): Promise<any> => null);
+    const chain = { ...w.chain, getSlot: vi.fn(async () => 100), getTransaction };
+    for (const [response, outcome] of [
+      [null, "unresolved"], [transactionHistory(await w.make()), "conflict"],
+      [{ ...good, slot: 101 }, "conflict"], [{ ...good, meta: { err: null, fee: 10001 } }, "conflict"],
+    ] as const) {
+      getTransaction.mockResolvedValueOnce(response);
+      expect((await reconcileRetainedRelayerOperations(chain as unknown as Connection, j)).entries[0]!.outcome).toBe(outcome);
+      expect(j.inspect(100).unsettled).toBe(10100n);
+    }
+    getTransaction.mockRejectedValueOnce(new Error("synthetic private RPC URL and credential"));
+    expect(JSON.stringify(await reconcileRetainedRelayerOperations(chain as unknown as Connection, j))).not.toContain("credential");
+    chain.getSlot.mockResolvedValueOnce(49);
+    await expect(reconcileRetainedRelayerOperations(chain as unknown as Connection, j)).rejects.toThrow(/stale/);
+    chain.getGenesisHash.mockResolvedValueOnce(Keypair.generate().publicKey.toBase58());
+    await expect(reconcileRetainedRelayerOperations(chain as unknown as Connection, j)).rejects.toThrow(/chain mismatch/);
+    getTransaction.mockResolvedValueOnce(good); await reconcileRetainedRelayerOperations(chain as unknown as Connection, j);
+    getTransaction.mockResolvedValueOnce({ ...good, meta: { err: { InstructionError: [0, "InvalidArgument"] }, fee: 10000 } });
+    expect((await reconcileRetainedRelayerOperations(chain as unknown as Connection, j)).entries[0]!.reason).toBe("saved_finality_mismatch");
+    expect(j.get(id)!.observation.state).toBe("finalized");
+  });
+
+  it("pages authenticated records and bounds concurrent history requests", async () => {
+    const w = world(), j = w.open(), packets = new Map<string, ReturnType<typeof transactionHistory>>();
+    for (let i = 1; i <= 8; i++) {
+      const recordId = i.toString(16).padStart(64, "0"); await w.submit(j).submit(recordId, digest, w.make);
+      const packet = j.get(recordId)!.packet!; packets.set(packet.signature, transactionHistory(packet));
+    }
+    const first = j.page(undefined, 3), second = j.page(first.nextCursor, 3), third = j.page(second.nextCursor, 3);
+    expect([...first.records, ...second.records, ...third.records]).toHaveLength(8); expect(third.nextCursor).toBeUndefined();
+    expect(() => j.page("bad")).toThrow(); expect(() => j.page(undefined, 101)).toThrow();
+    let active = 0, maximum = 0;
+    const chain = { ...w.chain, getSlot: async () => 100, getTransaction: async (signature: string) => {
+      active++; maximum = Math.max(maximum, active); await new Promise(resolve => setTimeout(resolve, 5)); active--; return packets.get(signature)!;
+    } };
+    const report = await reconcileRetainedRelayerOperations(chain as unknown as Connection, j);
+    expect(maximum).toBe(4); expect(report.entries.every(e => e.outcome === "verified-finalized")).toBe(true);
+  });
+
+  it("runs the actual operator backup/restore/inspect/rotate commands without a payer key", async () => {
+    const w = world(), j = w.open(); await w.submit(j).submit(id, digest, w.make);
+    const scopeFile = join(w.dir, "scope.json"), keyFile = join(w.dir, "key"), nextFile = join(w.dir, "next-key");
+    writeFileSync(scopeFile, JSON.stringify(w.scope)); writeFileSync(keyFile, w.key); writeFileSync(nextFile, randomBytes(32));
+    const cli = (args: string[], path = w.path, storageKey = keyFile) => spawnSync(process.execPath, [join(process.cwd(), "dist/maintenance.js"), ...args], {
+      encoding: "utf8", timeout: 10000, env: { ...process.env, GHOSTLINK_RELAYER_KEYPAIR: "", RELAYER_JOURNAL_PATH: path,
+        RELAYER_JOURNAL_KEY_PATH: storageKey, RELAYER_MAINTENANCE_SCOPE_PATH: scopeFile },
+    });
+    const archive = join(w.dir, "cli.enc"), restored = join(w.dir, "cli-restored"), output = join(w.dir, "report.json");
+    for (const args of [["backup", archive], ["restore", archive, restored]]) {
+      const result = cli(args); expect(result.status, result.stderr).toBe(0);
+    }
+    const file = join(restored, "state.sqlite");
+    expect(cli(["inspect", output], file).status).toBe(0);
+    const report = JSON.parse(readFileSync(output, "utf8")); expect(report.records[0].receipt.signature).toBe(j.get(id)!.packet!.signature);
+    expect(report.paidResumptionAllowed).toBe(false); expect(readFileSync(output, "utf8")).not.toContain(j.get(id)!.packet!.rawBase64);
+    expect(cli(["inspect", output], file).status).toBe(1); // Never overwrite an earlier report.
+    const stale = RelayerJournal.openForMaintenance(file, w.key, w.scope); cleanup.push(() => stale.close());
+    expect(cli(["rotate", nextFile], file).status).toBe(0);
+    expect(() => stale.get(id)).toThrow();
+    expect(cli(["inspect", join(w.dir, "new-report.json")], file, nextFile).status).toBe(0);
+  });
+});
 
 describe("durable relayer submissions", () => {
   it("resumes identical signed bytes and auxiliary destinations after restart, then reconciles without another send", async () => {

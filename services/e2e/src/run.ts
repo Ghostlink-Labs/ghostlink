@@ -606,6 +606,7 @@ async function main() {
   }
 
   // ---- sweep home with an owner proof ----------------------------------------
+  if (process.env.RELAYER_RESTORE_DRILL === "1") await relayerFixture.backupForDrill();
   const sweepMints = fork ? [inputMint, outputMint] : [outputMint];
   const expectedHome = new Map<string, bigint>();
   await send(sweepMints.map(mint => createAtaIdempotentIx(payer.publicKey, wallet.publicKey, mint)), []);
@@ -668,6 +669,7 @@ async function main() {
     const { exerciseWatcher } = await import("./watcher-drill.js");
     await exerciseWatcher({ connection, payer, pocket, relayerUrl, ownerBody });
   }
+  if (process.env.RELAYER_RESTORE_DRILL === "1") await relayerFixture.verifyBackupDrill(connection);
   console.log(
     "\nE2E PASSED — register, snapshot, bot consent, prove, verify, open, confirm, restart, fund, bot-signed fill, sweep.",
   );

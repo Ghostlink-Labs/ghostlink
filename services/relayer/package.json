@@ -10,7 +10,8 @@
     ".": "./dist/index.js",
     "./server": "./dist/server.js",
     "./policy": "./dist/policy.js",
-    "./journal": "./dist/journal.js"
+    "./journal": "./dist/journal.js",
+    "./reconciliation": "./dist/reconciliation.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

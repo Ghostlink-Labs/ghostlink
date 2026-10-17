@@ -35,6 +35,7 @@ import {
   RateLimiter,
   Router,
   Semaphore,
+  POCKET_ACCOUNT_SIZE,
   badRequest,
   cancelChangeIx,
   clientIp,
@@ -51,11 +52,7 @@ import {
 } from "@ghostlink/service-kit";
 import { policyFromDtoBytes } from "./policy.js";
 import { prepareRecoverySweep } from "./recovery.js";
-import {
-  BINDING_RENT_LAMPORTS,
-  POCKET_RENT_LAMPORTS,
-  SpendMeter,
-} from "./budget.js";
+import { SpendMeter } from "./budget.js";
 
 export interface RelayerDeps {
   connection: Connection;
@@ -94,6 +91,12 @@ export function buildServer(deps: RelayerDeps): Server {
     if (!meter.tryCharge(lamports)) {
       throw new HttpError(503, "relayer daily budget exhausted; try again later");
     }
+  }
+
+  async function rentFor(size: number): Promise<bigint> {
+    const rent = await connection.getMinimumBalanceForRentExemption(size, "confirmed");
+    if (!Number.isSafeInteger(rent) || rent <= 0) throw new HttpError(503, "account rent unavailable; try again later");
+    return BigInt(rent);
   }
 
   async function sendTx(instructions: TransactionInstruction[], rent: bigint, signers: Keypair[] = []): Promise<{ signature: string }> {
@@ -156,7 +159,8 @@ export function buildServer(deps: RelayerDeps): Server {
     if (BigInt(balance) < minLamports) throw badRequest("wallet below the minimum balance");
     const pre = ed25519Ix(wallet.toBytes(), signature, message);
     const reg = registerIx(payer.publicKey, wallet, commitment);
-    return { json: await sendTx([pre, reg], BINDING_RENT_LAMPORTS) };
+    // Registry Binding: discriminator + leaf index + commitment + slot.
+    return { json: await sendTx([pre, reg], await rentFor(8 + 8 + 32 + 8)) };
   });
 
   router.post("/snapshot", async ({ body, raw }) => {
@@ -204,7 +208,7 @@ export function buildServer(deps: RelayerDeps): Server {
       home: pubkey(req.home, "home"),
       policy: req.policy ? policyFromDtoBytes(req.policy) : undefined,
     });
-    return { json: await sendTx([computeBudget(400_000), ix], exists ? 0n : POCKET_RENT_LAMPORTS) };
+    return { json: await sendTx([computeBudget(400_000), ix], exists ? 0n : await rentFor(POCKET_ACCOUNT_SIZE)) };
   });
 
   router.post("/owner-action", async ({ body, raw }) => {

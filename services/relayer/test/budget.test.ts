@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { POCKET_RENT_LAMPORTS, SpendMeter, TX_FEE_LAMPORTS } from "../src/budget.js";
+import { SpendMeter } from "../src/budget.js";
 
 describe("spend meter", () => {
   it("stops paying once the rolling window is spent, and recovers as it rolls", () => {
@@ -22,13 +22,6 @@ describe("spend meter", () => {
     expect(() => meter.tryCharge(-100n, 1)).toThrow(/negative/);
     expect(meter.tryCharge(100n, 2)).toBe(false);
     expect(meter.spentInWindow(1000)).toBe(0n);
-  });
-
-  it("budgets the current pocket account allocation per 2 SOL day", () => {
-    const meter = new SpendMeter(2_000_000_000n);
-    let created = 0;
-    while (meter.tryCharge(TX_FEE_LAMPORTS + POCKET_RENT_LAMPORTS, 0)) created += 1;
-    expect(created).toBe(129);
   });
 
   it("retains the ceiling across restarts and refuses corrupt persisted credit", () => {

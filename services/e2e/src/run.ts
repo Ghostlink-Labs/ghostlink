@@ -410,6 +410,8 @@ async function main() {
 
   // ---- open the pocket session ---------------------------------------------
   const pocketHandle = gl.pocketFor(glSession, home.toBytes(), policy);
+  const payerBeforeOpen = BigInt(await connection.getBalance(payer.publicKey, "confirmed"));
+  const reservedBeforeOpen = BigInt(((await (await fetch(`${relayerUrl}/health`)).json()) as { spentLamports24h: string }).spentLamports24h);
   await gl.openSession(
     glSession,
     pocketHandle,
@@ -418,6 +420,12 @@ async function main() {
     domainHash,
   );
   const pocket = pocketPda(fieldToBytes32(appId));
+  const paidForOpen = payerBeforeOpen - BigInt(await connection.getBalance(payer.publicKey, "confirmed"));
+  const reservedForOpen = BigInt(((await (await fetch(`${relayerUrl}/health`)).json()) as { spentLamports24h: string }).spentLamports24h) - reservedBeforeOpen;
+  if (paidForOpen !== reservedForOpen || paidForOpen <= 0n) {
+    throw new Error(`pocket creation spend mismatch: paid ${paidForOpen}, reserved ${reservedForOpen}`);
+  }
+  ok(`pocket creation budget reserved the exact payer debit: ${paidForOpen} lamports`);
   ok(`pocket open at ${pocket.toBase58()}`);
   if ((await botFixture.confirm(consent.id)).state !== "confirmed") throw new Error("bot consent not confirmed");
   await botFixture.restart();

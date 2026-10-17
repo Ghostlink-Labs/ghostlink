@@ -2,6 +2,7 @@ import { once } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { Connection, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
+import { POCKET_ACCOUNT_SIZE } from "@ghostlink/service-kit";
 import { buildServer, type RelayerDeps } from "../src/server.js";
 
 const payer = Keypair.generate();
@@ -10,6 +11,7 @@ function rpc() {
     getAccountInfo: vi.fn(async () => ({ owner: SystemProgram.programId, data: Buffer.alloc(0), executable: false })),
     getLatestBlockhash: vi.fn(async () => ({ blockhash: SystemProgram.programId.toBase58(), lastValidBlockHeight: 100 })),
     getFeeForMessage: vi.fn(async () => ({ value: 10_000 })),
+    getMinimumBalanceForRentExemption: vi.fn(async () => 30_000_000),
     sendRawTransaction: vi.fn(async (bytes: Uint8Array) => bs58.encode(Transaction.from(bytes).signature!)),
     confirmTransaction: vi.fn(async () => ({ value: { err: null } })),
   };
@@ -26,8 +28,30 @@ function post(base: string, path: string, body: unknown) {
   return fetch(`${base}/${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 const snapshot = () => ({ wallet: Keypair.generate().publicKey.toBase58(), holding: payer.publicKey.toBase58() });
+const opening = () => ({
+  appIdHex: "01".repeat(32), domainHashHex: "02".repeat(32), sessionKind: 0,
+  proofAHex: "00".repeat(64), proofBHex: "00".repeat(128), proofCHex: "00".repeat(64),
+  registryRootHex: "00".repeat(32), censusRootHex: "00".repeat(32),
+  mint: payer.publicKey.toBase58(), threshold: "0", minSlot: "0", claimHoldings: false,
+  sessionKeyHex: "03".repeat(33), sessionExpirySlot: "100", home: payer.publicKey.toBase58(),
+  policy: { dailyCapUsdE6: "100", bigActionThresholdUsdE6: "10", noOracleCapUsdE6: "0", sessionMaxSlots: "100",
+    maxSlippageBps: 0, allowedOutMints: [], oracleFeeds: [] },
+});
 
 describe("relayer fee and creation boundary", () => {
+  it("reserves current-layout quoted rent before funding pocket creation", async () => {
+    const connection = rpc();
+    await withServer({ connection: connection as unknown as Connection, dailyBudgetLamports: 20_000_000n }, async base => {
+      expect((await post(base, "open-session", opening())).status).toBe(503);
+      expect(connection.getMinimumBalanceForRentExemption).toHaveBeenCalledWith(POCKET_ACCOUNT_SIZE, "confirmed");
+      expect(connection.sendRawTransaction).not.toHaveBeenCalled();
+      expect((await (await fetch(`${base}/health`)).json()).spentLamports24h).toBe("0");
+      connection.getMinimumBalanceForRentExemption.mockResolvedValueOnce(19_990_000);
+      expect((await post(base, "open-session", opening())).status).toBe(200);
+      expect((await (await fetch(`${base}/health`)).json()).spentLamports24h).toBe("20000000");
+    });
+  });
+
   it("never echoes provider broadcast/confirmation diagnostics and keeps uncertain sends charged", async () => {
     const marker = "SYNTHETIC_RELAYER_PROVIDER_SECRET";
     const connection = rpc();

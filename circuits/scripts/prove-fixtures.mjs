@@ -71,6 +71,7 @@ const changeDigest = sha(changeBytes);
 
 const actionSpecs = {
   sweep: ["sweep", 0n],
+  sweepAfterAction: ["sweep", 1n],
   revoke: ["revoke", 0n],
   proposeHome: ["change", 1n],
   cancel: ["cancel", 2n],
@@ -121,10 +122,17 @@ const expiry = BigInt(vectors.identity.expirySlot) + 1n;
 const p256Commitment = common.sessionCommitment(key32, expiry);
 
 const loginFx = vectors.circuits.login;
+const fixturePolicy = {
+  ...common.conservativePolicy(),
+  oracleFeeds: vectors.policyWithFeeds.feeds.map((f) => ({
+    mint: common.hexToBytes(f.mint), feedId: common.hexToBytes(f.feedId), decimals: f.decimals,
+  })),
+};
 const p256Input = {
   ...loginFx.public,
   ...loginFx.private,
   session_commitment: p256Commitment.toString(10),
+  authorization_context: common.pocketAuthorizationContext(fixturePolicy, 1).toString(),
 };
 const { proof: p256Proof, publicSignals: p256Signals } = await snarkjs.groth16.fullProve(
   p256Input,
@@ -145,4 +153,54 @@ writeFileSync(
   ) + "\n",
 );
 console.log("p256 login proof verified");
+
+// Real proofs for purpose/deployment refusal tests (not mutated fake proofs).
+const otherDeployment = common.developmentSessionDeployment();
+otherDeployment.pocketProgram = label("other pocket program");
+for (const [name, context] of [
+  ["offchain", 0n],
+  ["other_deployment", common.pocketAuthorizationContext(fixturePolicy, 0, otherDeployment)],
+  ["speculative", common.pocketAuthorizationContext({ ...fixturePolicy, speculative: {
+    dailyBuyCapUsdE6: 30_000_000n, maxCostExposureUsdE6: 20_000_000n, maxPositions: 2,
+    baseMints: fixturePolicy.oracleFeeds.map(f => f.mint),
+  } }, 0)],
+]) {
+  const input = { ...loginFx.public, ...loginFx.private, authorization_context: context.toString() };
+  const { proof, publicSignals } = await snarkjs.groth16.fullProve(input,
+    join(root, "circuits/build/login_js/login.wasm"), join(root, "circuits/build/login_dev.zkey"));
+  if (!(await snarkjs.groth16.verify(loginVk, publicSignals, proof))) throw new Error(`${name} proof invalid`);
+  const bytes = common.proofToBytes(proof);
+  writeFileSync(join(root, `circuits/keys/login_${name}_proof.json`), JSON.stringify({ proof, publicSignals,
+    bytes: Object.fromEntries(Object.entries(bytes).map(([k, v]) => [k, Buffer.from(v).toString("hex")])) }, null, 2) + "\n");
+  console.log(`${name} login proof verified`);
+}
+// Renew the same explicitly approved speculative policy after a full day.
+const specPolicy = { ...fixturePolicy, speculative: {
+  dailyBuyCapUsdE6: 30_000_000n, maxCostExposureUsdE6: 20_000_000n, maxPositions: 2,
+  baseMints: fixturePolicy.oracleFeeds.map(f => f.mint),
+} };
+const renewedExpiry = BigInt(vectors.identity.expirySlot) + 216_000n;
+const renewed = { ...loginFx.public, ...loginFx.private, claim_holdings: "0",
+  session_commitment: common.sessionCommitment(common.hexToBytes(vectors.identity.sessionPubkey), renewedExpiry).toString(),
+  authorization_context: common.pocketAuthorizationContext(specPolicy, 0).toString() };
+const renewProof = await snarkjs.groth16.fullProve(renewed,
+  join(root, "circuits/build/login_js/login.wasm"), join(root, "circuits/build/login_dev.zkey"));
+if (!(await snarkjs.groth16.verify(loginVk, renewProof.publicSignals, renewProof.proof))) throw new Error("renewal proof invalid");
+writeFileSync(join(root, "circuits/keys/login_speculative_renew_proof.json"), JSON.stringify(renewProof, null, 2) + "\n");
+
+// Owner proposes returning to the conservative policy. This independent
+// Borsh encoder is cross-checked by the real compiled-program action test.
+const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+const conservativeBorsh = Buffer.concat([
+  common.u64le(fixturePolicy.dailyCapUsdE6), common.u16le(fixturePolicy.maxSlippageBps),
+  common.u64le(fixturePolicy.bigActionThresholdUsdE6), common.u64le(fixturePolicy.noOracleCapUsdE6),
+  common.u64le(fixturePolicy.sessionMaxSlots), u32(0), u32(fixturePolicy.oracleFeeds.length),
+  ...fixturePolicy.oracleFeeds.flatMap(f => [f.mint, f.feedId, Buffer.from([f.decimals])]), Buffer.from([0]),
+]);
+const policyChangeDigest = sha(Buffer.from([1]), conservativeBorsh);
+const actionHash = toField(sha(Buffer.from("ghostlink:change:v1"), pocketBytes, policyChangeDigest, Buffer.alloc(8)));
+const policyProof = await snarkjs.groth16.fullProve({ ...ownerFx.private, ...ownerFx.public, action_hash: actionHash }, ownerWasm, ownerZkey);
+if (!(await snarkjs.groth16.verify(ownerVk, policyProof.publicSignals, policyProof.proof))) throw new Error("policy change proof invalid");
+writeFileSync(join(root, "circuits/keys/owner_speculative_policy_proof.json"), JSON.stringify(policyProof, null, 2) + "\n");
+console.log("speculative renewal and owner policy-change proofs verified");
 process.exit(0);

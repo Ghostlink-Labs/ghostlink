@@ -40,6 +40,7 @@ describe("watcher notifications", () => {
           outMint: "SOL",
           outReceived: 1n,
           inValueUsdE6: 250_000_000n, // $250
+          mode: 0, releasedCostUsdE6: 0n,
         },
         {
           kind: "Filled",
@@ -50,6 +51,7 @@ describe("watcher notifications", () => {
           outMint: "SOL",
           outReceived: 1n,
           inValueUsdE6: 5_000_000n, // $5 — below threshold
+          mode: 0, releasedCostUsdE6: 0n,
         },
       ],
       100_000_000n,

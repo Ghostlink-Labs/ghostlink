@@ -22,8 +22,11 @@ import {
   FIELD_PRIME,
   domainHash,
   homeHash,
+  pocketAuthorizationContext,
   sessionCommitment,
   type RootsResponse,
+  type Policy,
+  type SessionDeployment,
 } from "@ghostlink/common";
 
 /** Public signal order of the login circuit — the protocol contract. */
@@ -39,6 +42,7 @@ export const LOGIN_SIGNALS = [
   "session_commitment",
   "home_hash",
   "claim_holdings",
+  "authorization_context",
 ] as const;
 
 type SignalName = (typeof LOGIN_SIGNALS)[number];
@@ -66,7 +70,7 @@ export interface SessionExpectation {
 export interface VerifyLoginParams {
   /** The SDK's `session.proof.snarkjsProof`, not its on-chain proof bytes. */
   proof: object;
-  /** The 11 public signals, canonical decimal strings, in circuit order. */
+  /** The 12 V2 public signals, canonical decimal strings, in circuit order. */
   publicSignals: string[];
   /** Your app's origin, e.g. "https://app.example.com". */
   expectedDomain: string;
@@ -94,6 +98,8 @@ export interface VerifyLoginParams {
     session?: SessionExpectation;
     /** The home address the client announced (32 bytes). */
     home?: Uint8Array;
+    /** Explicitly verify a pocket authorization; absent means off-chain login only. */
+    pocket?: { policy: Policy; sessionKind: number; deployment?: SessionDeployment };
   };
   fetchFn?: typeof fetch;
 }
@@ -203,6 +209,14 @@ async function verifyLoginChecked(params: VerifyLoginParams): Promise<VerifyLogi
     if (signals.home_hash !== homeHash(params.expect.home)) {
       return { ok: false, reason: "proof bound to a different home address" };
     }
+  }
+
+  // A website login grants no pocket authority. Callers that verify a
+  // spending authorization must supply the owner-approved context.
+  const pocket = params.expect?.pocket;
+  const expectedContext = pocket ? pocketAuthorizationContext(pocket.policy, pocket.sessionKind, pocket.deployment) : 0n;
+  if (signals.authorization_context !== expectedContext) {
+    return { ok: false, reason: "proof bound to a different authorization purpose, policy or deployment" };
   }
 
   // 4. Roots must be known recent roots (stale-root control).

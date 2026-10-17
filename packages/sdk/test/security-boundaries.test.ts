@@ -12,7 +12,7 @@ import {
 } from "../src/index.js";
 import { verifyLogin } from "../../verify/src/index.js";
 
-const fixture = JSON.parse(readFileSync(new URL("../../../circuits/keys/login_proof.json", import.meta.url), "utf8"));
+const fixture = JSON.parse(readFileSync(new URL("../../../circuits/keys/login_offchain_proof.json", import.meta.url), "utf8"));
 const vectors = JSON.parse(readFileSync(new URL("../../common/fixtures/vectors.json", import.meta.url), "utf8"));
 afterEach(() => vi.unstubAllGlobals());
 
@@ -22,7 +22,7 @@ describe("browser transport", () => {
       if (this !== globalThis) throw new TypeError("Illegal invocation");
       return Promise.resolve(Response.json({ roots: [] }));
     });
-    const client = await GhostLink.init({ cluster: "devnet", indexer: "https://indexer.test" });
+    const client = await GhostLink.init({ cluster: "localnet", indexer: "https://indexer.test" });
     await expect(client.roots("registry")).resolves.toEqual({ roots: [] });
   });
 });
@@ -111,10 +111,10 @@ describe("proof and witness boundaries", () => {
       { from: 0, nextIndex: 2, leaves: [] },
       { from: 0, nextIndex: "2", leaves: ["1"] },
     ]) {
-      const client = await GhostLink.init({ cluster: "devnet", indexer: "https://indexer.test", fetchFn: async () => Response.json(page) });
+      const client = await GhostLink.init({ cluster: "localnet", indexer: "https://indexer.test", fetchFn: async () => Response.json(page) });
       await expect(client.localWitness("registry", 1n, 2)).rejects.toThrow(/leaves/);
     }
-    const client = await GhostLink.init({ cluster: "devnet", indexer: "https://indexer.test", fetchFn: async () => Response.json({ from: 0, nextIndex: 2, leaves: ["1", "2"] }) });
+    const client = await GhostLink.init({ cluster: "localnet", indexer: "https://indexer.test", fetchFn: async () => Response.json({ from: 0, nextIndex: 2, leaves: ["1", "2"] }) });
     expect((await client.localWitness("registry", 1n, 2)).index).toBe(0);
   });
 });

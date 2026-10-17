@@ -82,17 +82,17 @@ export async function signIntent(
   params: IntentParams,
 ): Promise<SignedIntent> {
   const intent: Intent = {
-    pocket: pocket.address,
+    pocket: pocket.address.slice(),
     nonce: params.nonce,
-    inMint: params.inMint,
+    inMint: params.inMint.slice(),
     inMax: params.inMax,
-    outMint: params.outMint,
+    outMint: params.outMint.slice(),
     outMin: params.outMin,
     deadlineSlot: params.deadlineSlot,
     policyHash: policyHash(pocket.policy),
   };
   const hash = intentHash(intent);
-  const signature = await session.sign(hash);
+  const signature = await session.sign(hash.slice());
   return { intent, hash, signature };
 }
 

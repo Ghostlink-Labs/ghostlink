@@ -16,6 +16,7 @@ import {
   POCKET_PROGRAM_ID,
   REGISTRY_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
+  policyBytes,
   type Policy,
 } from "@ghostlink/common";
 import { BorshWriter } from "./borsh.js";
@@ -205,6 +206,7 @@ export interface OpenSessionFields {
 }
 
 export function writePolicy(w: BorshWriter, p: Policy): void {
+  policyBytes(p); // Share canonical validation before accepting a paid transaction.
   w.u64(p.dailyCapUsdE6)
     .u16(p.maxSlippageBps)
     .u64(p.bigActionThresholdUsdE6)
@@ -213,7 +215,9 @@ export function writePolicy(w: BorshWriter, p: Policy): void {
     .vec(p.allowedOutMints, (ww, m) => ww.fixed(m, 32))
     .vec(p.oracleFeeds, (ww, f) => {
       ww.fixed(f.mint, 32).fixed(f.feedId, 32).u8(f.decimals);
-    });
+    })
+    .option(p.speculative, (ww, s) => ww.u64(s.dailyBuyCapUsdE6).u64(s.maxCostExposureUsdE6)
+      .u8(s.maxPositions).vec(s.baseMints, (writer, m) => writer.fixed(m, 32)));
 }
 
 export function openSessionIx(payer: PublicKey, f: OpenSessionFields) {
@@ -244,7 +248,7 @@ export function openSessionIx(payer: PublicKey, f: OpenSessionFields) {
       { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
-    data: data("open_session", w.out()),
+    data: data("open_session_v2", w.out()),
   });
 }
 

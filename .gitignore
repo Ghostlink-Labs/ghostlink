@@ -4,6 +4,7 @@ dist/
 .next/
 *.tsbuildinfo
 coverage/
+/artifacts/sdk/
 
 # Rust / Solana
 target/
@@ -41,6 +42,15 @@ services/e2e/.genesis/
 .env.*
 !.env.example
 *.keypair.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.enc
 keys/
 # circuits/keys holds PUBLIC verifying keys and fixture proofs that the
 # TypeScript, Rust and LiteSVM suites read; the dev zkeys stay ignored above.

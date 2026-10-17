@@ -4,6 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import { HttpError, Router, decodeLogs, type GhostLinkEvent } from "@ghostlink/service-kit";
 import type { IndexerStore } from "./store.js";
 import type { PollerStatus } from "./poller.js";
+import type { IndexerDatabase } from "./database.js";
 import type { ChainRoots } from "./chain-roots.js";
 
 export interface ServerOptions {
@@ -15,11 +16,31 @@ export interface ServerOptions {
   /** When set, every tree event's root must be in the on-chain ring. */
   chainRoots?: ChainRoots;
   poller?: PollerStatus;
+  database?: IndexerDatabase;
+  /** Hosted webhooks only wake the ordered poller; they never mutate checkpoint state. */
+  onIngestionHint?: () => void;
 }
 
-export function buildServer(store: IndexerStore, options: ServerOptions = {}): Server {
+export function buildServer(store: IndexerStore, options: ServerOptions = {}): Server & { drain(): void; readonly active: number } {
   // Webhook batches can be large; everything else is tiny.
   const router = new Router({ maxBodyBytes: 1024 * 1024 });
+  let draining = false, active = 0;
+  const ready = () => {
+    const status = options.poller;
+    const fresh = (value: string | null) => value !== null && Date.now() - Date.parse(value) >= 0 && Date.now() - Date.parse(value) < 30_000;
+    // Refuse known catch-up before counting a potentially large spool on a public read.
+    if (draining || !status || status.catchingUp || status.lastError !== null ||
+      !fresh(status.lastSuccessAt) || !fresh(status.lastHeadAdvancedAt) ||
+      (status.rootReconciliationRequired && (!status.rootsUsable || !fresh(status.rootsCheckedAt)))) return false;
+    try { options.database?.assertOwned(); return Boolean(options.database); }
+    catch { return false; } // Keep storage diagnostics private.
+  };
+  const requireReconciled = () => {
+    if (options.poller?.rootReconciliationRequired && !ready()) throw new HttpError(503, "indexer is not ready; reconciled history and usable roots are required");
+  };
+  router.get("/ready", async () => {
+    const available = ready(); return { status: available ? 200 : 503, json: { ready: available } };
+  });
 
   router.get("/health", async () => ({
     json: {
@@ -32,6 +53,7 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   }));
 
   router.get("/roots/:tree", async ({ params }) => {
+    requireReconciled();
     const tree = params.tree === "registry" ? "registry" : params.tree === "census" ? "census" : null;
     if (!tree) return { status: 404, json: { error: "unknown tree" } };
     const t = tree === "registry" ? store.registry : store.census;
@@ -41,6 +63,7 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   });
 
   router.get("/path/:tree/:leafIndex", async ({ params }) => {
+    requireReconciled();
     const tree = params.tree === "registry" ? store.registry : params.tree === "census" ? store.census : null;
     if (!tree) return { status: 404, json: { error: "unknown tree" } };
     if (!/^(0|[1-9][0-9]{0,15})$/.test(params.leafIndex ?? "")) return { status: 400, json: { error: "bad leaf index" } };
@@ -62,6 +85,7 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
    * and compute its own path without ever naming the leaf it wants.
    */
   router.get("/leaves/:tree", async ({ params, query }) => {
+    requireReconciled();
     const leaves = params.tree === "registry" ? store.registryLeaves : params.tree === "census" ? store.censusLeaves : null;
     if (!leaves) return { status: 404, json: { error: "unknown tree" } };
     const from = pageInteger(query.get("from"), 0, 0, Number.MAX_SAFE_INTEGER, "from");
@@ -72,12 +96,14 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   });
 
   router.get("/registry/binding/:wallet", async ({ params }) => {
+    requireReconciled();
     const binding = store.bindings.get(params.wallet ?? "");
     if (!binding) return { status: 404, json: { error: "not registered" } };
     return { json: { leafIndex: binding.leafIndex, commitment: binding.commitmentHex, slot: "0" } };
   });
 
   router.get("/census/latest", async ({ query }) => {
+    requireReconciled();
     const wallet = query.get("wallet");
     const mint = query.get("mint");
     if (!wallet || !mint) return { status: 400, json: { error: "wallet and mint required" } };
@@ -89,24 +115,27 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
   // ---- dashboard API -----------------------------------------------------
 
   router.get("/pockets/:appIdHex", async ({ params }) => {
+    requireReconciled();
     const entry = store.pocketByAppId(params.appIdHex ?? "");
     if (!entry) return { status: 404, json: { error: "no pocket for this app id" } };
     return { json: entry };
   });
 
   router.get("/activity/:pocket", async ({ params, query }) => {
+    requireReconciled();
     const limit = pageInteger(query.get("limit"), 50, 1, 200, "limit");
     return { json: { pocket: params.pocket, events: store.activityFor(params.pocket!, limit) } };
   });
 
-  router.get("/stats", async () => ({
-    json: {
+  router.get("/stats", async () => {
+    requireReconciled();
+    return { json: {
       registrations: store.registryLeaves.length,
       snapshots: store.censusLeaves.length,
       pockets: store.pockets.size,
       activity: store.activity.length,
-    },
-  }));
+    } };
+  });
 
   /**
    * Webhook ingestion: a Helius raw-transaction webhook array (each item
@@ -116,52 +145,58 @@ export function buildServer(store: IndexerStore, options: ServerOptions = {}): S
    * program's own root ring. The store's chaining checks run after that.
    */
   router.post("/webhook", async ({ body, raw }) => {
-    if (!options.webhookSecret) throw new HttpError(404, "webhook disabled: set WEBHOOK_SECRET");
-    if (!authorized(raw.headers.authorization, options.webhookSecret)) {
-      throw new HttpError(401, "bad webhook secret");
-    }
-    const batches: { logs: string[]; signature?: string }[] = [];
-    const add = (logs: unknown, signature: unknown) => {
-      if (!Array.isArray(logs) || !logs.every((line) => typeof line === "string")) throw new HttpError(400, "logs must be an array of strings");
-      if (signature !== undefined && (typeof signature !== "string" || !signature || signature.length > 128)) {
-        throw new HttpError(400, "invalid transaction signature");
+    if (draining) throw new HttpError(503, "indexer is draining");
+    active++;
+    try {
+      if (!options.webhookSecret) throw new HttpError(404, "webhook disabled: set WEBHOOK_SECRET");
+      if (!authorized(raw.headers.authorization, options.webhookSecret)) {
+        throw new HttpError(401, "bad webhook secret");
       }
-      batches.push({ logs, signature: signature as string | undefined });
-    };
-    if (Array.isArray(body)) {
-      for (const item of body as { signature?: string; transaction?: { signatures?: string[] }; meta?: { err?: unknown; logMessages?: string[] } }[]) {
-        if (item?.meta?.err) continue;
-        if (Array.isArray(item?.meta?.logMessages)) add(item.meta.logMessages, item.signature ?? item.transaction?.signatures?.[0]);
-      }
-    } else if (body && typeof body === "object" && Array.isArray((body as { logs?: unknown }).logs)) {
-      const item = body as { logs: unknown; signature?: unknown };
-      add(item.logs, item.signature);
-    } else {
-      throw new HttpError(400, "expected a transaction array or { logs }");
-    }
-    let applied = 0;
-    let ignored = 0;
-    for (const { logs, signature } of batches) {
-      const events = decodeLogs(logs);
-      if (!signature && events.some((event) => event.kind !== "Registered" && event.kind !== "SnapshotTaken")) {
-        throw new HttpError(400, "transaction signature required for pocket events");
-      }
-      let valid = true;
-      for (const event of events) {
-        if (options.chainRoots && !(await rootOnChain(options.chainRoots, event))) {
-          valid = false;
-          break;
+      if (options.onIngestionHint) { options.onIngestionHint(); return { status: 202, json: { queued: true } }; }
+      const batches: { logs: string[]; signature?: string }[] = [];
+      const add = (logs: unknown, signature: unknown) => {
+        if (!Array.isArray(logs) || !logs.every((line) => typeof line === "string")) throw new HttpError(400, "logs must be an array of strings");
+        if (signature !== undefined && (typeof signature !== "string" || !signature || signature.length > 128)) {
+          throw new HttpError(400, "invalid transaction signature");
         }
+        batches.push({ logs, signature: signature as string | undefined });
+      };
+      if (Array.isArray(body)) {
+        for (const item of body as { signature?: string; transaction?: { signatures?: string[] }; meta?: { err?: unknown; logMessages?: string[] } }[]) {
+          if (item?.meta?.err) continue;
+          if (Array.isArray(item?.meta?.logMessages)) add(item.meta.logMessages, item.signature ?? item.transaction?.signatures?.[0]);
+        }
+      } else if (body && typeof body === "object" && Array.isArray((body as { logs?: unknown }).logs)) {
+        const item = body as { logs: unknown; signature?: unknown };
+        add(item.logs, item.signature);
+      } else {
+        throw new HttpError(400, "expected a transaction array or { logs }");
       }
-      if (!valid) { ignored += events.length; continue; }
-      const count = signature ? store.applyTransaction(signature, events) : events.filter((event) => store.apply(event)).length;
-      applied += count;
-      ignored += events.length - count;
-    }
-    return { json: { applied, ignored } };
+      let applied = 0;
+      let ignored = 0;
+      for (const { logs, signature } of batches) {
+        const events = decodeLogs(logs);
+        if (!signature && events.some((event) => event.kind !== "Registered" && event.kind !== "SnapshotTaken")) {
+          throw new HttpError(400, "transaction signature required for pocket events");
+        }
+        let valid = true;
+        for (const event of events) {
+          if (options.chainRoots && !(await rootOnChain(options.chainRoots, event))) {
+            valid = false;
+            break;
+          }
+        }
+        if (!valid) { ignored += events.length; continue; }
+        const count = signature ? store.applyTransaction(signature, events) : events.filter((event) => store.apply(event)).length;
+        applied += count;
+        ignored += events.length - count;
+      }
+      return { json: { applied, ignored } };
+    } finally { active--; }
   });
 
-  return router.server();
+  const server = Object.assign(router.server(), { drain: () => { draining = true; } });
+  return Object.defineProperty(server, "active", { get: () => active }) as Server & { drain(): void; readonly active: number };
 }
 
 function pageInteger(value: string | null, fallback: number, minimum: number, maximum: number, name: string): number {

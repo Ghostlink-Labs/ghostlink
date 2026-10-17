@@ -10,7 +10,8 @@ export function policyFromDtoBytes(d: PolicyDto): Policy {
       !Number.isInteger(d.maxSlippageBps) || d.maxSlippageBps < 0 || d.maxSlippageBps > 10_000) {
       throw new Error("invalid policy limits");
     }
-    for (const value of [d.dailyCapUsdE6, d.bigActionThresholdUsdE6, d.noOracleCapUsdE6, d.sessionMaxSlots]) {
+    for (const value of [d.dailyCapUsdE6, d.bigActionThresholdUsdE6, d.noOracleCapUsdE6, d.sessionMaxSlots,
+      ...(d.speculative ? [d.speculative.dailyBuyCapUsdE6, d.speculative.maxCostExposureUsdE6] : [])]) {
       if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(value)) throw new Error("invalid policy amount");
     }
     const policy = {
@@ -20,6 +21,9 @@ export function policyFromDtoBytes(d: PolicyDto): Policy {
       noOracleCapUsdE6: BigInt(d.noOracleCapUsdE6),
       sessionMaxSlots: BigInt(d.sessionMaxSlots),
       allowedOutMints: d.allowedOutMints.map((m) => bs58.decode(m)),
+      speculative: d.speculative && { dailyBuyCapUsdE6: BigInt(d.speculative.dailyBuyCapUsdE6),
+        maxCostExposureUsdE6: BigInt(d.speculative.maxCostExposureUsdE6),
+        maxPositions: d.speculative.maxPositions, baseMints: d.speculative.baseMints.map(m => bs58.decode(m)) },
       oracleFeeds: d.oracleFeeds.map((f) => ({
         mint: bs58.decode(f.mint),
         feedId: hexToBytes(f.feedIdHex),

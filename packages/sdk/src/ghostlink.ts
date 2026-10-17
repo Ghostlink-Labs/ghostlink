@@ -14,9 +14,14 @@ import {
   conservativePolicy,
   fieldToBytes32,
   hexToBytes,
+  homeHash,
+  intentHash,
+  pocketAuthorizationContext,
+  relayerRequestDigest,
   toBase58,
   type CensusLatestResponse,
   type IntentRequest,
+  type IntentSubmission,
   type LeavesResponse,
   type OpenSessionRequest,
   type PathResponse,
@@ -34,7 +39,7 @@ import {
   type LoginWitnessData,
   type Prover,
 } from "./login.js";
-import { softwareSession, type SessionSigner } from "./session.js";
+import { copySessionPublicKey, softwareSession, type SessionPublicKey, type SessionSigner } from "./session.js";
 import {
   derivePocket,
   fundingOptions,
@@ -44,8 +49,10 @@ import {
   type PocketHandle,
   type SignedIntent,
 } from "./pocket.js";
+import { RelayerClient, RelayerOperationPendingError, prepareRelayerOperation } from "./relayer.js";
 
 export interface GhostLinkConfig {
+  /** V2 is localnet-only until a fresh deployment and migration are verified. */
   cluster: Cluster;
   indexer: string;
   relayer?: string;
@@ -60,12 +67,31 @@ export interface GhostLinkConfig {
   fetchFn?: typeof fetch;
 }
 
-export interface GhostLinkSession {
+export interface GhostLinkAuthorization {
   appId: FieldElement;
   appIdBase58: string;
   proof: LoginProof;
-  signer: SessionSigner;
+  /** Public key descriptor, with no signing function or private key. */
+  signer: SessionPublicKey;
   expirySlot: bigint;
+}
+
+export interface GhostLinkSession extends GhostLinkAuthorization {
+  signer: SessionSigner;
+}
+
+export interface SessionAuthorizationParams {
+  identity: DerivedIdentity;
+  claim?: Claim;
+  minSlot?: bigint;
+  currentSlot?: bigint;
+  witness: LoginWitnessData;
+  session: SessionPublicKey;
+  /** Must exceed every previous session expiry for this pocket. */
+  expirySlot: bigint;
+  home: Uint8Array;
+  /** Exact owner-approved policy. Renewal must use the current confirmed policy. */
+  policy: Policy;
 }
 
 export class GhostLink {
@@ -78,6 +104,9 @@ export class GhostLink {
   }
 
   static async init(config: GhostLinkConfig): Promise<GhostLink> {
+    if (config.cluster !== "localnet") {
+      throw new Error("This V2 SDK has no verified devnet or mainnet deployment; use localnet");
+    }
     return new GhostLink(config);
   }
 
@@ -219,9 +248,33 @@ export class GhostLink {
      */
     expirySlot: bigint;
     home: Uint8Array;
+    /** Omit for off-chain login; supply explicitly to authorize a pocket. */
+    policy?: Policy;
   }): Promise<GhostLinkSession> {
     if (!this.config.prover) throw new Error("no prover configured");
     const signer = params.session ?? softwareSession();
+    const authorization = await this.prepareAuthorization({ ...params, session: signer });
+    return { ...authorization, signer };
+  }
+
+  /**
+   * Run on the user's trusted device to authorize a bot's PUBLIC session key.
+   * The bot keeps its session secret; the user's identity and proof inputs
+   * never go to the bot. This prepares a proof, not an on-chain activation:
+   * openSession must confirm before the bot trades. Show the user the bot,
+   * home, policy and expiry, and authenticate the key handoff first.
+   */
+  async authorizeSession(params: SessionAuthorizationParams): Promise<GhostLinkAuthorization> {
+    // A remote P-256 key does not establish that a hardware authenticator
+    // created it. Never classify a bot-supplied key as passkey-held authority.
+    if (params.session?.kind !== 0) throw new Error("Delegated bots require an Ed25519 session public key");
+    if (!params.policy) throw new Error("Bot authorization requires an explicit approved policy");
+    return this.prepareAuthorization(params);
+  }
+
+  private async prepareAuthorization(params: Omit<SessionAuthorizationParams, "policy"> & { policy?: Policy }): Promise<GhostLinkAuthorization> {
+    if (!this.config.prover) throw new Error("no prover configured");
+    const signer = copySessionPublicKey(params.session);
     const { input, appId } = buildLoginInput({
       identity: params.identity,
       origin: this.origin(),
@@ -232,6 +285,7 @@ export class GhostLink {
       expirySlot: params.expirySlot,
       home: params.home,
       witness: params.witness,
+      policy: params.policy,
     });
     const proof = await proveLogin(this.config.prover, input, appId);
     return {
@@ -245,8 +299,19 @@ export class GhostLink {
 
   // ---- pocket -------------------------------------------------------------
 
-  pocketFor(session: GhostLinkSession, home: Uint8Array, policy?: Policy): PocketHandle {
-    return derivePocket(session.appId, home, policy ?? conservativePolicy());
+  pocketFor(session: GhostLinkAuthorization, home: Uint8Array, policy?: Policy): PocketHandle {
+    const pocket = derivePocket(session.appId, home, policy ?? conservativePolicy());
+    this.checkPocketAuthorization(session, pocket);
+    return pocket;
+  }
+
+  private checkPocketAuthorization(session: GhostLinkAuthorization, pocket: PocketHandle): void {
+    const signals = session.proof.publicSignals;
+    if (signals.length !== 12 || fieldFromDecimal(signals[11]) !== pocketAuthorizationContext(pocket.policy, session.signer.kind)
+      || fieldFromDecimal(signals[9]) !== homeHash(pocket.home)
+      || fieldFromDecimal(signals[3]) !== session.appId || pocket.appId !== session.appId) {
+      throw new Error("Pocket policy, home or deployment does not match the approved V2 authorization");
+    }
   }
 
   funding(pocket: PocketHandle): FundingOptions {
@@ -259,6 +324,8 @@ export class GhostLink {
    * the very pocket address derived here. This detects metadata mismatches
    * only: the Actions server still supplies the eventual transaction, whose
    * destination and instructions must be checked before a wallet signs it.
+   * Use prepareFundingTransaction with independently approved values to check
+   * the eventual deposit; this method does not validate transaction bytes.
    */
   async verifyFunding(options: FundingOptions): Promise<FundingOptions> {
     const meta = await this.getJson<{ pocket?: string }>(options.blinkUrl, "");
@@ -274,13 +341,14 @@ export class GhostLink {
    * never disagree with what was proved.
    */
   async openSession(
-    session: GhostLinkSession,
+    session: GhostLinkAuthorization,
     pocket: PocketHandle,
     claimFields: { mint: Uint8Array; threshold: bigint; minSlot: bigint; claim: boolean },
     roots?: { registry: FieldElement; census: FieldElement },
     domainHash?: FieldElement,
   ): Promise<TxResponse> {
     if (!this.config.relayer) throw new Error("no relayer configured");
+    this.checkPocketAuthorization(session, pocket);
     const signals = session.proof.publicSignals;
     const bound = {
       registry: roots?.registry ?? fieldFromDecimal(signals[0]),
@@ -305,18 +373,32 @@ export class GhostLink {
       home: toBase58(pocket.home),
       policy: policyToDto(pocket.policy),
     };
-    return this.postJson(this.config.relayer, "/open-session", req);
+    // Same authorization/body keeps one identity even when this convenience method is called again after a lost reply.
+    const operation = prepareRelayerOperation("/open-session", req, relayerRequestDigest("/open-session", req));
+    const receipt = await new RelayerClient(this.config.relayer, this.fetchFn).submit(operation);
+    if (receipt.state !== "confirmed" && receipt.state !== "finalized") throw new RelayerOperationPendingError(operation, receipt);
+    return { signature: receipt.signature! };
   }
 
   async submitIntent(
     pocket: PocketHandle,
     session: SessionSigner,
     params: IntentParams,
-  ): Promise<{ signed: SignedIntent; tx: TxResponse }> {
+  ): Promise<{ signed: SignedIntent; tx: IntentSubmission }> {
     if (!this.config.solver) throw new Error("no solver configured");
+    const publicKey = copySessionPublicKey(session);
     const signed = await signIntent(pocket, session, params);
+    return { signed, tx: await this.submitSignedIntent(signed, publicKey) };
+  }
+
+  /** Retry an already-signed intent without changing its nonce or prompting the signer again. */
+  async submitSignedIntent(signed: SignedIntent, session: SessionPublicKey): Promise<IntentSubmission> {
+    if (!this.config.solver) throw new Error("no solver configured");
+    const key = copySessionPublicKey(session);
+    const expectedHash = bytesToHex(intentHash(signed.intent));
+    if (expectedHash !== bytesToHex(signed.hash)) throw new Error("signed intent was mutated");
     const req: IntentRequest = {
-      pocket: toBase58(pocket.address),
+      pocket: toBase58(signed.intent.pocket),
       nonce: signed.intent.nonce.toString(),
       inMint: toBase58(signed.intent.inMint),
       inMax: signed.intent.inMax.toString(),
@@ -324,9 +406,9 @@ export class GhostLink {
       outMin: signed.intent.outMin.toString(),
       deadlineSlot: signed.intent.deadlineSlot.toString(),
       policyHashHex: bytesToHex(signed.intent.policyHash),
-      sessionKind: session.kind,
+      sessionKind: key.kind,
       signatureHex: bytesToHex(signed.signature.signature),
-      sessionKeyHex: bytesToHex(session.kind === 0 ? session.key32 : session.key33),
+      sessionKeyHex: bytesToHex(key.kind === 0 ? key.key32 : key.key33),
       webauthn: signed.signature.webauthn
         ? {
             authenticatorDataHex: bytesToHex(signed.signature.webauthn.authenticatorData),
@@ -334,8 +416,29 @@ export class GhostLink {
           }
         : undefined,
     };
-    const tx = await this.postJson<TxResponse>(this.config.solver, "/intent", req);
-    return { signed, tx };
+    const tx = await this.postJson<IntentSubmission>(this.config.solver, "/intent", req);
+    return this.checkedIntentStatus(tx, expectedHash);
+  }
+
+  /** Poll the exact intent; a submission receipt is not confirmation. */
+  async intentStatus(intentHashHex: string): Promise<IntentSubmission> {
+    if (!this.config.solver) throw new Error("no solver configured");
+    if (!/^[0-9a-f]{64}$/.test(intentHashHex)) throw new Error("invalid intent hash");
+    const response = await this.fetchFn(`${this.config.solver}/intents/${intentHashHex}`);
+    if (!response.ok) throw new Error(`solver status: HTTP ${response.status}`);
+    return this.checkedIntentStatus(await response.json(), intentHashHex);
+  }
+
+  private checkedIntentStatus(value: unknown, expectedHash: string): IntentSubmission {
+    const v = value as IntentSubmission;
+    if (!v || v.intentHashHex !== expectedHash || !["preparing", "pending", "confirmed", "finalized", "failed", "expired", "unknown"].includes(v.state)) {
+      throw new Error("invalid solver submission receipt");
+    }
+    if (!["preparing", "unknown"].includes(v.state) && (typeof v.signature !== "string" || !/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(v.signature))) throw new Error("missing transaction identity");
+    if (["confirmed", "finalized", "failed"].includes(v.state) && (!Number.isSafeInteger(v.slot) || v.slot! < 0 ||
+      !["confirmed", "finalized"].includes(v.confirmationStatus ?? ""))) throw new Error("missing confirmation evidence");
+    if ((v.state === "confirmed" || v.state === "finalized") && v.confirmationStatus !== v.state) throw new Error("inconsistent confirmation evidence");
+    return v;
   }
 }
 
@@ -347,6 +450,9 @@ export function policyToDto(p: Policy): PolicyDto {
     noOracleCapUsdE6: p.noOracleCapUsdE6.toString(),
     sessionMaxSlots: p.sessionMaxSlots.toString(),
     allowedOutMints: p.allowedOutMints.map(toBase58),
+    speculative: p.speculative && { dailyBuyCapUsdE6: p.speculative.dailyBuyCapUsdE6.toString(),
+      maxCostExposureUsdE6: p.speculative.maxCostExposureUsdE6.toString(),
+      maxPositions: p.speculative.maxPositions, baseMints: p.speculative.baseMints.map(toBase58) },
     oracleFeeds: p.oracleFeeds.map((f) => ({
       mint: toBase58(f.mint),
       feedIdHex: bytesToHex(f.feedId),
@@ -364,6 +470,9 @@ export function policyFromDto(d: PolicyDto): Policy {
     noOracleCapUsdE6: BigInt(d.noOracleCapUsdE6),
     sessionMaxSlots: BigInt(d.sessionMaxSlots),
     allowedOutMints: d.allowedOutMints.map(bs58decode),
+    speculative: d.speculative && { dailyBuyCapUsdE6: BigInt(d.speculative.dailyBuyCapUsdE6),
+      maxCostExposureUsdE6: BigInt(d.speculative.maxCostExposureUsdE6),
+      maxPositions: d.speculative.maxPositions, baseMints: d.speculative.baseMints.map(bs58decode) },
     oracleFeeds: d.oracleFeeds.map((f) => ({
       mint: bs58decode(f.mint),
       feedId: hexToBytes(f.feedIdHex),

@@ -1,13 +1,12 @@
 /**
  * The reference solver. Fill shape (build plan 4.4):
  *   [precompile over SHA-256(intent)] [fill_begin] [route] [fill_end]
- * all in one transaction — the route either delivers out_min or the
- * whole thing reverts, solver fee included.
+ * all in one transaction — token movements revert together if out_min
+ * is not delivered. Solana network fees can still be charged on failure.
  *
  * Routing is pluggable. The mock planner transfers from the solver's own
- * inventory (localnet/devnet, where DEX liquidity is thin — accepted by
- * the M2 gate); a Jupiter planner belongs here when mainnet routing
- * lands (docs/adr/0001). Whatever the planner, the server values both
+ * inventory on the local validator; the experimental Jupiter planner validates
+ * one approved Raydium CP hop (docs/JUPITER-ROUTING.md). The server values both
  * legs first and refuses to overpay (economics.ts).
  */
 import type { Server } from "node:http";
@@ -15,7 +14,6 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
 import bs58 from "bs58";
@@ -25,7 +23,6 @@ import {
   HttpError,
   RateLimiter,
   Router,
-  Semaphore,
   ataAddress,
   clientIp,
   createAtaIdempotentIx,
@@ -37,13 +34,22 @@ import {
 } from "@ghostlink/service-kit";
 import { validateIntent, type ValidatedIntent } from "./validate.js";
 import { PriceReader, checkEconomics } from "./economics.js";
+import { NonceConflictError, SubmissionJournal } from "./journal.js";
+import { IntentAuthorizationError, SubmissionCoordinator } from "./submission.js";
+import { prepareVersionedTransaction, type LookupTableRequest, type TransactionLimits } from "./transactions.js";
+import { SolverOperations } from "./operations.js";
 
 export interface RoutePlan {
   instructions: TransactionInstruction[];
+  lookupTables?: LookupTableRequest[];
+  /** Bank used to validate route accounts; later composition must not regress. */
+  minimumSlot?: number;
 }
 
 export interface RoutePlanner {
-  plan(v: ValidatedIntent, solver: PublicKey): Promise<RoutePlan>;
+  /** Opt-in contract: output comes solely from swapping the exact intent input. */
+  readonly funding?: "intent-input";
+  plan(v: ValidatedIntent, solver: PublicKey, minimumSlot?: number): Promise<RoutePlan>;
 }
 
 /** Fills from the solver's own token inventory at the intent's terms. */
@@ -63,11 +69,13 @@ export interface SolverDeps {
   connection: Connection;
   keypair: Keypair;
   planner: RoutePlanner;
+  journal: SubmissionJournal;
+  transactionLimits?: TransactionLimits;
   /** mint base58 -> Pyth price update account base58 (user-pinned feeds). */
   priceAccounts: Record<string, string>;
   /** How much more than the input's value the solver will deliver; default 100 bps. */
   maxQuoteSpreadBps?: number;
-  /** Fill output mints that have no price (NFT-style); default false. */
+  /** Allow unpriced legs with an intent-funded planner; default false. Owner policy still applies. */
   allowUnpriced?: boolean;
   /**
    * Pay rent for the pocket's output token account when it is missing.
@@ -76,60 +84,85 @@ export interface SolverDeps {
    */
   createPocketAta?: boolean;
   trustProxy?: boolean;
+  /** Operational reserve, not a per-trade or aggregate spending permission. */
+  minimumBalanceLamports?: number;
 }
 
-export function buildServer(deps: SolverDeps): Server {
-  const router = new Router();
+export function buildServer(deps: SolverDeps): Server & { operations: SolverOperations } {
+  const router = new Router({ exposeErrors: false, onError: () => console.error("solver request failed") });
   const solver = deps.keypair.publicKey;
+  if (deps.journal.scope.solver !== solver.toBase58()) throw new Error("solver identity does not match journal");
+  const submissions = new SubmissionCoordinator(deps.connection, deps.journal);
   const prices = new PriceReader(deps.connection, deps.priceAccounts);
   const ipLimiter = new RateLimiter(30, 60_000);
   const pocketLimiter = new RateLimiter(10, 60_000);
-  const inFlight = new Semaphore(8);
-  const locked = new Set<string>();
+  const minimumBalanceLamports = deps.minimumBalanceLamports ?? 5_000_000;
+  if (BigInt(minimumBalanceLamports) < (deps.transactionLimits?.maxNetworkFeeLamports ?? 20_000n)) throw new Error("solver reserve must cover the configured maximum network fee");
+  const operations = new SolverOperations({ connection: deps.connection, solver, genesisHash: deps.journal.scope.genesisHash,
+    checkWritable: () => deps.journal.checkWritable(), minimumBalanceLamports });
 
   router.get("/health", async () => ({ json: { ok: true, solver: solver.toBase58() } }));
+  router.get("/ready", async () => {
+    const { ready, checks } = operations.snapshot();
+    return { status: ready ? 200 : 503, json: { ready, checks }, headers: { "cache-control": "no-store", "retry-after": "1" } };
+  });
+
+  router.get("/intents/:id", async ({ params, raw }) => {
+    if (!ipLimiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
+    if (!/^[0-9a-f]{64}$/.test(params.id ?? "")) throw new HttpError(400, "invalid intent hash");
+    const release = operations.acquire("status");
+    if (!release) throw new HttpError(503, "solver busy");
+    try {
+      let exists: boolean;
+      try { exists = !!deps.journal.get(params.id!); }
+      catch { throw new HttpError(503, "intent journal unavailable"); }
+      if (!exists) throw new HttpError(404, "intent not found");
+      return { json: await submissions.status(params.id!), headers: { "cache-control": "no-store" } };
+    } finally { release(); }
+  });
 
   router.post("/intent", async ({ body, raw }) => {
     if (!ipLimiter.allow(clientIp(raw, deps.trustProxy))) throw new HttpError(429, "rate limited");
-    const req = body as IntentRequest;
-    let v: ValidatedIntent;
+    const release = operations.acquire("intent");
+    if (!release) throw new HttpError(503, "solver not ready; retry the identical signed intent");
     try {
-      v = validateIntent(req);
-    } catch (e) {
-      return { status: 400, json: { error: e instanceof Error ? e.message : String(e) } };
-    }
+      const req = body as IntentRequest;
+      let v: ValidatedIntent;
+      try {
+        v = validateIntent(req);
+      } catch (e) {
+        return { status: 400, json: { error: e instanceof Error ? e.message : String(e) } };
+      }
 
-    const pocket = new PublicKey(v.intent.pocket);
-    const inMint = new PublicKey(v.intent.inMint);
-    const outMint = new PublicKey(v.intent.outMint);
-    if (!pocketLimiter.allow(pocket.toBase58())) throw new HttpError(429, "rate limited for this pocket");
+      const pocket = new PublicKey(v.intent.pocket);
+      const inMint = new PublicKey(v.intent.inMint);
+      const outMint = new PublicKey(v.intent.outMint);
+      if (!pocketLimiter.allow(pocket.toBase58())) throw new HttpError(429, "rate limited for this pocket");
 
-    const inPrice = await prices.priceFor(inMint);
-    if (!inPrice) {
-      return { status: 400, json: { error: `no price account configured for ${inMint.toBase58()}` } };
-    }
-    const outPrice = await prices.priceFor(outMint);
-    const economics = checkEconomics(
-      v.intent,
-      { in: inPrice, out: outPrice },
-      deps.maxQuoteSpreadBps ?? 100,
-      deps.allowUnpriced ?? false,
-    );
-    if (!economics.ok) return { status: 400, json: { error: economics.reason } };
-
-    // One attempt per (pocket, nonce) at a time: a second request would
-    // only burn a fee racing the first.
-    const lockKey = `${pocket.toBase58()}:${v.intent.nonce}`;
-    if (locked.has(lockKey)) throw new HttpError(409, "this intent is already being filled");
-    locked.add(lockKey);
-    try {
-      return await inFlight.run(() => fill(v, pocket, inMint, outMint));
-    } finally {
-      locked.delete(lockKey);
-    }
+      try {
+        const result = await submissions.submit(v, async minimumSlot => {
+          const inPrice = await prices.priceFor(inMint);
+          const outPrice = await prices.priceFor(outMint);
+          if ((!inPrice || !outPrice) && (!deps.allowUnpriced || deps.planner.funding !== "intent-input")) {
+            throw new HttpError(400, "unpriced trades require an enabled intent-funded swap planner");
+          }
+          const economics = checkEconomics(v.intent, { in: inPrice, out: outPrice },
+            deps.maxQuoteSpreadBps ?? 100, deps.allowUnpriced ?? false);
+          if (!economics.ok) throw new HttpError(400, economics.reason ?? "quote refused");
+          return prepare(v, pocket, inMint, outMint, minimumSlot);
+        });
+        return { status: ["preparing", "pending", "unknown"].includes(result.state) ? 202 : 200,
+          json: result, headers: { "cache-control": "no-store" } };
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        if (error instanceof NonceConflictError) throw new HttpError(409, error.message);
+        if (error instanceof IntentAuthorizationError) throw new HttpError(403, "intent is not authorized by the current pocket");
+        throw new HttpError(503, "intent preparation unavailable; retry the identical signed intent");
+      }
+    } finally { release(); }
   });
 
-  async function fill(v: ValidatedIntent, pocket: PublicKey, inMint: PublicKey, outMint: PublicKey) {
+  async function prepare(v: ValidatedIntent, pocket: PublicKey, inMint: PublicKey, outMint: PublicKey, minimumSlot: number) {
     const pre =
       v.sessionKind === 0
         ? ed25519Ix(v.sessionKey, v.signature, v.hash)
@@ -144,10 +177,13 @@ export function buildServer(deps: SolverDeps): Server {
       deadlineSlot: v.intent.deadlineSlot,
       policyHash: v.intent.policyHash,
     };
-    const inPriceAccount = new PublicKey(deps.priceAccounts[inMint.toBase58()]!);
+    // Unpriced exits have no input oracle. The program classifies the leg
+    // from the owner-pinned policy and ignores this placeholder only then.
+    const inPriceAccount = deps.priceAccounts[inMint.toBase58()]
+      ? new PublicKey(deps.priceAccounts[inMint.toBase58()]!) : pocket;
     const outPriceAccount = deps.priceAccounts[outMint.toBase58()];
 
-    const route = await deps.planner.plan(v, solver);
+    const route = await deps.planner.plan(v, solver, minimumSlot);
     const begin = fillBeginIx({
       solver,
       pocket,
@@ -171,24 +207,16 @@ export function buildServer(deps: SolverDeps): Server {
     const setup: TransactionInstruction[] = [createAtaIdempotentIx(solver, solver, inMint)];
     if (deps.createPocketAta) setup.push(createAtaIdempotentIx(solver, pocket, outMint));
 
-    const tx = new Transaction().add(...setup, pre, begin, ...route.instructions, end);
-    tx.feePayer = solver;
-    const { blockhash, lastValidBlockHeight } = await deps.connection.getLatestBlockhash();
-    tx.recentBlockhash = blockhash;
-    tx.sign(deps.keypair);
-    try {
-      const signature = await deps.connection.sendRawTransaction(tx.serialize());
-      const status = await deps.connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
-      if (status.value.err) {
-        return { status: 502, json: { error: `fill failed on-chain: ${JSON.stringify(status.value.err)}`, signature } };
-      }
-      return { json: { signature } };
-    } catch (e) {
-      return { status: 502, json: { error: e instanceof Error ? e.message : String(e) } };
-    }
+    return prepareVersionedTransaction(deps.connection, deps.keypair, {
+      instructions: [...setup, pre, begin, ...route.instructions, end], lookupTables: route.lookupTables,
+      minimumSlot: Math.max(minimumSlot, route.minimumSlot ?? minimumSlot), deadlineSlot: v.intent.deadlineSlot, limits: deps.transactionLimits,
+    });
   }
 
-  return router.server();
+  const server = Object.assign(router.server(), { operations });
+  server.once("listening", () => operations.start());
+  server.once("close", () => operations.stop());
+  return server;
 }
 
 function webauthnMessage(v: ValidatedIntent): Uint8Array {

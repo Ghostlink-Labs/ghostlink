@@ -92,6 +92,12 @@ export interface PolicyDto {
   sessionMaxSlots: string;
   allowedOutMints: string[]; // base58
   oracleFeeds: { mint: string; feedIdHex: string; decimals: number }[];
+  speculative?: {
+    dailyBuyCapUsdE6: string;
+    maxCostExposureUsdE6: string;
+    maxPositions: number;
+    baseMints: string[];
+  };
 }
 
 /** POST /intent (to the solver) */
@@ -116,10 +122,25 @@ export interface TxResponse {
   signature: string;
 }
 
+/** Submission is not settlement. Only confirmed/finalized states establish success. */
+export interface IntentSubmission {
+  intentHashHex: string;
+  state: "preparing" | "pending" | "confirmed" | "finalized" | "failed" | "expired" | "unknown";
+  signature?: string;
+  slot?: number;
+  confirmationStatus?: "confirmed" | "finalized";
+  reason?: string;
+  chainError?: unknown;
+}
+
 /** Owner-proof-authorized relayer calls (sweep, changes, revoke). */
 export interface OwnerActionRequest {
   pocket: string; // base58
   action: "sweep" | "revoke" | "propose" | "cancel";
+  /** Sweep: must match the current on-chain recovery home. */
+  home?: string;
+  /** Sweep: omit destination to select/create a clean account owned by home. Explicit destinations are never substituted. */
+  tokenPairs?: { source: string; destination?: string; mint?: string }[];
   /** borsh-encoded Change for propose, hex; omitted otherwise. */
   changeHex?: string;
   proofAHex: string;

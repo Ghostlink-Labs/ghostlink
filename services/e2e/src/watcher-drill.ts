@@ -1,0 +1,110 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { POCKET, readPocketAccount } from "@ghostlink/service-kit";
+import { CrankJournal, DurableCranker, Watcher, WatcherState } from "@ghostlink/watcher";
+import { startRpcFaultFixture } from "./rpc-fault.js";
+import { watcherGenesis } from "./watcher-fixture.js";
+
+export async function exerciseWatcher(input: {
+  connection: Connection; payer: Keypair; pocket: PublicKey; relayerUrl: string;
+  ownerBody: (action: "propose" | "cancel" | "revoke", change?: Uint8Array) => Promise<Record<string, unknown>>;
+}) {
+  const { connection, payer, pocket, relayerUrl, ownerBody } = input;
+  const directory = mkdtempSync(join(tmpdir(), "ghostlink-watcher-validator-")), state = join(directory, "state.sqlite");
+  const rpc = await startRpcFaultFixture(connection), genesis = await connection.getGenesisHash();
+  const journalKey = randomBytes(32), journalPath = join(directory, "cranks.sqlite");
+  const journalScope = { genesisHash: genesis, pocketProgram: POCKET.toBase58(), payer: payer.publicKey.toBase58() };
+  const limits = { maximumFeeLamports: 20_000, totalBudgetLamports: 100_000 };
+  const stateScope = { ...journalScope, receiver: "validator-fixture", threshold: "1" };
+  const initialJournal = new CrankJournal(journalPath, journalKey, journalScope, limits), journalId = initialJournal.instanceId!;
+  initialJournal.close();
+  const initialState = new WatcherState(state, journalKey, stateScope), stateId = initialState.instanceId!; initialState.close();
+  let journal: CrankJournal | undefined, runningWatcher: Watcher | undefined, broadcasts = 0;
+  // The provider pool resends identical bytes; then lose the final reply at the process boundary too.
+  const crankConnection = new Proxy(rpc.connection, { get(target, property) {
+    if (property === "sendRawTransaction") return async (...args: Parameters<Connection["sendRawTransaction"]>) => {
+      broadcasts++; const signature = await target.sendRawTransaction(...args);
+      if (broadcasts === 1) throw new Error("synthetic accepted-send response lost before watcher restart");
+      return signature;
+    };
+    const value = Reflect.get(target, property, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const fixtures = watcherGenesis(), mature = fixtures[0]!, future = fixtures[1]!;
+  const read = async (address: PublicKey) => {
+    const info = await connection.getAccountInfo(address, "confirmed"); assert(info); return readPocketAccount(info);
+  };
+  let failedDeliveries = 0, outage = true;
+  const delivered: Record<string, unknown>[] = [];
+  const notify = async (subject: string, body: Record<string, unknown>) => {
+    if (outage && subject.includes("executed")) { failedDeliveries++; throw new Error("synthetic receiver outage"); }
+    delivered.push({ ...body, subject });
+  };
+  const restore = () => {
+    runningWatcher?.close(); journal?.close();
+    journal = CrankJournal.openExisting(journalPath, journalKey, journalScope, limits, journalId);
+    const database = WatcherState.openExisting(state, journalKey, stateScope, stateId);
+    runningWatcher = new Watcher(crankConnection, { notify }, 1n, payer, database, journal);
+    return runningWatcher;
+  };
+  const action = async (kind: "propose" | "cancel" | "revoke", change?: Uint8Array) => {
+    const response = await fetch(`${relayerUrl}/owner-action`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(await ownerBody(kind, change)) });
+    assert(response.ok, `watcher fixture owner action failed: ${await response.text()}`);
+  };
+  try {
+    assert.equal((await read(mature.pocket)).pending?.executableAfterSlot, 0n);
+    assert((await read(future.pocket)).pending!.executableAfterSlot > BigInt(await connection.getSlot("confirmed")));
+    let watcher = restore();
+    await watcher.tick();
+    assert(delivered.some(item => item.pocket === pocket.toBase58() && item.subject === "Large fill on your pocket" && item.mode === 0), "actual PocketV3 Filled event must reach the watcher");
+    // Genesis fixtures have no historical proposal events. Exercise their actual crank directly;
+    // the watcher then observes real execution logs and recovers the same outstanding journal packet.
+    const cranker = new DurableCranker(crankConnection, payer, journal!);
+    await cranker.execute(future.pocket.toBase58()); assert.equal(broadcasts, 0);
+    rpc.arm();
+    const balanceBefore = await connection.getBalance(payer.publicKey, "confirmed");
+    await assert.rejects(() => cranker.execute(mature.pocket.toBase58()));
+    const prepared = journal!.get(mature.pocket.toBase58())!;
+    assert.equal(prepared.state, "pending"); assert.equal(broadcasts, 1);
+    await connection.confirmTransaction({ signature: prepared.packet.signature, blockhash: prepared.packet.blockhash,
+      lastValidBlockHeight: prepared.packet.lastValidBlockHeight }, "confirmed");
+    const executed = await read(mature.pocket);
+    assert(executed.home.equals(mature.newHome)); assert.equal(executed.pending, undefined);
+    assert.equal(executed.ownerActionNonce, 1n);
+    assert((await read(future.pocket)).home.equals(future.home));
+    assert.equal(delivered.filter(item => item.pocket === mature.pocket.toBase58()).length, 0);
+    watcher = restore();
+    await assert.rejects(() => watcher.tick()); assert.equal(failedDeliveries, 1);
+    assert.equal(delivered.filter(item => item.pocket === mature.pocket.toBase58()).length, 0);
+    outage = false; watcher = restore(); await watcher.tick();
+    rpc.assertRecovered();
+    assert.equal(broadcasts, 1, "restart must reconcile accepted packet without another paid attempt");
+    assert.equal(journal!.get(mature.pocket.toBase58())!.packet.signature, prepared.packet.signature);
+    assert.equal(journal!.spent(), balanceBefore - await connection.getBalance(payer.publicKey, "confirmed"));
+    assert.equal(watcher.pending.size, 0);
+    assert.equal(delivered.filter(item => item.pocket === mature.pocket.toBase58() && String(item.subject).includes("executed")).length, 1);
+    console.log("✓ watcher recovered its durably reserved packet after lost acceptance and restart, reconciled one actual fee, preserved the future timelock and retried receiver delivery");
+
+    // Real owner-authorized proposal/revocation/cancellation on the ordinary E2E pocket.
+    const homeBefore = (await read(pocket)).home;
+    const change = Buffer.concat([Buffer.from([0]), Keypair.generate().publicKey.toBuffer()]);
+    await action("propose", change); await watcher.tick();
+    assert(watcher.pending.snapshot().some(([key]) => key === pocket.toBase58()));
+    assert((await read(pocket)).pending!.executableAfterSlot > BigInt(await connection.getSlot("confirmed")));
+    assert(delivered.some(item => item.pocket === pocket.toBase58() && String(item.subject).includes("proposed")));
+    await action("revoke"); await watcher.tick();
+    assert((await read(pocket)).pending, "revocation must not pretend to cancel a separate pending change");
+    await action("cancel", change); watcher = restore(); await watcher.tick();
+    const cancelled = await read(pocket);
+    assert.equal(cancelled.pending, undefined); assert(cancelled.home.equals(homeBefore));
+    assert.equal(cancelled.sessionExpirySlot, 0n);
+    assert(!watcher.pending.snapshot().some(([key]) => key === pocket.toBase58()));
+    assert(!delivered.some(item => item.pocket === pocket.toBase58() && String(item.subject).includes("executed")));
+    console.log("✓ real owner proposal was observed, revocation stayed separate, and cancellation survived watcher restart without a false execution alert");
+  } finally { runningWatcher?.close(); journal?.close(); journalKey.fill(0); await rpc.close(); rmSync(directory, { recursive: true, force: true }); }
+}

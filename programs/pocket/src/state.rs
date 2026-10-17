@@ -2,6 +2,7 @@
 
 use anchor_lang::prelude::*;
 use solana_sha256_hasher::hashv;
+use crate::speculative::{SpeculativePolicy, SpeculativeLedger, MAX_POSITIONS};
 
 /// 24 hours in slots (400 ms slots), used for the change timelock and the
 /// daily spending window.
@@ -45,13 +46,24 @@ pub struct Policy {
     pub allowed_out_mints: Vec<Pubkey>,
     #[max_len(8)]
     pub oracle_feeds: Vec<OracleFeedBinding>,
+    /// Explicit owner consent. Absent means all unpriced trades are disabled.
+    pub speculative: Option<SpeculativePolicy>,
 }
 
 impl Policy {
     pub fn validate(&self) -> bool {
-        self.allowed_out_mints.len() <= 8
+        let base_valid = self.allowed_out_mints.len() <= 8
             && self.oracle_feeds.len() <= 8
             && self.max_slippage_bps <= 10_000
+            && self.oracle_feeds.iter().enumerate().all(|(i, f)|
+                !self.oracle_feeds[..i].iter().any(|prior| prior.mint == f.mint));
+        base_valid && self.speculative.as_ref().map_or(true, |s|
+            self.no_oracle_cap_usd_e6 > 0 && s.daily_buy_cap_usd_e6 > 0 && s.max_cost_exposure_usd_e6 > 0
+            && s.max_positions > 0 && s.max_positions as usize <= MAX_POSITIONS
+            && !s.base_mints.is_empty() && s.base_mints.len() <= 4
+            && s.base_mints.iter().enumerate().all(|(i, mint)|
+                !s.base_mints[..i].contains(mint) && self.feed_for(mint).is_some()
+                && (self.allowed_out_mints.is_empty() || self.allowed_out_mints.contains(mint))))
     }
 
     /// Canonical bytes, byte-for-byte the layout in
@@ -59,6 +71,7 @@ impl Policy {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(35 + 1 + self.allowed_out_mints.len() * 32
             + 1 + self.oracle_feeds.len() * 65);
+        out.extend_from_slice(b"ghostlink:policy:v3");
         out.extend_from_slice(&self.daily_cap_usd_e6.to_le_bytes());
         out.extend_from_slice(&self.max_slippage_bps.to_le_bytes());
         out.extend_from_slice(&self.big_action_threshold_usd_e6.to_le_bytes());
@@ -73,6 +86,14 @@ impl Policy {
             out.extend_from_slice(&f.mint.to_bytes());
             out.extend_from_slice(&f.feed_id);
             out.push(f.decimals);
+        }
+        out.push(u8::from(self.speculative.is_some()));
+        if let Some(s) = &self.speculative {
+            out.extend_from_slice(&s.daily_buy_cap_usd_e6.to_le_bytes());
+            out.extend_from_slice(&s.max_cost_exposure_usd_e6.to_le_bytes());
+            out.push(s.max_positions);
+            out.push(s.base_mints.len() as u8);
+            for mint in &s.base_mints { out.extend_from_slice(mint.as_ref()); }
         }
         out
     }
@@ -100,7 +121,7 @@ pub struct PendingChange {
 
 #[account]
 #[derive(InitSpace)]
-pub struct Pocket {
+pub struct PocketV3 {
     pub app_id: [u8; 32],
     pub domain_hash: [u8; 32],
     /// The only address this pocket can ever withdraw to.
@@ -123,9 +144,10 @@ pub struct Pocket {
     pub nonce_base: u64,
     /// Freshness for every owner/session administrative authorization.
     pub owner_action_nonce: u64,
+    pub speculative_ledger: SpeculativeLedger,
 }
 
-impl Pocket {
+impl PocketV3 {
     pub fn consume_owner_action(&mut self) -> Result<()> {
         self.owner_action_nonce = self.owner_action_nonce.checked_add(1)
             .ok_or(error!(PocketError::Overflow))?;
@@ -145,6 +167,7 @@ impl Pocket {
         if now_slot >= self.day_start_slot.saturating_add(SLOTS_PER_DAY) {
             self.day_start_slot = now_slot;
             self.spent_today_usd_e6 = 0;
+            self.speculative_ledger.bought_today_usd_e6 = 0;
         }
     }
 
@@ -276,6 +299,9 @@ pub struct FillState {
     pub out_balance_before: u64,
     pub in_value_usd_e6: u64,
     pub passkey_signed: bool,
+    /// 0 = both legs priced, 1 = speculative buy, 2 = tracked exit.
+    pub mode: u8,
+    pub in_account: Pubkey,
     /// The token account whose balance `out_balance_before` snapshotted;
     /// `fill_end` must measure the very same account, or a second
     /// pocket-owned account with a standing balance would pass as delivery.
@@ -299,6 +325,9 @@ pub struct Filled {
     pub out_mint: Pubkey,
     pub out_received: u64,
     pub in_value_usd_e6: u64,
+    /// For mode 2 input has no oracle value; in_value_usd_e6 is zero.
+    pub mode: u8,
+    pub released_cost_usd_e6: u64,
 }
 
 #[event]
@@ -384,7 +413,7 @@ pub enum PocketError {
     NoInputOracle,
     #[msg("daily cap exceeded")]
     DailyCapExceeded,
-    #[msg("no-oracle intents need a passkey signature and the no-oracle cap")]
+    #[msg("unpriced trades need explicit speculative policy and the no-oracle buy cap")]
     NoOracleViolation,
     #[msg("intent exceeds the passkey threshold but was not passkey-signed")]
     PasskeyRequired,
@@ -412,4 +441,16 @@ pub enum PocketError {
     SessionReplayed,
     #[msg("fill_end output account differs from the one fill_begin snapshotted")]
     FillAccountMismatch,
+    #[msg("speculative trade is not allowed by owner policy")]
+    SpeculativeViolation,
+    #[msg("speculative daily buy cap exceeded")]
+    SpeculativeDailyCap,
+    #[msg("speculative acquisition-cost exposure cap exceeded")]
+    SpeculativeExposureCap,
+    #[msg("speculative position account, base or quantity mismatch")]
+    SpeculativePosition,
+    #[msg("speculative open position limit exceeded")]
+    SpeculativePositionLimit,
+    #[msg("close or sweep speculative positions before executing a policy change")]
+    PositionsOpen,
 }

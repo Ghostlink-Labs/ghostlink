@@ -58,7 +58,7 @@ export interface EconomicsCheck {
  */
 export function checkEconomics(
   intent: Pick<Intent, "inMax" | "outMin">,
-  prices: { in: PriceInfo; out?: PriceInfo },
+  prices: { in?: PriceInfo; out?: PriceInfo },
   maxSpreadBps: number,
   allowUnpriced = false,
 ): EconomicsCheck {
@@ -66,6 +66,13 @@ export function checkEconomics(
     throw new Error("maximum spread must be an integer from 0 to 10000 bps");
   }
   if (intent.inMax <= 0n) return { ok: false, reason: "intent spends nothing" };
+  if (!prices.in) {
+    // This is route permission, never inventory valuation. The server
+    // additionally requires a planner funded only by the exact intent input.
+    return allowUnpriced && prices.out && intent.outMin > 0n
+      ? { ok: true, outUsdE6: usdE6(intent.outMin, prices.out) }
+      : { ok: false, reason: "unpriced input requires an approved swap route to a priced base" };
+  }
   const inUsdE6 = usdE6(intent.inMax, prices.in);
   if (!prices.out) {
     return allowUnpriced

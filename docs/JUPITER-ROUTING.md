@@ -1,0 +1,70 @@
+# Experimental Jupiter routing
+
+The solver has an opt-in composable Jupiter adapter for one approved Raydium CP pool per trade. It validates both directions of a classic SPL token pair. It is development software, not a mainnet release: the V2 solver still rejects public-chain genesis hashes. The default planner remains the local inventory fixture.
+
+## Configuration
+
+Set `SOLVER_ROUTER=jupiter-raydium-cp`, `JUPITER_API_KEY_PATH` to a private file containing the API key, and `JUPITER_POOLS_PATH` to a private JSON file with an array of pool approvals. Each entry contains `pool`, `token0`, `token1` (base58 addresses in the pool's on-chain order), and `maxTradeFeePpm` (combined trade and enabled creator fees in millionths, at most 50,000). Approval of a pool permits either direction of its pair; the signed intent still determines the direction and amounts. No pools are implicitly trusted or shipped as production recommendations.
+
+`JUPITER_SLIPPAGE_BPS` defaults to 50 and accepts 0 through 500. The user's signed minimum output takes precedence whenever stricter. Existing solver price, authorization, compute, priority-fee, network-fee and journal configuration still applies. Unpriced trades additionally require `SOLVER_ALLOW_UNPRICED=1` and the owner-approved [PocketV3 speculative policy](adr/0004-bounded-speculative-trading.md). The inventory test planner cannot use that opt-in.
+
+The fixed-origin client calls [Jupiter's composable build endpoint](https://developers.jup.ag/docs/api-reference/swap/build), requests transaction version 0, exact input, no wrapping, no platform fee, and the pocket's derived output token account. It sends the key only to `api.jup.ag`, refuses redirects, aborts after four seconds, caps the streamed body at 256 KiB and redacts provider/transport errors. It has no automatic provider retry: retry the identical signed intent through the durable submission path.
+
+## What the adapter checks
+
+- Quote mints, input amount, output minimum, explicit tolerance, one 100% Raydium CP step and an operator-approved pool.
+- `route_v2` or `shared_accounts_route_v2` instruction bytes, one RaydiumCP enum step, exact amounts, no platform or positive-slippage fee, and no trailing instruction data.
+- Every account and privilege: solver source ATA, pocket destination ATA, Jupiter authority and event PDAs, SPL programs, Raydium authority, pool/config, correct directional vaults, mints and observation account. The only transaction signer is the solver. Shared accounts must be the derived Jupiter ATAs; the final output can never be redirected from the pocket.
+- RPC-owned pool/config/observation layouts, approved mint identities, initialized classic SPL mints without freeze authority, token owners, no delegates/close authority, active token state and pool fee ceiling. Pool mapping is rechecked with the other accounts in a single confirmed bank. The resulting context becomes a minimum for transaction composition.
+- No tips, cleanup or auxiliary instructions. The only accepted provider setup is a redundant idempotent creation of the solver input ATA; those bytes are discarded and the server supplies its own creation instruction. The pocket output account and any Jupiter shared accounts must already exist. This avoids paying user-controlled output rent.
+- Provider compute suggestions are discarded. Lookup mappings are bounded and independently verified at finalized commitment by the transaction composer. The full atomic begin/swap/end message is simulated twice; its exact network fee, compute budget and blockhash lifetime are checked before signing and journaling.
+
+Already wrapped SOL may be a classic SPL leg; this adapter never wraps, unwraps or closes token accounts. Token-2022, freezable mints, arbitrary intermediate accounts, split/multi-hop routes, legacy Jupiter instructions, exact-out trades, other DEXes and launchpads are refused. Missing liquidity or an unsupported provider response returns a preparation failure, never a fallback arbitrary transaction.
+
+Pool fees are checked against the observed bank, not locked by a new on-chain fee instruction. The atomic Pocket output floor protects the delivered amount; network fees can still be charged on failed transactions. Program upgrades, price impact, inventory exposure, aggregate fee budgets and RPC integrity require separate operational controls. A passing simulation is not a substitute for those controls.
+
+## Evidence and remaining release gates
+
+Contract tests cover both directions and direct/shared account variants, malicious instruction/account substitutions, fees, authorities, pool changes, stale contexts, malformed responses, oversized streamed bodies, provider failure and timeout. These provider-response fixtures are synthetic and are explicitly labelled as such.
+
+On 2026-10-17, a disposable Agave 3.0.15 validator completed the full V2 Pocket journey against actual cloned Jupiter and Raydium programs: registration, census, owner proof, bot consent, pocket opening, wallet-signed funding, buy, sell, lost-acknowledgment retry, service/database restart, owner revocation and recovery of both token balances. Each successful trade consumed its signed nonce exactly once. A separate local wallet moved the market after both complete simulations; the resulting submitted transaction executed `fill_begin` and the DEX, then failed and rolled back Pocket/solver token balances, nonce, spending budget and temporary fill account. Its failed identity survived restart. Revocation refused an already signed intent and new bot signing. The test deliberately skipped preflight only for that failing packet to exercise actual chain rollback; production submission keeps preflight enabled.
+
+The earlier standalone fork test exercised six swaps: both directions with direct, shared, and shared-destination accounts. The full Pocket test currently uses the direct route variant. These are real program executions on a local fork, with **synthetic quotes and Pyth accounts**, not live Jupiter API responses, public-chain trades, commercial bot adoption or production approval.
+
+The cloned binaries were observed at finalized mainnet slot 457793783:
+
+| Program | SHA-256 of captured program bytes |
+| --- | --- |
+| Jupiter `JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4` | `099da3a26d336aa7174960f057546f192fc1ccda8e3e9d1b4aa5c69fa8a79a5f` |
+| Raydium CP `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` | `b6dbea8cefc2e7d490775ce6115e34a2ba480c0853c359e0bb4043b9381ef09a` |
+
+Both observed programs were upgradeable. These hashes identify the tested artifacts; they are not a production deployment allowlist or an independent code review.
+
+Account ordering was cross-checked against the official ABI and the Raydium CPI in a confirmed public transaction ([2d1A2pdD…](https://explorer.solana.com/tx/2d1A2pdDExuPU2DsuLEEA6xFYZ8TZyZTDLJp6NeQPCUU8zhH2aWCFtSbxf3op3ibkR8jCNraUdkWpaHiRm81vzZU)). That transaction contains an unsupported multi-hop/Token-2022 route and is reference evidence only, not an accepted GhostLink fill.
+
+Before enabling a public release, collect real build responses with an operator-owned Jupiter key, repeat the complete Pocket flow with those responses and the intended supported route variants, and independently review the program binaries and operating limits. Retain binary hashes, upgrade authorities, account snapshots and provider versions. Complete the independent security review, production proof ceremony, controlled deployment and capped pilot in [MAINNET-READINESS.md](MAINNET-READINESS.md). Never remove the V2 public-genesis guard merely to test routing.
+
+## Reproducing the complete local fork
+
+After building the workspace, circuits and GhostLink SBF programs, run:
+
+```sh
+CARGO_TARGET_DIR=/path/to/compiled-programs \
+  bash scripts/jupiter-localnet-e2e.sh /private/path/to/routing-snapshot
+```
+
+To exercise an unpriced token buy and tracked partial exit, prefix the same command with `SPECULATIVE_TRADING=1`. This configures only the base-asset oracle, carries speculative limits through owner proof and durable bot consent, verifies quantity/cost accounting and proves recovery clears the position. Both variants keep quotes and base prices synthetic; this is not live provider acceptance.
+
+The snapshot directory must contain:
+
+- `snapshot.json`: `{ "approval": { "pool", "token0", "token1", "maxTradeFeePpm" }, "accounts": [...] }`. Each account entry has `pubkey` and an RPC account object with base64 `data`, `owner`, `lamports` and `executable`. Order: pool, config, token0 vault, token1 vault, token0 mint, token1 mint, observation, Jupiter program, Raydium CP program. Capture these through read-only finalized RPC calls. The current test setup requires already wrapped SOL as token0, classic SPL token1 and creator fees disabled; these are test-fixture constraints.
+- `programs.json`: two entries containing `id` and `sha256`, identifying the intended captured Jupiter and Raydium CP binaries.
+- `<program-id>.so` for each program, extracted from its upgradeable-loader ProgramData account after the 45-byte metadata header. Keep original upgrade slot/authority and RPC context evidence with the snapshot. Program hashes must match the manifest.
+
+The harness verifies layouts and binary hashes, creates temporary genesis accounts and synthetic prices, starts its own validator, generates local test identities and stops that validator on exit. It refuses funded payer configuration and public-chain genesis, including a public RPC proxied through localhost. No external funds, wallet imports or Jupiter key are required. The synthetic quote calculator is test-only and must never be used as a live oracle or production quote adapter. Keep snapshot directories, binaries, generated keys, ledgers and service databases outside published source.
+
+ABI/layout references reviewed on 2026-10-16:
+
+- [Jupiter aggregator IDL](https://github.com/jup-ag/rfq-v2-sdk/blob/f3f30ff2af48f63c11f326a486b8b0eb9611714f/fill-decoder/idls/aggregator.json), including V2 route instructions and RaydiumCP enum variant 46.
+- [Jupiter DEX interface accounts](https://github.com/jup-ag/jupiter-amm-implementation/blob/cc068c9d1df0060c62f9a8a4fc37ea13ea7b9b39/idls/jupiter_dex_interfaces.json) and [authority derivation](https://github.com/jup-ag/jupiter-amm-implementation/blob/cc068c9d1df0060c62f9a8a4fc37ea13ea7b9b39/jupiter/src/lib.rs).
+- [Raydium swap accounts](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/instructions/swap_base_input.rs), [pool layout](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/states/pool.rs), [fee config](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/states/config.rs), and [observation layout](https://github.com/raydium-io/raydium-cp-swap/blob/b3187ae53a1b95a201f855a59024a12ca8f5b51a/programs/cp-swap/src/states/oracle.rs).

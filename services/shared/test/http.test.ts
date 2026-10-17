@@ -1,5 +1,5 @@
 /** The HTTP kit's hardening: bounded bodies, preflight, status mapping. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { once } from "node:events";
 import { request } from "node:http";
 import { HttpError, RateLimiter, Router, Semaphore, badRequest } from "../src/index.js";
@@ -18,6 +18,50 @@ async function withRouter<T>(router: Router, fn: (base: string) => Promise<T>): 
 }
 
 describe("router", () => {
+  it.each(["development", "production"])("keeps unexpected errors and request values private by default in %s", async (mode) => {
+    vi.stubEnv("NODE_ENV", mode);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const marker = "SYNTHETIC_PROVIDER_AND_REQUEST_SECRET";
+    try {
+      const guarded = new Router();
+      guarded.get("/rpc/:value", async () => { throw new Error(`provider https://example.invalid/${marker}?api-key=${marker}`); });
+      await withRouter(guarded, async (base) => {
+        const response = await fetch(`${base}/rpc/${marker}?token=${marker}`, { headers: { authorization: marker } });
+        expect(response.status).toBe(500);
+        expect(await response.json()).toEqual({ error: "internal error" });
+        expect(log).toHaveBeenCalled();
+        expect(JSON.stringify(log.mock.calls)).not.toContain(marker);
+      });
+    } finally { log.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("bounds bodies before parsing and retains capacity until disconnected work actually finishes", async () => {
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const router = new Router({ maxInFlight: 1 });
+    router.post("/body", async () => ({ json: { ok: true } }));
+    router.get("/hold", async () => { entered(); await new Promise<void>(resolve => { release = resolve; }); return { json: {} }; });
+    router.get("/ok", async () => ({ json: {} }));
+    const server = router.server(); server.listen(0, "127.0.0.1"); await once(server, "listening");
+    const address = server.address(); if (!address || typeof address === "string") throw new Error();
+    const url = `http://127.0.0.1:${address.port}`;
+    const incoming = once(server, "request");
+    const slow = request(`${url}/body`, { method: "POST", headers: { "content-length": "100" } });
+    slow.on("error", () => {}); slow.flushHeaders();
+    const [raw] = await incoming;
+    try {
+      expect((await fetch(`${url}/ok`)).status).toBe(503);
+      const closed = new Promise<void>(resolve => raw.once("close", resolve)); slow.destroy(); await closed;
+      await new Promise(resolve => setImmediate(resolve));
+      const controller = new AbortController();
+      const held = fetch(`${url}/hold`, { signal: controller.signal }).catch(() => {});
+      await started; controller.abort(); await held;
+      expect((await fetch(`${url}/ok`)).status).toBe(503);
+      release(); await new Promise(resolve => setImmediate(resolve));
+      expect((await fetch(`${url}/ok`)).status).toBe(200);
+    } finally { slow.destroy(); release?.(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
   const router = new Router({ maxBodyBytes: 1024, exposeErrors: false, onError: () => undefined });
   router.post("/echo", async ({ body }) => ({ json: { body } }));
   router.get("/boom", async () => {
@@ -88,6 +132,26 @@ describe("router", () => {
 });
 
 describe("rate limiter and semaphore", () => {
+  it("refuses new identities at capacity without evicting existing rate limits", () => {
+    const limiter = new RateLimiter(2, 1000, 2);
+    expect(limiter.allow("a", 0)).toBe(true);
+    expect(limiter.allow("b", 1)).toBe(true);
+    expect(limiter.allow("c", 2)).toBe(false);
+    expect(limiter.allow("a", 3)).toBe(true);
+    expect(limiter.allow("a", 4)).toBe(false);
+    expect(limiter.allow("c", 1000)).toBe(true);
+    expect(limiter.allow("x".repeat(257), 1001)).toBe(false);
+  });
+
+  it("rejects excess queued work without executing it", async () => {
+    const sem = new Semaphore(1, 1);
+    let release!: () => void, ran = false;
+    const active = sem.run(() => new Promise<void>(resolve => { release = resolve; }));
+    const waiting = sem.run(async () => {});
+    try { await expect(sem.run(async () => { ran = true; })).rejects.toThrow("busy"); }
+    finally { release(); await Promise.all([active, waiting]); }
+    expect(ran).toBe(false);
+  });
   it("limits per key per window and forgets old windows", () => {
     const limiter = new RateLimiter(2, 1000);
     expect(limiter.allow("a", 0)).toBe(true);

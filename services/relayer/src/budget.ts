@@ -12,14 +12,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-export const TX_FEE_LAMPORTS = 5_000n;
-/** Rent-exempt minimum of a Pocket account (8 + 2081 bytes). */
-export const POCKET_RENT_LAMPORTS = 15_430_320n;
-/** Rent-exempt minimum of a registry Binding account (8 + 48 bytes). */
-export const BINDING_RENT_LAMPORTS = 1_280_640n;
-/** Rent-exempt minimum of an SPL token account. */
-export const ATA_RENT_LAMPORTS = 2_039_280n;
-
 export class SpendMeter {
   private charges: { at: number; lamports: bigint }[] = [];
 

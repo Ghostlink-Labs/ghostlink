@@ -16,6 +16,10 @@
     "node": ">=20"
   },
   "scripts": {
+    "pack:sdk": "pnpm --filter @ghostlink/sdk... build && node scripts/package-sdk.mjs",
+    "pack:bot": "pnpm --filter @ghostlink/bot... build && node scripts/package-sdk.mjs --bot",
+    "test:package": "node scripts/package-sdk.mjs --test",
+    "test:package:bot": "node scripts/package-sdk.mjs --bot --test",
     "build": "pnpm -r --filter './packages/*' build",
     "test": "pnpm -r test",
     "test:vectors": "pnpm --filter @ghostlink/common test",

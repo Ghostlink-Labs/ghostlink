@@ -1,0 +1,148 @@
+// Pack only public libraries and test them in a consumer outside the monorepo.
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const destination = join(root, "artifacts", "sdk");
+const pnpm = process.env.npm_execpath;
+if (!pnpm || !/pnpm/i.test(pnpm)) throw new Error("Run through pnpm: pnpm pack:sdk or pnpm test:package");
+const run = (args, cwd = root) => execFileSync(process.execPath, [pnpm, ...args], { cwd, stdio: "inherit" });
+mkdirSync(destination, { recursive: true });
+const includeBot = process.argv.includes("--bot");
+const folders = ["packages/common", "packages/sdk", ...(includeBot ? ["services/shared", "packages/bot"] : [])];
+const tarballs = [], packageOverrides = {};
+for (const relative of folders) {
+  const folder = join(root, relative);
+  const pkg = JSON.parse(readFileSync(join(folder, "package.json"), "utf8"));
+  run(["pack", "--pack-destination", destination], folder);
+  const tarball = join(destination, `${pkg.name.replace(/^@/, "").replace("/", "-")}-${pkg.version}.tgz`);
+  // pnpm's allowlisted package contents must not accidentally ship workspace files.
+  const files = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" }).trim().split(/\r?\n/);
+  for (const file of files) {
+    if (!/^package\/(dist\/[^\s]+\.(?:js|d\.ts)|fixtures\/[^\s]+\.json|package\.json|README\.md|LICENSE)$/.test(file)) {
+      throw new Error(`Unexpected packed file: ${file}`);
+    }
+  }
+  tarballs.push(tarball);
+  packageOverrides[pkg.name] = `file:${tarball.replaceAll("\\", "/")}`;
+}
+writeFileSync(join(destination, "SHA256SUMS"), tarballs.map(path => `${createHash("sha256").update(readFileSync(path)).digest("hex")}  ${path.split(/[\\/]/).pop()}`).join("\n") + "\n");
+
+if (process.argv.includes("--test")) {
+  const consumer = mkdtempSync(join(tmpdir(), "ghostlink-sdk-consumer-"));
+  // Until registry publication, resolve the SDK's versioned common dependency
+  // to the reviewed companion archive, including under pnpm's strict resolver.
+  writeFileSync(join(consumer, "package.json"), JSON.stringify({
+    name: "ghostlink-install-check", private: true, type: "module",
+    pnpm: { overrides: { ...JSON.parse(readFileSync(join(root, "package.json"), "utf8")).pnpm.overrides, ...packageOverrides } },
+  }));
+  run(["add", "--ignore-scripts", ...tarballs], consumer);
+  writeFileSync(join(consumer, "check.mjs"), `
+import assert from 'node:assert/strict';
+import { createPublicKey, verify } from 'node:crypto';
+import { GhostLink, softwareSession, sessionPublicKey, derivePocket, signIntent, policyToDto, policyFromDto,
+  ApplicationRegistry, applicationRegistryDigest, OwnerConsentController, verifyTelegramOwnerInitData,
+  prepareTelegramPairing, parseTelegramPairingCode, verifyTelegramPairingClaim,
+  RelayerClient, prepareRelayerOperation, RelayerOperationPendingError, prepareFundingTransaction } from '@ghostlink/sdk';
+import { intentHash, conservativePolicy, policyHash, u64le } from '@ghostlink/common';
+const relayerOperation = prepareRelayerOperation('/snapshot', {wallet:'wallet',holding:'holding'});
+const relayerClient = new RelayerClient('https://relayer.invalid', async () => { throw new Error('synthetic offline'); });
+await assert.rejects(relayerClient.submit(relayerOperation), e => e instanceof RelayerOperationPendingError && e.operation.digestHex === relayerOperation.digestHex);
+const bot = softwareSession();
+const publicKey = sessionPublicKey(0, bot.key32);
+assert.equal('sign' in publicKey, false);
+const base = new Uint8Array(32).fill(2);
+const policy = { ...conservativePolicy(), oracleFeeds: [{ mint: base, feedId: new Uint8Array(32).fill(4), decimals: 9 }],
+  speculative: { dailyBuyCapUsdE6: 30000000n, maxCostExposureUsdE6: 20000000n, maxPositions: 2, baseMints: [base] } };
+assert.deepEqual(policyFromDto(policyToDto(policy)), policy);
+const pocket = derivePocket(1n, new Uint8Array(32).fill(1), policy);
+// Legacy native deposit fixture, independently assembled from the wire format.
+const depositWire = Uint8Array.of(1, ...new Uint8Array(64), 1, 0, 1, 3,
+  ...publicKey.key32, ...pocket.address, ...new Uint8Array(32), ...new Uint8Array(32).fill(2),
+  1, 2, 2, 0, 1, 12, 2, 0, 0, 0, ...u64le(100n));
+const depositApproval = { appId: 1n, funder: publicKey.key32, asset: { kind: 'sol', lamports: 100n }, recentBlockhash: new Uint8Array(32).fill(3) };
+const expectedDeposit = Uint8Array.from(depositWire); expectedDeposit.set(depositApproval.recentBlockhash, 165);
+assert.deepEqual(prepareFundingTransaction(depositWire, depositApproval), expectedDeposit);
+assert.throws(() => prepareFundingTransaction(depositWire, { ...depositApproval, appId: 2n }));
+assert.throws(() => prepareFundingTransaction(depositWire, { ...depositApproval, asset: { kind: 'sol', lamports: 101n } }));
+const signed = await signIntent(pocket, bot, {
+  nonce: 1n, inMint: new Uint8Array(32).fill(2), inMax: 100n,
+  outMint: new Uint8Array(32).fill(3), outMin: 90n, deadlineSlot: 1000n,
+});
+const key = createPublicKey({ format: 'der', type: 'spki', key: Buffer.concat([
+  Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(publicKey.key32),
+]) });
+assert.equal(verify(null, intentHash(signed.intent), key, signed.signature.signature), true);
+assert.deepEqual(signed.intent.policyHash, policyHash(policy));
+await assert.rejects(GhostLink.init({ cluster: 'mainnet-beta', indexer: 'https://example.invalid' }), /no verified devnet or mainnet/);
+for (const api of [ApplicationRegistry, applicationRegistryDigest, OwnerConsentController, verifyTelegramOwnerInitData,
+  prepareTelegramPairing, parseTelegramPairingCode, verifyTelegramPairingClaim]) assert.equal(typeof api, 'function');
+assert.throws(() => verifyTelegramOwnerInitData('user=forged', '12345'));
+assert.throws(() => prepareTelegramPairing('user=forged', '12345'));
+const code = 'GLP1.12345.42.' + 'ab'.repeat(32);
+assert.equal(parseTelegramPairingCode(code).userId, '42');
+assert.throws(() => verifyTelegramPairingClaim(code, '12345', { initData: 'user=forged', expiresAt: Math.floor(Date.now()/1000)+60 }));
+console.log('Installed SDK: ESM import, public delegation, real intent signature and exact funding validation verified. No network transaction sent.');
+`);
+  execFileSync(process.execPath, [join(consumer, "check.mjs")], { cwd: consumer, stdio: "inherit" });
+  if (includeBot) {
+    writeFileSync(join(consumer, "bot.mjs"), `
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { join } from 'node:path';
+import { BotKeyStore, BotOnboarding, createBotAuthorizationServer, verifyTelegramInitData } from '@ghostlink/bot';
+import { createRpcPool } from '@ghostlink/service-kit/rpc';
+const rpc = createRpcPool({ genesisHash: '11111111111111111111111111111111', endpoints: [{ url: 'https://example.invalid' }] });
+assert.equal(rpc.connection.rpcEndpoint, 'https://ghostlink-rpc.invalid');
+rpc.close();
+await assert.rejects(rpc.connection.getSlot(), /closed/);
+const key = randomBytes(32);
+const path = join(process.cwd(), 'consumer.sqlite');
+const store = new BotKeyStore(path, key);
+const backup = join(process.cwd(), 'consumer.enc');
+await store.backupTo(backup);
+const restoredPath = BotKeyStore.restoreBackup(backup, join(process.cwd(), 'restored-consumer'), key);
+const restored = new BotKeyStore(restoredPath, key);
+restored.close();
+const rotatedKey = randomBytes(32);
+store.rotateKey(rotatedKey);
+assert.throws(() => new BotKeyStore(path, key));
+store.close();
+const reopened = new BotKeyStore(path, rotatedKey);
+assert.equal(JSON.stringify(reopened), '{}');
+reopened.close(); key.fill(0); rotatedKey.fill(0);
+assert.equal(typeof BotOnboarding, 'function');
+assert.equal(typeof BotOnboarding.prototype.prepareIntent, 'function');
+assert.equal(typeof BotOnboarding.prototype.orderStatus, 'function');
+assert.equal(typeof BotOnboarding.prototype.cancelOrder, 'function');
+assert.equal(typeof createBotAuthorizationServer, 'function');
+assert.throws(() => verifyTelegramInitData('forged', '12345:' + 'a'.repeat(32)));
+console.log('Installed bot package: dependencies, encrypted backup/restore, key rotation, restart and authentication boundary verified.');
+`);
+    execFileSync(process.execPath, [join(consumer, "bot.mjs")], { cwd: consumer, stdio: "inherit" });
+    execFileSync(process.execPath, ["-e", "import('@ghostlink/bot').then(bot => { if (typeof bot.BotKeyStore !== 'function') process.exit(1); });"], { cwd: consumer, stdio: "inherit" });
+  }
+  writeFileSync(join(consumer, "check.cjs"), "import('@ghostlink/sdk').then(sdk => { if (typeof sdk.GhostLink !== 'function') process.exit(1); console.log('CommonJS dynamic import verified'); });\n");
+  execFileSync(process.execPath, [join(consumer, "check.cjs")], { cwd: consumer, stdio: "inherit" });
+  writeFileSync(join(consumer, "check.mts"), `
+import { GhostLink, sessionPublicKey, OwnerConsentController, type OwnerConsentOptions, type OwnerConsentExpectations,
+  type SessionAuthorizationParams, type SessionPublicKey, prepareFundingTransaction, type FundingApproval } from '@ghostlink/sdk';
+import type { BotConsentStatus } from '@ghostlink/common';
+const review = (options: OwnerConsentOptions, status: BotConsentStatus, expected: OwnerConsentExpectations) => new OwnerConsentController(options).review(status, expected);
+void review;
+const authorize = (client: GhostLink, params: SessionAuthorizationParams) => client.authorizeSession(params);
+const key: SessionPublicKey = sessionPublicKey(0, new Uint8Array(32));
+const deposit = (bytes: Uint8Array, approval: FundingApproval): Uint8Array => prepareFundingTransaction(bytes, approval);
+void authorize; void key; void deposit;
+${includeBot ? "import { BotOnboarding, type BotOnboardingOptions, type BotConsent, type BotIntentParams, type BotOrderStatus } from '@ghostlink/bot';\nconst initBot = (options: BotOnboardingOptions) => new BotOnboarding(options);\nconst prepare = (m: BotOnboarding, c: BotConsent, requestKey: string, params: BotIntentParams) => m.prepareIntent(c.id, c, { requestKey, params });\nconst status = (m: BotOnboarding, c: BotConsent, requestKey: string): BotOrderStatus => m.orderStatus(c.id, c, requestKey);\nvoid initBot; void prepare; void status;" : ""}
+`);
+  const require = createRequire(join(root, "packages", "sdk", "package.json"));
+  execFileSync(process.execPath, [require.resolve("typescript/bin/tsc"), "--noEmit", "--strict", "--skipLibCheck", "--target", "ES2022", "--module", "NodeNext", "--moduleResolution", "NodeNext", "check.mts"], { cwd: consumer, stdio: "inherit" });
+  console.log(`Isolated consumer and type declarations verified: ${consumer}`);
+}
+console.log(`SDK archives and checksums: ${destination}`);

@@ -1,0 +1,28 @@
+{
+  "name": "@ghostlink/bot",
+  "version": "0.1.0",
+  "description": "Localnet candidate for authenticated Telegram bot onboarding and encrypted delegated session storage.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": { "node": "^22.16.0 || ^24.0.0" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ghostlink/common": "workspace:*",
+    "@ghostlink/sdk": "workspace:*",
+    "@ghostlink/service-kit": "workspace:*",
+    "@solana/web3.js": "^1.98.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.11"
+  }
+}

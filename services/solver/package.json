@@ -2,14 +2,19 @@
   "name": "@ghostlink/solver",
   "version": "0.1.0",
   "private": true,
-  "description": "Reference solver: receives signed intents, quotes a route, and submits precompile + fill_begin + route + fill_end as one atomic transaction. A bad solver can only lose its own funds.",
+  "description": "Localnet reference solver with encrypted transaction persistence, explicit confirmation states and atomic bounded-intent settlement.",
   "license": "Apache-2.0",
   "type": "module",
+  "engines": { "node": "^22.16.0 || ^24.0.0" },
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js",
     "./server": "./dist/server.js",
-    "./validate": "./dist/validate.js"
+    "./validate": "./dist/validate.js",
+    "./jupiter": "./dist/jupiter.js",
+    "./raydium": "./dist/raydium.js",
+    "./journal": "./dist/journal.js",
+    "./submission": "./dist/submission.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

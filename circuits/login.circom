@@ -13,7 +13,7 @@ include "lib/merkle.circom";
  * domain; and (if the holdings claim is on) that wallet had at least
  * `threshold` of `mint` in a census snapshot no older than `min_slot`."
  *
- * session_commitment and home_hash are public inputs with no in-circuit
+ * session_commitment, home_hash and authorization_context are public inputs with no in-circuit
  * constraints: including them in the statement binds them to the proof,
  * and the pocket program re-derives both from the raw instruction data.
  *
@@ -33,6 +33,9 @@ template Login(depth) {
     signal input session_commitment;
     signal input home_hash;
     signal input claim_holdings;
+    // V2: zero for off-chain login; otherwise the program re-derives the
+    // purpose/deployment/policy/key-kind commitment. Never accept a V1 proof.
+    signal input authorization_context;
 
     // ---- private ----
     signal input s;
@@ -118,6 +121,8 @@ template Login(depth) {
     sBind <== session_commitment * 1;
     signal hBind;
     hBind <== home_hash * 1;
+    signal aBind;
+    aBind <== authorization_context * 1;
 }
 
 component main {
@@ -132,6 +137,7 @@ component main {
         min_slot,
         session_commitment,
         home_hash,
-        claim_holdings
+        claim_holdings,
+        authorization_context
     ]
 } = Login(26);

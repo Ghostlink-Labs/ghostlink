@@ -35,12 +35,10 @@ import {
   RateLimiter,
   Router,
   Semaphore,
-  ataAddress,
   badRequest,
   cancelChangeIx,
   clientIp,
   computeBudget,
-  createAtaIdempotentIx,
   ed25519Ix,
   isPocketAccount,
   openSessionIx,
@@ -52,8 +50,8 @@ import {
   sweepHomeIx,
 } from "@ghostlink/service-kit";
 import { policyFromDtoBytes } from "./policy.js";
+import { prepareRecoverySweep } from "./recovery.js";
 import {
-  ATA_RENT_LAMPORTS,
   BINDING_RENT_LAMPORTS,
   POCKET_RENT_LAMPORTS,
   SpendMeter,
@@ -98,13 +96,13 @@ export function buildServer(deps: RelayerDeps): Server {
     }
   }
 
-  async function sendTx(instructions: TransactionInstruction[], rent: bigint): Promise<{ signature: string }> {
+  async function sendTx(instructions: TransactionInstruction[], rent: bigint, signers: Keypair[] = []): Promise<{ signature: string }> {
     return inFlight.run(async () => {
       const tx = new Transaction().add(...instructions);
       tx.feePayer = payer.publicKey;
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
       tx.recentBlockhash = blockhash;
-      tx.sign(payer);
+      tx.sign(payer, ...signers);
       // Serialize and obtain the full fee (including signature precompiles)
       // before reserving. Nothing asynchronous sits between charge and send.
       const bytes = tx.serialize();
@@ -205,11 +203,7 @@ export function buildServer(deps: RelayerDeps): Server {
 
   router.post("/owner-action", async ({ body, raw }) => {
     throttle(raw);
-    const req = objectBody(body) as Partial<OwnerActionRequest> & {
-      /** sweep only: (pocketAta, destinationAta) base58 pairs, with the mint so missing destinations can be created */
-      tokenPairs?: { source: string; destination: string; mint?: string }[];
-      home?: string;
-    };
+    const req = objectBody(body) as Partial<OwnerActionRequest>;
     const pocket = pubkey(req.pocket, "pocket");
     const proof = {
       proofA: hex(req.proofAHex, 64, "proofAHex"),
@@ -219,6 +213,8 @@ export function buildServer(deps: RelayerDeps): Server {
     };
     const instructions: TransactionInstruction[] = [computeBudget(400_000)];
     let cost = 0n;
+    let extraSigners: Keypair[] = [];
+    let tokenPairs: {source:string;destination:string;mint:string}[] | undefined;
     switch (req.action) {
       case "sweep": {
         const home = pubkey(req.home, "home");
@@ -230,29 +226,20 @@ export function buildServer(deps: RelayerDeps): Server {
           const p = objectBody(pair);
           return {
             source: pubkey(p.source, "tokenPairs.source"),
-            destination: pubkey(p.destination, "tokenPairs.destination"),
-            mint: p.mint ? pubkey(p.mint, "tokenPairs.mint") : undefined,
+            destination: p.destination === undefined ? undefined : pubkey(p.destination, "tokenPairs.destination"),
+            mint: p.mint === undefined ? undefined : pubkey(p.mint, "tokenPairs.mint"),
           };
         });
-        // The program needs every destination to exist. Create the home's
-        // missing associated accounts (and only those) in the same transaction.
-        const creatable = parsed.filter((p) => p.mint && ataAddress(home, p.mint).equals(p.destination));
-        if (creatable.length > 0) {
-          const infos = await connection.getMultipleAccountsInfo(creatable.map((p) => p.destination));
-          creatable.forEach((p, i) => {
-            if (infos[i] === null) {
-              instructions.push(createAtaIdempotentIx(payer.publicKey, home, p.mint!));
-              cost += ATA_RENT_LAMPORTS;
-            }
-          });
-        }
+        const prepared = await prepareRecoverySweep(connection,payer.publicKey,pocket,home,parsed);
+        instructions.push(...prepared.instructions);cost=prepared.rent;extraSigners=prepared.signers;
+        tokenPairs=prepared.pairs.map(p=>({source:p.source.toBase58(),destination:p.destination.toBase58(),mint:p.mint.toBase58()}));
         instructions.push(
           sweepHomeIx({
             payer: payer.publicKey,
             pocket,
             home,
             auth: proof,
-            tokenPairs: parsed.map((p) => ({ source: p.source, destination: p.destination })),
+            tokenPairs: prepared.pairs,
           }),
         );
         break;
@@ -282,7 +269,7 @@ export function buildServer(deps: RelayerDeps): Server {
       default:
         throw badRequest("unknown action");
     }
-    return { json: await sendTx(instructions, cost) };
+    return { json: { ...await sendTx(instructions, cost, extraSigners), ...(tokenPairs ? {tokenPairs} : {}) } };
   });
 
   // Convenience: derive a pocket address for an app id (read-only).

@@ -15,6 +15,7 @@ pub struct ParsedTokenAccount {
     pub mint: Pubkey,
     pub owner: Pubkey,
     pub amount: u64,
+    pub delegate: Option<Pubkey>,
     pub close_authority: Option<Pubkey>,
 }
 
@@ -37,10 +38,16 @@ pub fn parse_token_account(info: &AccountInfo) -> Result<ParsedTokenAccount> {
         [1, 0, 0, 0] => Some(Pubkey::try_from(&data[133..165]).unwrap()),
         _ => return err!(PocketError::BadTokenAccount),
     };
+    let delegate = match &data[72..76] {
+        [0, 0, 0, 0] => None,
+        [1, 0, 0, 0] => Some(Pubkey::try_from(&data[76..108]).unwrap()),
+        _ => return err!(PocketError::BadTokenAccount),
+    };
     Ok(ParsedTokenAccount {
         mint: Pubkey::try_from(&data[0..32]).unwrap(),
         owner: Pubkey::try_from(&data[32..64]).unwrap(),
         amount: u64::from_le_bytes(data[64..72].try_into().unwrap()),
+        delegate,
         close_authority,
     })
 }

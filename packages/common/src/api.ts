@@ -137,6 +137,10 @@ export interface IntentSubmission {
 export interface OwnerActionRequest {
   pocket: string; // base58
   action: "sweep" | "revoke" | "propose" | "cancel";
+  /** Sweep: must match the current on-chain recovery home. */
+  home?: string;
+  /** Sweep: omit destination to select/create a clean account owned by home. Explicit destinations are never substituted. */
+  tokenPairs?: { source: string; destination?: string; mint?: string }[];
   /** borsh-encoded Change for propose, hex; omitted otherwise. */
   changeHex?: string;
   proofAHex: string;

@@ -543,6 +543,10 @@ async function main() {
     throw new Error("owner recovery retained speculative trading permission");
   }
 
+  if (process.env.RECOVERY_DESTINATION_DRILL === "1") {
+    const {exerciseRecoveryDestinations}=await import("./recovery-destinations.js");
+    await exerciseRecoveryDestinations({connection,payer,wallet,pocket,relayerUrl,send,ownerBody:()=>ownerBody("sweep")});
+  }
   console.log(
     "\nE2E PASSED — register, snapshot, bot consent, prove, verify, open, confirm, restart, fund, bot-signed fill, sweep.",
   );

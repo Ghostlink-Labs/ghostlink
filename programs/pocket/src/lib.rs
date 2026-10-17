@@ -520,8 +520,11 @@ pub mod ghostlink_pocket {
             let src = parse_token_account(src_info)?;
             require!(src.owner == pocket_key, PocketError::BadTokenAccount);
             let dst = parse_token_account(dst_info)?;
+            // A relayer may select any home-owned account. It must not redirect
+            // the withdrawn balance into a pre-existing third-party authority.
             require!(
-                dst.owner == pocket.home && dst.mint == src.mint,
+                dst.owner == pocket.home && dst.mint == src.mint
+                    && dst.delegate.is_none() && dst.can_close(&pocket.home),
                 PocketError::BadTokenAccount
             );
             if src.amount > 0 {

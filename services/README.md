@@ -1,21 +1,34 @@
 # Off-chain services
 
-Five small TypeScript services, all stateless or rebuildable from chain data, all self-hostable — an app that doesn't trust ours can run its own copy of any of them and lose nothing, because none of them holds user secrets. What each one is trusted with is listed honestly below; "integrity" never appears, because that lives on-chain.
+GhostLink's reference services connect clients to the Solana programs. They carry availability, privacy, transaction-construction and operational responsibilities. On-chain checks do not make a service trustworthy in every respect, and reconstructing chain events does not reconstruct every off-chain request, notification acknowledgment or spending reservation.
 
-| Service | Job | Trust it carries |
+## Choose the correct version
+
+The default branch is the published V1 development baseline. The [V2 authorization / PocketV3 candidate](https://github.com/Ghostlink-Labs/ghostlink/tree/codex/mainnet-sdk-foundation/services) contains newer durable-state, recovery and hosted-service controls. It is localnet-only and is not a drop-in upgrade for the preserved devnet deployment. Neither version is approved for real funds.
+
+| Service | Responsibility | Boundary to understand |
 | --- | --- | --- |
-| [`indexer/`](indexer) | Rebuilds both Merkle trees from on-chain events (RPC polling or an authenticated Helius webhook) and serves roots, paths in O(depth), and pages of leaves so clients can build witnesses locally. | Liveness; and for clients that ask for a specific path, the privacy of which wallet asked (clients rebuilding the tree locally reveal nothing). Events are attributed by program framing, every root is reconciled with the on-chain ring, and the store refuses — without mutating — anything that doesn't chain. |
-| [`relayer/`](relayer) | The fee payer: registration bundles, census cranks, session openings, owner actions (incl. creating the home's missing token accounts for a sweep). Rate-limited per IP and wallet, metered against a rolling daily budget, optionally restricted to partner origins for pocket creation. | Liveness only — every instruction carries the user's signature or proof. |
-| [`solver/`](solver) | Fills intents atomically: precompile + `fill_begin` + route + `fill_end`. Validates signatures locally and values both legs against the pinned price feeds before spending a fee. Ships with a mock route; Jupiter drops into the same interface. | Only its own capital, and it refuses to overpay for it. |
-| [`actions/`](actions) | Solana Actions (Blinks) deposit endpoint. Destination derived only from the app id, never from the request, and only for pockets that exist. | Correctness of the destination, double-checked by the wallet's simulation. |
-| [`watcher/`](watcher) | Alerts on `propose_change` (the loud 24-hour step an attacker can't skip) and large fills; retries deliveries and never forgets an undelivered one. Given a keypair, cranks `execute_change` once a timelock has elapsed so users without SOL get their own change applied. | None (the crank's fees). |
-| [`shared/`](shared) | Instruction encoding, event decoding, precompile builders and the hardened HTTP kit (bounded bodies, preflight, status mapping) — the TypeScript twin of the byte shapes the Rust integration tests prove on-chain. |
-| [`e2e/`](e2e) | The localnet end-to-end: real validator, services in-process, the whole journey over HTTP. `scripts/localnet-e2e.sh` runs it. |
+| [Indexer](indexer/) | Rebuild trees and serve witness data/activity | Clients must verify roots against trusted chain state. Requests can reveal metadata; archival completeness is a separate requirement. |
+| [Relayer](relayer/) | Submit supported operations and pay fees | Durable request identity, fee/rent accounting, authorization and uncertain outcomes matter. It must not receive the owner's identity secret. |
+| [Solver](solver/) | Construct and submit supported atomic fills | Validate session authority, route instructions, fees and actual outcomes. A new route is not automatically safe or compatible. |
+| [Actions](actions/) | Construct funding transactions | The funding wallet/client must independently validate destination, amount, instructions and total debit before signing. |
+| [Watcher](watcher/) | Observe events, deliver alerts and optionally fund cranks | Delivery can be repeated; receivers need deduplication. Observation and fee history must survive restart. |
+| [Shared](shared/) | Encodings, event decoding and transport helpers | Clients, programs and deployed account formats must agree. |
+| [E2E](e2e/) | Disposable local-validator integration flow | Test fixtures do not certify production providers or real devices. |
 
-Keys and environment variables are documented in each service's entry file and summarized in `docs/DEVNET.md`; keypairs never live in the repo.
+## Development and operations
 
-For restart durability, set `PERSIST_PATH` on the indexer, `RELAYER_BUDGET_PATH` on the relayer, and `WATCHER_STATE_PATH` on the watcher to writable files outside the checkout. Missing files start empty; invalid snapshots fail startup. Run one process per snapshot/payer: the JSON snapshots do not provide distributed locking. Without these paths, state is memory-only. The relayer charges the RPC's full transaction fee plus estimated rent immediately before broadcasting and retains ambiguous broadcast charges conservatively for 24 hours.
+For the baseline, use the checked-in [setup guide](../docs/SETUP.md), [devnet notes](../docs/DEVNET.md) and version-matched service entry points. Older JSON/ephemeral state paths are development behavior, not a production recovery strategy.
 
-The watcher paginates all available history on its first run, then resumes from its saved cursor. Notifications are at-least-once: a crash between delivery and checkpointing can redeliver an alert. Execution alerts come from successful chain events, and failed cranks stay pending. Webhooks carrying pocket events must include `signature` (or Helius `transaction.signatures[0]`); tree-only `{ logs }` payloads remain supported. The indexer stores processed event-bearing transaction signatures to deduplicate webhook and poller overlap across restarts; its snapshot size grows with history.
+For the candidate, read its dedicated operations guides before configuring a hosted process:
 
-The current Pocket account allocation is **2,089 bytes**, including its discriminator and owner action nonce. `readPocketAccount` rejects earlier allocations, including 2,081-byte accounts whose padding could otherwise be mistaken for a zero nonce. This is a breaking account-format change: older deployed accounts require a separately reviewed migration or a fresh deployment; these service changes do not migrate or upgrade them.
+- [Indexer](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/INDEXER-OPERATIONS.md)
+- [Relayer](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/RELAYER-OPERATIONS.md)
+- [Solver](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/SOLVER-OPERATIONS.md)
+- [Watcher](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/WATCHER-OPERATIONS.md)
+- [Actions](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/ACTIONS-OPERATIONS.md)
+- [RPC](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/RPC-OPERATIONS.md) and [backup/restore](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/BACKUP-RESTORE.md)
+
+Do not delete or replace production state to bypass a startup error. Keep credentials, keys, databases, WAL files and backups outside source control, and independently reconcile uncertain history before resuming work. Candidate services have service-specific existing-state/identity requirements, restore restrictions, readiness and shutdown behavior; read each guide rather than applying one generic environment configuration.
+
+See the [project README](../README.md#versions-and-release-status) for version boundaries and the [candidate readiness plan](https://github.com/Ghostlink-Labs/ghostlink/blob/codex/mainnet-sdk-foundation/docs/MAINNET-READINESS.md) for outstanding release gates.

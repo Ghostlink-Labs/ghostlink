@@ -112,6 +112,10 @@ try {
   assert.notEqual(rejected.child.exitCode, 0); assert(!rejected.output.includes(marker));
 
   secondary.mode = "normal";
+  const unfundedConfig = await start("watcher", { GHOSTLINK_WATCHER_KEYPAIR: payerPath,
+    WATCHER_JOURNAL_PATH: "", WATCHER_JOURNAL_KEY_PATH: "", WATCHER_TOTAL_BUDGET_LAMPORTS: "" });
+  await stopped(unfundedConfig); assert.notEqual(unfundedConfig.child.exitCode, 0);
+  assert(!unfundedConfig.output.includes(marker), "funded watcher configuration failure exposed diagnostics");
   const indexer = await start("indexer");
   await until(async () => Boolean((await health(indexer))?.poller?.lastSuccessAt), "indexer did not ingest through fallback");
   assert(primary.calls.every(method => method === "getGenesisHash"), "wrong-chain provider received ingestion requests");

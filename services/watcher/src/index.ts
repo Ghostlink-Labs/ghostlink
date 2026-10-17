@@ -23,14 +23,19 @@
  *   GHOSTLINK_WATCHER_KEYPAIR — optional fee payer; enables the crank
  *   WATCHER_STATE_PATH — durable scoped snapshot (required by entry point)
  *   WATCHER_POLL_MS — polling interval, 100..60000 (default 5000)
+ *   WATCHER_JOURNAL_PATH / WATCHER_JOURNAL_KEY_PATH — required for funded execution
+ *   WATCHER_TOTAL_BUDGET_LAMPORTS — explicit cumulative fee cap, never reset by restart
+ *   WATCHER_MAX_FEE_LAMPORTS — per-packet cap (default 20000)
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
-import { POCKET, decodeLogs, executeChangeIx, type GhostLinkEvent } from "@ghostlink/service-kit";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { POCKET, decodeLogs, type GhostLinkEvent } from "@ghostlink/service-kit";
 import { createRpcPool, loadRpcEndpoints } from "@ghostlink/service-kit/rpc";
-import bs58 from "bs58";
+import { CrankJournal } from "./journal.js";
+import { DurableCranker } from "./crank.js";
+export { CrankJournal, DurableCranker };
 
 export interface Notifier {
   notify(subject: string, body: Record<string, unknown>): Promise<void>;
@@ -152,6 +157,10 @@ export class Watcher {
   /** Newest signature every notification of which was delivered. */
   private cursor: string | undefined;
   private busy = false;
+  private readonly durableCranker?: DurableCranker;
+  private stopping = false;
+  get idle(): boolean { return !this.busy; }
+  drain(): void { this.stopping = true; }
   readonly pending = new PendingChanges();
   private readonly scope?: { genesisHash: string; pocketProgram: string; cranker: string | null };
 
@@ -164,7 +173,12 @@ export class Watcher {
     private readonly statePath?: string,
     /** Required by the hosted entry point; omitted only for unscoped local fixtures. */
     genesisHash?: string,
+    private readonly journal?: CrankJournal,
   ) {
+    if (cranker) {
+      if (!journal || !statePath || genesisHash !== journal.scope.genesisHash) throw new Error("funded watcher requires a scoped durable crank journal and snapshot");
+      this.durableCranker = new DurableCranker(connection, cranker, journal);
+    } else if (journal) throw new Error("crank journal requires its payer");
     if (genesisHash) {
       try {
         if (new PublicKey(genesisHash).toBase58() !== genesisHash) throw new Error();
@@ -192,7 +206,7 @@ export class Watcher {
   }
 
   async tick(): Promise<void> {
-    if (this.busy) return;
+    if (this.busy || this.stopping) return;
     this.busy = true;
     try {
       const sigs = [];
@@ -222,40 +236,23 @@ export class Watcher {
         this.cursor = info.signature;
         this.persist();
       }
-      if (this.cranker && this.pending.size > 0) await this.crank(this.cranker);
+      if (this.durableCranker && !this.stopping) await this.crank();
     } finally {
       this.busy = false;
     }
   }
 
-  private async crank(payer: Keypair): Promise<void> {
-    this.persist(); // A prior write failure must not allow the next tick to fund work from memory alone.
+  private async crank(): Promise<void> {
+    this.persist(); // Refuse funding if notification/proposal progress cannot be saved.
     const slot = BigInt(await this.connection.getSlot("confirmed"));
-    for (const pocket of this.pending.due(slot)) {
-      try {
-        const tx = new Transaction().add(executeChangeIx(payer.publicKey, new PublicKey(pocket)));
-        tx.feePayer = payer.publicKey;
-        const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-        tx.recentBlockhash = blockhash;
-        tx.sign(payer);
-        const signature = bs58.encode(tx.signature!);
-        const acknowledged = await this.connection.sendRawTransaction(tx.serialize(), { maxRetries: 0 });
-        if (acknowledged !== signature) throw new Error("unexpected transaction acknowledgment");
-        const status = await this.connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
-        if (status.value.err) throw new Error("crank failed on-chain");
-        this.pending.forget(pocket);
-        this.persist();
-        // Notify from the confirmed ChangeExecuted event on the next tick.
-        // Its cursor is durable, so a delivery outage cannot lose this alert.
-      } catch {
-        // Already executed or cancelled by someone else: the next
-        // ChangeExecuted/ChangeCanceled event clears it; anything else is
-        // retried next tick.
-        console.error("watcher crank not confirmed; retaining pending change");
-      }
+    const pockets = new Set([...this.journal!.outstanding(), ...this.pending.due(slot)]);
+    for (const pocket of pockets) {
+      if (this.stopping) break;
+      try { await this.durableCranker!.execute(pocket); }
+      catch { console.error("watcher crank not confirmed; retaining pending change"); }
+      // Only actual executed/cancelled events remove pending work and produce notifications.
     }
   }
-
   start(intervalMs = 5000): NodeJS.Timeout {
     if (!Number.isSafeInteger(intervalMs) || intervalMs < 100 || intervalMs > 60_000) throw new Error("invalid watcher polling interval");
     return setInterval(() => {
@@ -292,8 +289,30 @@ async function main() {
   const cranker = process.env.GHOSTLINK_WATCHER_KEYPAIR
     ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.env.GHOSTLINK_WATCHER_KEYPAIR, "utf8"))))
     : undefined;
-  const watcher = new Watcher(connection, notifier, threshold, cranker, statePath, genesisHash);
-  watcher.start(Number(process.env.WATCHER_POLL_MS ?? 5000));
+  let journal: CrankJournal | undefined;
+  if (cranker) {
+    const journalPath = process.env.WATCHER_JOURNAL_PATH, keyPath = process.env.WATCHER_JOURNAL_KEY_PATH;
+    if (!journalPath || !keyPath || !process.env.WATCHER_TOTAL_BUDGET_LAMPORTS) throw new Error("funded watcher journal and budget are required");
+    const key = readFileSync(keyPath);
+    try { journal = new CrankJournal(journalPath, key, { genesisHash, pocketProgram: POCKET.toBase58(), payer: cranker.publicKey.toBase58() }, {
+      maximumFeeLamports: Number(process.env.WATCHER_MAX_FEE_LAMPORTS ?? 20_000),
+      totalBudgetLamports: Number(process.env.WATCHER_TOTAL_BUDGET_LAMPORTS),
+    }); } finally { key.fill(0); }
+  }
+  const watcher = new Watcher(connection, notifier, threshold, cranker, statePath, genesisHash, journal);
+  const timer = watcher.start(Number(process.env.WATCHER_POLL_MS ?? 5000));
+  let stopping = false;
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true; clearInterval(timer); watcher.drain();
+    const deadline = setTimeout(() => { rpc.close(); journal?.close(); process.exit(1); }, 30_000);
+    deadline.unref();
+    const drain = setInterval(() => {
+      if (!watcher.idle) return;
+      clearInterval(drain); clearTimeout(deadline); rpc.close(); journal?.close();
+    }, 50);
+  };
+  process.once("SIGTERM", shutdown); process.once("SIGINT", shutdown);
   void watcher.tick().catch(() => console.error("watcher poll failed; preserving saved progress"));
   console.log(`ghostlink watcher running${cranker ? ` (crank payer ${cranker.publicKey.toBase58()})` : ""}`);
 }

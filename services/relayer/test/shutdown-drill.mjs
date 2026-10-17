@@ -52,12 +52,14 @@ try {
   let operationsPort = await unusedPort(); while (operationsPort === port) operationsPort = await unusedPort();
   const keyFile = join(dir, "storage.key"), signerFile = join(dir, "payer.json"), journalFile = join(dir, "journal.sqlite");
   writeFileSync(keyFile, key, { mode: 0o600 }); writeFileSync(signerFile, JSON.stringify([...payer.secretKey]), { mode: 0o600 });
+  const initialized = new RelayerJournal(journalFile, key, scope), journalId = initialized.instanceId;
+  initialized.close();
   let output = "";
   child = spawn(process.execPath, [fileURLToPath(new URL("../dist/index.js", import.meta.url))], {
     env: { ...process.env, PORT: String(port), OPERATIONS_PORT: String(operationsPort), RPC_URL: `http://127.0.0.1:${rpcPort}`,
       RPC_ENDPOINTS_PATH: "", RELAYER_GENESIS_HASH: genesisHash, GHOSTLINK_RELAYER_KEYPAIR: signerFile,
       RELAYER_MIN_BALANCE_LAMPORTS: "50000000", RELAYER_DAILY_BUDGET_LAMPORTS: "1000000", RELAYER_BUDGET_PATH: "",
-      RELAYER_JOURNAL_PATH: journalFile, RELAYER_JOURNAL_KEY_PATH: keyFile }, stdio: ["ignore", "pipe", "pipe"],
+      RELAYER_JOURNAL_PATH: journalFile, RELAYER_JOURNAL_KEY_PATH: keyFile, RELAYER_JOURNAL_ID: journalId }, stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.on("data", chunk => { output = (output + chunk).slice(-8192); });
   child.stderr.on("data", chunk => { output = (output + chunk).slice(-8192); });

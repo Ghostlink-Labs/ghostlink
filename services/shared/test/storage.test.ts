@@ -1,12 +1,28 @@
 import { describe, expect, it } from "vitest";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { EncryptedSqlite } from "../src/storage.js";
 
 describe("encrypted store compatibility", () => {
+  it("opens authenticated existing state without initializing missing, empty or unauthenticated files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ghostlink-existing-")), path = join(dir, "state.sqlite"), key = randomBytes(32);
+    const open = () => new EncryptedSqlite(path, key, "existing", { existing: true });
+    try {
+      expect(open).toThrow(); expect(existsSync(path)).toBe(false);
+      writeFileSync(path, ""); expect(open).toThrow(); expect(readFileSync(path).length).toBe(0);
+      const empty = new DatabaseSync(path); empty.exec("CREATE TABLE unrelated (id INTEGER)"); empty.close();
+      expect(open).toThrow();
+      const check = new DatabaseSync(path, { readOnly: true });
+      expect(check.prepare("SELECT name FROM sqlite_master WHERE name='metadata'").all()).toHaveLength(0); check.close();
+      const created = new EncryptedSqlite(path, key, "existing"); created.close();
+      const current = open(); current.checkWritable(); current.close();
+      expect(() => new EncryptedSqlite(path, randomBytes(32), "existing", { existing: true })).toThrow();
+      expect(() => new EncryptedSqlite(path, key, "different", { existing: true })).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); key.fill(0); }
+  });
   it("probes committed writes without changing records and detects read-only storage or stale keys", () => {
     const dir = mkdtempSync(join(tmpdir(), "ghostlink-write-probe-")), path = join(dir, "store.sqlite");
     const key = randomBytes(32), replacement = randomBytes(32);

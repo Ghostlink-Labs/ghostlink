@@ -31,7 +31,9 @@ export async function startRelayerFixture(connection: Connection, payer: Keypair
     };
     const value = Reflect.get(target, prop, target); return typeof value === "function" ? value.bind(target) : value;
   } });
-  let journal = new RelayerJournal(path, key, scope), server = buildServer({ connection: transport, payer, journal, minWalletLamports: 1n });
+  const initialized = new RelayerJournal(path, key, scope), journalId = initialized.instanceId!;
+  initialized.close();
+  let journal = RelayerJournal.openExisting(path, key, scope, journalId), server = buildServer({ connection: transport, payer, journal, minWalletLamports: 1n });
   async function listen() {
     server.listen(port, "127.0.0.1"); await once(server, "listening");
     const address = server.address(); assert(address && typeof address !== "string"); port = address.port;
@@ -58,6 +60,7 @@ export async function startRelayerFixture(connection: Connection, payer: Keypair
       }
       const file = RelayerJournal.restoreBackup(join(dir, "before-sweep.enc"), join(dir, "restored"), key, scope);
       assert.throws(() => new RelayerJournal(file, key, scope), /restored/);
+      assert.throws(() => RelayerJournal.openExisting(file, key, scope, journalId), /restored/);
       const restored = RelayerJournal.openForMaintenance(file, key, scope);
       try {
         const retained = restored.page(), live = journal.page();
@@ -80,6 +83,7 @@ export async function startRelayerFixture(connection: Connection, payer: Keypair
         const nextKey = randomBytes(32);
         try {
           restored.rotateKey(nextKey);
+          assert.equal(restored.instanceId, journalId);
           assert.throws(() => RelayerJournal.openForMaintenance(file, key, scope));
           assert.throws(() => new RelayerJournal(file, nextKey, scope), /restored/);
         } finally { nextKey.fill(0); }
@@ -87,7 +91,7 @@ export async function startRelayerFixture(connection: Connection, payer: Keypair
       } finally { restored.close(); }
     },
     arm() { armed = true; hidden = false; packets.length = 0; },
-    async restart() { await stop(); hidden = false; journal = new RelayerJournal(path, key, scope); server = buildServer({ connection: transport, payer, journal, minWalletLamports: 1n }); return listen(); },
+    async restart() { await stop(); hidden = false; journal = RelayerJournal.openExisting(path, key, scope, journalId); server = buildServer({ connection: transport, payer, journal, minWalletLamports: 1n }); return listen(); },
     spent: () => journal.spent(),
     assertSinglePacket() { assert.equal(new Set(packets).size, 1); },
     async close() { await stop(); key.fill(0); rmSync(dir, { recursive: true, force: true }); },

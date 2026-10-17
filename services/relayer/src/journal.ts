@@ -26,28 +26,52 @@ export class RelayerJournal {
   readonly scope: Readonly<RelayerScope>;
   readonly dailyBudget: bigint;
   #storage: EncryptedSqlite;
+  #openedInstanceId?: string;
   constructor(path: string, key: Uint8Array, scope: RelayerScope, dailyBudget = 2_000_000_000n,
     private readonly clock = Date.now, private readonly maximumRecords = 10_000,
-    private readonly mode: "active" | "maintenance" = "active") {
+    private readonly mode: "active" | "maintenance" = "active", existing = false) {
     this.scope = Object.freeze({ genesisHash: scope.genesisHash, payer: scope.payer, pocket: scope.pocket, registry: scope.registry, census: scope.census }); this.dailyBudget = dailyBudget;
     if (dailyBudget < 0n || !Number.isSafeInteger(maximumRecords) || maximumRecords < 1) throw new Error("invalid relayer journal limits");
     if (mode !== "active" && mode !== "maintenance") throw new Error("invalid relayer journal mode");
     const namespace = journalNamespace(this.scope);
-    this.#storage = new EncryptedSqlite(path, key, namespace);
+    this.#storage = new EncryptedSqlite(path, key, namespace, { existing });
     try {
       if (this.#storage.recoveryId && mode !== "maintenance") throw new Error("restored relayer journal requires operator reconciliation");
-      this.#storage.transaction(() => this.#storage.db.exec("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT"));
+      if (existing) this.#storage.db.prepare("SELECT id,record FROM operations LIMIT 0").all();
+      else this.#storage.transaction(() => {
+        this.#storage.db.exec("CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, record BLOB NOT NULL) STRICT");
+        if (!this.instanceId) this.#storage.db.prepare("INSERT INTO metadata VALUES ('relayer-instance-v1', ?)")
+          .run(this.#storage.seal(Buffer.from(randomBytes(32).toString("hex")), this.#instanceAad()));
+      });
+      this.#openedInstanceId = this.instanceId;
+      if (mode === "active" && !this.#openedInstanceId) throw new Error("relayer journal identity missing; reconcile legacy state before cutover");
     } catch (e) { this.#storage.close(); throw e; }
   }
   close(): void { this.#storage.close(); }
   checkWritable(): void { this.#storage.checkWritable(); }
   get recoveryId(): string | undefined { return this.#storage.recoveryId; }
+  #instanceAad(): string { return journalNamespace(this.scope) + ":instance:v1"; }
+  get instanceId(): string | undefined {
+    const row = this.#storage.db.prepare("SELECT value FROM metadata WHERE name='relayer-instance-v1'").get();
+    if (!row) return;
+    const plain = this.#storage.open(row.value as Uint8Array, this.#instanceAad());
+    try { const id = plain.toString(); if (!hex32(id)) throw new Error("invalid relayer journal identity"); return id; }
+    finally { plain.fill(0); }
+  }
+  /** Hosted opening: authenticate existing state and match its independently pinned identity. */
+  static openExisting(path: string, key: Uint8Array, scope: RelayerScope, expectedId: string, dailyBudget = 2_000_000_000n): RelayerJournal {
+    if (!hex32(expectedId)) throw new Error("expected relayer journal identity required");
+    const journal = new RelayerJournal(path, key, scope, dailyBudget, Date.now, 10_000, "active", true);
+    if (journal.instanceId !== expectedId) { journal.close(); throw new Error("relayer journal identity mismatch"); }
+    return journal;
+  }
   /** Observation/backup/rotation only. There is deliberately no resume or clear-restore API. */
   static openForMaintenance(path: string, key: Uint8Array, scope: RelayerScope): RelayerJournal {
-    return new RelayerJournal(path, key, scope, 2_000_000_000n, Date.now, 10_000, "maintenance");
+    return new RelayerJournal(path, key, scope, 2_000_000_000n, Date.now, 10_000, "maintenance", true);
   }
   assertSubmissionAllowed(): void {
     if (this.mode !== "active" || this.recoveryId) throw new Error("relayer maintenance/restore forbids paid submissions");
+    if (!this.#openedInstanceId || this.instanceId !== this.#openedInstanceId) throw new Error("relayer journal identity changed");
   }
   backupTo(destination: string): Promise<void> { return this.#storage.backupTo(destination); }
   static restoreBackup(archive: string, newDirectory: string, key: Uint8Array, scope: RelayerScope): string {
@@ -55,7 +79,7 @@ export class RelayerJournal {
   }
   rotateKey(nextKey: Uint8Array): void {
     this.#storage.rotateKey(nextKey, [{ name: "operations", columns: ["id", "record"], primaryKey: ["id"],
-      encrypted: { record: row => JSON.stringify([this.scope, String(row.id)]) } }]);
+      encrypted: { record: row => JSON.stringify([this.scope, String(row.id)]) } }], { "relayer-instance-v1": this.#instanceAad() });
   }
   /** Bounded, authenticated inventory. A cursor is an ID, not evidence of complete chain history. */
   page(afterId?: string, limit = 100): { records: RelayerRecord[]; nextCursor?: string } {

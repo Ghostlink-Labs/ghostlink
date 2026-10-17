@@ -13,7 +13,8 @@ async function main() {
   const keypairPath = process.env.GHOSTLINK_RELAYER_KEYPAIR;
   const genesisHash = process.env.RELAYER_GENESIS_HASH;
   const journalPath = process.env.RELAYER_JOURNAL_PATH, journalKeyPath = process.env.RELAYER_JOURNAL_KEY_PATH;
-  if (!keypairPath || !genesisHash || !journalPath || !journalKeyPath) throw new Error("relayer payer, chain and journal configuration required");
+  const journalId = process.env.RELAYER_JOURNAL_ID;
+  if (!keypairPath || !genesisHash || !journalPath || !journalKeyPath || !journalId || !/^[0-9a-f]{64}$/.test(journalId)) throw new Error("relayer payer, chain and pinned journal configuration required");
   // No automatic migration can prove whether an old ambiguous send was accepted.
   if (process.env.RELAYER_BUDGET_PATH) throw new Error("legacy spend state requires reconciliation before switching to the journal");
   const port = Number(process.env.PORT ?? 8788);
@@ -27,9 +28,9 @@ async function main() {
   try {
     await rpc.connection.getGenesisHash();
     const key = readFileSync(journalKeyPath);
-    try { journal = new RelayerJournal(journalPath, key, { genesisHash, payer: payer.publicKey.toBase58(),
+    try { journal = RelayerJournal.openExisting(journalPath, key, { genesisHash, payer: payer.publicKey.toBase58(),
       pocket: POCKET.toBase58(), registry: REGISTRY.toBase58(), census: CENSUS.toBase58() },
-      BigInt(process.env.RELAYER_DAILY_BUDGET_LAMPORTS ?? "2000000000")); }
+      journalId, BigInt(process.env.RELAYER_DAILY_BUDGET_LAMPORTS ?? "2000000000")); }
     finally { key.fill(0); }
     const origins = process.env.RELAYER_ALLOWED_ORIGINS?.split(",").map(s => s.trim()).filter(Boolean);
     server = buildServer({ connection: rpc.connection, payer, journal,

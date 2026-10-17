@@ -72,17 +72,25 @@ export class EncryptedSqlite {
   #ready = false;
   #inTransaction = false;
 
-  constructor(path: string, encryptionKey: Uint8Array, namespace: string) {
+  constructor(path: string, encryptionKey: Uint8Array, namespace: string, options: { existing?: boolean } = {}) {
     if (encryptionKey.length !== 32) throw new Error("storage requires a 32-byte encryption key");
     if (!namespace) throw new Error("storage namespace required");
     this.#key = Buffer.from(encryptionKey);
     this.#namespace = namespace;
     try {
-      if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      if (options.existing) {
+        // Read-only SQLite open cannot create a missing file or initialize an
+        // empty/mistyped database. Authenticate before any writable open.
+        const existing = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+        try { this.#verifyKey(existing); } finally { existing.close(); }
+      } else if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
       this.#db = new DatabaseSync(path, { allowExtension: false });
+      // Recheck on the actual writable handle: deletion/replacement between
+      // opens must never cause a new sentinel/business state to be initialized.
+      if (options.existing) this.#verifyKey();
       if (path !== ":memory:") chmodSync(path, 0o600);
-      this.#db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-        CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value BLOB NOT NULL) STRICT;`);
+      this.#db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
+      if (!options.existing) this.#db.exec("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value BLOB NOT NULL) STRICT;");
       this.transaction(() => {
         const row = this.#db.prepare("SELECT value FROM metadata WHERE name='key-check-v1'").get();
         const aad = namespace + ":key-check:v1", value = namespace + ":v1";
@@ -90,7 +98,10 @@ export class EncryptedSqlite {
           const check = this.open(row.value as Uint8Array, aad);
           try { if (check.toString() !== value) throw new Error("invalid database key or namespace"); }
           finally { check.fill(0); }
-        } else this.#db.prepare("INSERT INTO metadata VALUES ('key-check-v1', ?)").run(this.seal(Buffer.from(value), aad));
+        } else {
+          if (options.existing) throw new Error("existing storage key check is missing");
+          this.#db.prepare("INSERT INTO metadata VALUES ('key-check-v1', ?)").run(this.seal(Buffer.from(value), aad));
+        }
       });
       this.#ready = true;
     } catch (error) {

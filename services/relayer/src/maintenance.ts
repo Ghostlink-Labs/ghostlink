@@ -31,7 +31,7 @@ async function main() {
       let report: unknown;
       if (command === "inspect") {
         const page = journal.page(extra);
-        report = { scope: journal.scope, recoveryId: journal.recoveryId, nextCursor: page.nextCursor,
+        report = { scope: journal.scope, journalId: journal.instanceId, recoveryId: journal.recoveryId, nextCursor: page.nextCursor,
           records: page.records.map(r => ({ requestIdHex: r.id, digest: r.digest, receipt: r.observation, chargedAt: r.chargedAt,
             feeLamports: r.packet?.feeLamports, rentLamports: r.packet?.rentLamports })),
           historyCompleteness: "not-established", paidResumptionAllowed: false };

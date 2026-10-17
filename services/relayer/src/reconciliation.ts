@@ -52,6 +52,6 @@ export async function reconcileRetainedRelayerOperations(
       } catch { entries[index] = { ...base, outcome: "unresolved", reason: "history_or_storage_unavailable" }; }
     }
   }));
-  return { scope: journal.scope, recoveryId: journal.recoveryId, finalizedSlot, entries, nextCursor: page.nextCursor,
+  return { scope: journal.scope, journalId: journal.instanceId, recoveryId: journal.recoveryId, finalizedSlot, entries, nextCursor: page.nextCursor,
     historyCompleteness: "not-established" as const, paidResumptionAllowed: false as const };
 }

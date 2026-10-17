@@ -29,6 +29,7 @@ Use Node 22 with `node:sqlite`. Keep these paths and keys outside tracked source
 - `GHOSTLINK_RELAYER_KEYPAIR`: payer keypair JSON.
 - `RELAYER_GENESIS_HASH`: independently approved chain identity; `RPC_ENDPOINTS_PATH` or `RPC_URL` supplies the approved providers.
 - `RELAYER_JOURNAL_PATH`: persistent journal on local durable storage.
+- `RELAYER_JOURNAL_ID`: independently pinned 64-character lowercase hex instance ID from the approved deployment record. Do not discover or replace this pin automatically during startup.
 - `RELAYER_JOURNAL_KEY_PATH`: file containing exactly 32 raw random bytes, managed through the operator's secret system.
 - `RELAYER_DAILY_BUDGET_LAMPORTS`: conservative rolling 24-hour fee plus creation-rent ceiling, default 2 SOL. Complete message fees above 20,000 lamports are refused. Set an appropriate cap for the intended deployment.
 - `RELAYER_MIN_BALANCE_LAMPORTS`: operating reserve, default 50,000,000 lamports (0.05 SOL); must be at least the maximum 20,000-lamport network fee. This is separate from permission to spend the daily budget.
@@ -36,7 +37,18 @@ Use Node 22 with `node:sqlite`. Keep these paths and keys outside tracked source
 - `OPERATIONS_PORT`: private metrics listener, default 18788, bound to `127.0.0.1`; must differ from the public HTTP port.
 - `RELAYER_ALLOWED_ORIGINS`, `TRUST_PROXY` and `PORT`: retain their existing meanings. Only trust forwarded addresses behind your controlled proxy.
 
-The journal is authenticated against genesis, payer and all three program IDs. A wrong key/scope refuses access. SQLite FULL transactions atomically save packet and reservation, including all auxiliary signatures. Multiple handles to that same database coordinate preparation leases and spending. Use one hosted instance per journal/payer: independent databases do not share a budget, and admission/rate controls are process-local. This is not multi-host availability.
+The journal is authenticated against genesis, payer and all three program IDs. Hosted startup uses `RelayerJournal.openExisting`: it authenticates a read-only SQLite open, rechecks the actual writable handle, requires the existing operations table, then matches the encrypted instance ID to the independent pin. Missing/empty/unauthenticated files, missing schema/identity and a different journal are refused. No spending history or identity is initialized by hosted startup. SQLite FULL transactions atomically save packet and reservation, including all auxiliary signatures. Multiple handles to that same database coordinate preparation leases and spending. Use one hosted instance per journal/payer: independent databases do not share a budget, and admission/rate controls are process-local. This is not multi-host availability.
+
+For a **new development deployment with a fresh payer**, initialize once before funding:
+
+```sh
+# RELAYER_GENESIS_HASH must already be independently approved.
+node services/relayer/dist/initialize.js /private/new-relayer
+```
+
+The destination must not exist. This command generates a fresh payer keypair, fresh storage key, empty authenticated journal and random journal instance ID. It writes private `payer.json`, `storage-key`, `journal.sqlite`, `scope.json`, then `deployment.json` last; files are flushed and directories synced on Unix. It never loads or adopts an existing payer and refuses the currently unsupported public mainnet/devnet deployment identities. It neither funds nor starts the service. Set the paths above from the approved output, pin `deployment.json`'s `journalId`, configure caps/providers, and verify startup before funding through the authorized deployment process. Keep all generated material outside source control and distribute keys through the approved secret system. If initialization fails partway, inspect the partial directory; do not delete an existing deployment to make initialization pass.
+
+Low-level `new RelayerJournal(...)` remains available for explicitly constructed disposable fixtures; hosted services must use `openExisting` with a separately pinned identity. Legacy journals without an instance marker can still be inspected, backed up, reconciled and rotated through maintenance, but cannot enter hosted paid work. An ID pin detects a different journal, not rollback of an authentic copy with the same ID. The existing restore quarantine and independent full-history/cutover requirements still apply; do not recreate or relabel state to bypass them.
 
 Legacy `RELAYER_BUDGET_PATH` configuration is refused. Before replacing an older service, stop admission and reconcile its outstanding transactions and spend window; do not erase old state or reset a funded payer's budget to make startup pass. The maintenance workflow below supports encrypted snapshots, quarantined restore, retained-history inspection and atomic storage-key rotation. Hosted startup still refuses restored storage. Manual file rollback is not detected as a safe restore and must never be used to resume funded work.
 
@@ -99,6 +111,8 @@ Reconciliation checks genesis and a nonregressing finalized context, validates e
 Every report states `historyCompleteness: "not-established"` and `paidResumptionAllowed: false`. An old snapshot can omit paid work even when every retained packet verifies. Recovery must still reconcile the full payer history, client request receipts, owner nonces and business effects, preserve all unresolved spending, fence the prior writer, and approve a controlled cutover. These are remaining release gates. A 404, an empty page or an all-verified snapshot never authorizes resetting the journal or spending budget.
 
 ## Verified boundary and remaining work
+
+Hosted-process startup regressions reproduce the former missing-path reset and now verify refusal of absent, empty, wrong-instance and damaged journals; a valid restart preserves the saved packet and charge. Real initializer processes generate a new payer/storage key/instance, refuse existing destinations and unsupported public chains, and start the service with the pinned output. Legacy identity-less journals stay available for maintenance only. The hosted RPC and local-validator restart/restore drills use explicitly initialized, pinned existing state.
 
 The focused tests cover lost/substituted replies, same-packet retries, a real child exit immediately after durable commit, SQLite transaction rollback/lock refusal, concurrent funding reservations, covered-finality liquidity release, budget limits, wrong/stale/frozen chain evidence, hung/late probes, bounded reconciliation batches, reserved status capacity, cached HTTP health, private metrics and conservative expiry. Real compiled service processes exercise HTTP failover, admission refusal and opaque diagnostics. The Unix shutdown drill disconnects a client during preparation, sends SIGTERM and verifies one confirmed packet and reservation after reopening the journal. The disposable-validator recovery drill loses an accepted withdrawal reply, reopens the journal, retains the generated home destination and original signature, and verifies actual recovered balances without a second reservation:
 

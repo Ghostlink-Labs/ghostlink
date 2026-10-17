@@ -30,7 +30,8 @@ export class Poller {
     if (this.maximumPages > 100 || this.maximumTransactions > 1000 || this.maximumTickMs > 30_000 || this.paceMs > 1000 || pageSize > 1000 || !programs.length || new Set(programs.map(p => p.toBase58())).size !== programs.length || !Number.isSafeInteger(this.paceMs) || this.paceMs < 0) throw new Error("invalid indexer scan configuration");
     // In-process fixtures remain ephemeral; the hosted entry always supplies scoped persistent storage.
     this.database = options.database ?? new IndexerDatabase(":memory:", randomBytes(32), JSON.stringify(["ephemeral", programs.map(p => p.toBase58()), commitment]));
-    const saved = this.database.snapshot(); if (saved) store.restore(saved); else this.database.save(store.snapshot());
+    if (!options.database) this.database.save(store.snapshot()); // Explicit ephemeral fixture only.
+    store.restore(this.database.snapshot());
   }
   drain(): void { this.draining = true; }
   get idle(): boolean { return !this.status.inFlight; }

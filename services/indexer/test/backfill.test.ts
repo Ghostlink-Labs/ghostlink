@@ -28,6 +28,28 @@ function world() {
 const config = (database: IndexerDatabase) => ({ database, maximumPages: 1, maximumTransactions: 1, paceMs: 0 });
 
 describe("durable bounded indexer backfill", () => {
+  it("refuses a missing snapshot after partial application instead of skipping already dequeued history", () => {
+    const w = world(), db = w.open(), store = new IndexerStore(), program = REGISTRY.toBase58();
+    db.save(store.snapshot()); db.begin(1, [program], store.cursors);
+    db.page(program, undefined, [info("B"), info("A")], 3);
+    store.checkpointTransaction("A", [{ kind: "SessionOpened", pocket: "saved-pocket", appId: new Uint8Array(32), created: true, sessionExpirySlot: 10n }],
+      [program], snapshot => db.complete("A", snapshot));
+    expect(db.pending()).toBe(1); db.close();
+    const changed = new DatabaseSync(w.path); changed.exec("DELETE FROM state WHERE name='snapshot'"); changed.close();
+    expect(() => new Poller({} as Connection, new IndexerStore(), [REGISTRY], 3, "finalized", config(w.open()))).toThrow();
+    const check = new DatabaseSync(w.path, { readOnly: true });
+    try { expect(check.prepare("SELECT name FROM state WHERE name='snapshot'").all()).toHaveLength(0); }
+    finally { check.close(); }
+  });
+  it.each(["pending", "members", "scanned", "edges"])("refuses missing %s spool records instead of accepting incomplete history", table => {
+    const w = world(), db = w.open(), store = new IndexerStore(), program = REGISTRY.toBase58();
+    db.save(store.snapshot()); db.begin(1, [program], store.cursors);
+    db.page(program, undefined, [info("B"), info("A")], 3);
+    const changed = new DatabaseSync(w.path); changed.exec(`DELETE FROM ${table}`); changed.close();
+    expect(() => db.assertOwned()).toThrow();
+    expect(() => db.oldest()).toThrow();
+    expect(() => db.finish()).toThrow();
+  });
   it("resumes saved pagination after restart and preserves cross-program same-slot order across batches", async () => {
     const w = world(); let db = w.open(), store = new IndexerStore();
     const reads: string[] = [];
@@ -47,7 +69,7 @@ describe("durable bounded indexer backfill", () => {
     expect(poller.status.catchingUp).toBe(false); expect(db.pending()).toBe(0); expect(db.through()).toBe(1);
   });
   it("bounds each tick while resuming a longer history and excludes transactions above the captured head", async () => {
-    const w = world(); let db = w.open(), store = new IndexerStore(); store.setCursor(REGISTRY.toBase58(), "A0");
+    const w = world(); let db = w.open(), store = new IndexerStore(); store.setCursor(REGISTRY.toBase58(), "A0"); db.save(store.snapshot());
     const history = Array.from({ length: 76 }, (_, n) => info(`A${75-n}`, 75-n));
     const chain = { getSlot: vi.fn(async () => 60),
       getSignaturesForAddress: vi.fn(async (_program, options) => { const from = options.before ? history.findIndex(i => i.signature === options.before) + 1 : 0; return history.slice(from, from + options.limit); }),
@@ -128,6 +150,12 @@ describe("durable bounded indexer backfill", () => {
       expect(hint).toHaveBeenCalledOnce(); expect(store.pockets.size).toBe(0);
       poller.status.lastHeadAdvancedAt = new Date(Date.now() - 31_000).toISOString();
       expect((await fetch(`${base}/ready`)).status).toBe(503);
+      poller.status.lastHeadAdvancedAt = new Date().toISOString();
+      expect((await fetch(`${base}/ready`)).status).toBe(200);
+      const changed = new DatabaseSync(w.path); changed.exec("DELETE FROM state WHERE name='snapshot'"); changed.close();
+      expect((await fetch(`${base}/ready`)).status).toBe(503);
+      expect(() => db.save(store.snapshot())).toThrow(/checkpoint/);
+      await expect(poller.tick()).rejects.toThrow(/checkpoint/);
       server.drain(); poller.drain();
       expect((await fetch(`${base}/webhook`, { method: "POST", body: "{}" })).status).toBe(503);
       const calls = chain.getSlot.mock.calls.length; await poller.tick(); expect(chain.getSlot).toHaveBeenCalledTimes(calls);

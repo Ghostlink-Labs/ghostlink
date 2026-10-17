@@ -2,10 +2,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import { EncryptedSqlite } from "@ghostlink/service-kit/storage";
 import type { ConfirmedSignatureInfo } from "@solana/web3.js";
-import type { Snapshot } from "./store.js";
+import { IndexerStore, type Snapshot } from "./store.js";
 
 export interface Scan { upperSlot: number; programs: string[]; nextProgram: number;
+  counts: Record<SpoolTable, number>;
   positions: Record<string, { until?: string; before?: string; previous?: { signature: string; slot: number }; done: boolean }> }
+const spoolTables = ["pending", "members", "scanned", "edges"] as const;
+type SpoolTable = typeof spoolTables[number];
+const emptyCounts = () => ({ pending: 0, members: 0, scanned: 0, edges: 0 });
 export interface Pending { signature: string; slot: number; failed: boolean; programs: string[] }
 const slotValue = (n: number) => { if (!Number.isSafeInteger(n) || n < 0) throw new Error("invalid indexer slot"); return n; };
 const signatureValue = (s: string) => { if (typeof s !== "string" || !s.length || s.length > 128) throw new Error("invalid indexer signature"); return s; };
@@ -15,15 +19,17 @@ export class IndexerDatabase {
   #namespace: string;
   #token = randomBytes(32).toString("hex");
   #closed = false;
+  #openedInstanceId!: string;
   constructor(path: string, key: Uint8Array, scope: string, private readonly clock = Date.now,
-    private readonly maximumPending = 1_000_000, private readonly maximumSlot = 4096) {
+    private readonly maximumPending = 1_000_000, private readonly maximumSlot = 4096, expectedId?: string) {
     if (!scope || !Number.isSafeInteger(maximumPending) || maximumPending < 1 || !Number.isSafeInteger(maximumSlot) || maximumSlot < 1) throw new Error("invalid indexer storage limits");
     this.#namespace = "ghostlink:indexer:v1:" + createHash("sha256").update(scope).digest("hex");
-    this.#storage = new EncryptedSqlite(path, key, this.#namespace);
+    this.#storage = new EncryptedSqlite(path, key, this.#namespace, { existing: expectedId !== undefined });
     try {
       if (this.#storage.recoveryId) throw new Error("restored indexer requires independently reconciled history");
       this.#storage.transaction(() => {
-        this.#storage.db.exec(`CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, data BLOB NOT NULL) STRICT;
+        if (expectedId === undefined && !this.#storage.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='state'").get()) {
+          this.#storage.db.exec(`CREATE TABLE state (name TEXT PRIMARY KEY, data BLOB NOT NULL) STRICT;
           CREATE TABLE IF NOT EXISTS pending (signature TEXT PRIMARY KEY, slot INTEGER NOT NULL, failed INTEGER NOT NULL) STRICT;
           CREATE INDEX IF NOT EXISTS pending_slot ON pending(slot);
           CREATE TABLE IF NOT EXISTS members (program TEXT NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(program,signature)) STRICT;
@@ -31,11 +37,58 @@ export class IndexerDatabase {
           CREATE TABLE IF NOT EXISTS scanned (program TEXT NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(program,signature)) STRICT;
           CREATE TABLE IF NOT EXISTS edges (older TEXT NOT NULL, newer TEXT NOT NULL, PRIMARY KEY(older,newer)) STRICT;
           CREATE INDEX IF NOT EXISTS edges_newer ON edges(newer);`);
+          this.#storage.db.prepare("INSERT INTO metadata VALUES ('indexer-instance-v1', ?)")
+            .run(this.#storage.seal(Buffer.from(randomBytes(32).toString("hex")), this.#namespace + ":instance:v1"));
+          this.#put("snapshot", new IndexerStore().snapshot()); this.#put("through", 0); this.#put("scan", null);
+        }
+        // Never recreate missing hosted schema or silently upgrade legacy checkpoint state.
+        this.#storage.db.prepare("SELECT name,data FROM state LIMIT 0").all();
+        this.#storage.db.prepare("SELECT signature,slot,failed FROM pending LIMIT 0").all();
+        this.#storage.db.prepare("SELECT program,signature FROM members LIMIT 0").all();
+        this.#storage.db.prepare("SELECT program,signature FROM scanned LIMIT 0").all();
+        this.#storage.db.prepare("SELECT older,newer FROM edges LIMIT 0").all();
+        const id = this.instanceId;
+        if (!id || (expectedId !== undefined && id !== expectedId)) throw new Error("indexer state identity mismatch");
+        this.#checkpoint(); this.#verifySpool();
+        this.#openedInstanceId = id; // Check identity and continuity before acquiring a lease.
         const lease = this.#get<{ token: string; until: number }>("lease");
         if (lease && lease.until > this.clock()) throw new Error("indexer state is already owned by another worker");
         this.#put("lease", { token: this.#token, until: this.clock() + 90_000 });
       });
     } catch (error) { this.#storage.close(); throw error; }
+  }
+  get instanceId(): string | undefined {
+    const row = this.#storage.db.prepare("SELECT value FROM metadata WHERE name='indexer-instance-v1'").get();
+    if (!row) return;
+    const plain = this.#storage.open(row.value as Uint8Array, this.#namespace + ":instance:v1");
+    try { const id = plain.toString(); if (!/^[0-9a-f]{64}$/.test(id)) throw new Error("invalid indexer state identity"); return id; }
+    finally { plain.fill(0); }
+  }
+  static openExisting(path: string, key: Uint8Array, scope: string, expectedId: string, clock = Date.now): IndexerDatabase {
+    if (typeof expectedId !== "string" || !/^[0-9a-f]{64}$/.test(expectedId)) throw new Error("expected indexer state identity required");
+    return new IndexerDatabase(path, key, scope, clock, 1_000_000, 4096, expectedId);
+  }
+  #checkpoint(): Snapshot {
+    const snapshot = this.#get<Snapshot>("snapshot");
+    if (!snapshot || !Array.isArray(snapshot.registryLeaves) || !Array.isArray(snapshot.censusLeaves) ||
+      !Array.isArray(snapshot.activity) || !Array.isArray(snapshot.processedTransactions) ||
+      [snapshot.bindings, snapshot.census, snapshot.pockets, snapshot.cursors].some(value => !value || typeof value !== "object" || Array.isArray(value))) {
+      throw new Error("indexer snapshot is missing or incomplete");
+    }
+    return snapshot;
+  }
+  #verifySpool(): void {
+    const through = this.#get<number>("through"), scan = this.#get<Scan | null>("scan");
+    if (through === undefined || scan === undefined) throw new Error("indexer progress checkpoint is missing");
+    slotValue(through);
+    if (scan !== null && (!scan.counts || !Array.isArray(scan.programs) || !scan.programs.length ||
+      !Number.isInteger(scan.nextProgram) || scan.nextProgram < 0 || scan.nextProgram > scan.programs.length ||
+      slotValue(scan.upperSlot) < through || !scan.positions || scan.programs.some(program => !scan.positions[program]))) throw new Error("invalid indexer scan checkpoint");
+    for (const table of spoolTables) {
+      const expected = scan === null ? 0 : scan.counts[table];
+      const actual = Number(this.#storage.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!.n);
+      if (!Number.isSafeInteger(expected) || expected < 0 || actual !== expected) throw new Error("indexer spool history is missing or inconsistent");
+    }
   }
   #get<T>(name: string): T | undefined {
     const row = this.#storage.db.prepare("SELECT data FROM state WHERE name=?").get(name); if (!row) return;
@@ -50,33 +103,35 @@ export class IndexerDatabase {
     } finally { bytes.fill(0); }
   }
   #owned(): void {
+    if (this.instanceId !== this.#openedInstanceId || this.#storage.recoveryId) throw new Error("indexer state identity or restore state changed");
+    if (this.#storage.db.prepare("SELECT COUNT(*) AS n FROM state WHERE name IN ('snapshot','through','scan')").get()!.n !== 3) throw new Error("indexer checkpoint is missing");
     const lease = this.#get<{ token: string; until: number }>("lease"), now = this.clock();
     if (!Number.isSafeInteger(now) || !lease || lease.token !== this.#token || lease.until <= now) throw new Error("indexer ownership lease lost");
   }
-  assertOwned(): void { this.#owned(); }
-  renew(): void { this.#storage.transaction(() => { this.#owned(); this.#put("lease", { token: this.#token, until: this.clock() + 90_000 }); }); }
+  assertOwned(): void { this.#owned(); this.#verifySpool(); }
+  renew(): void { this.#storage.transaction(() => { this.assertOwned(); this.#put("lease", { token: this.#token, until: this.clock() + 90_000 }); }); }
   close(): void {
     if (this.#closed) return;
     try { this.#storage.transaction(() => { if (this.#get<{ token: string }>("lease")?.token === this.#token) this.#storage.db.prepare("DELETE FROM state WHERE name='lease'").run(); }); }
     finally { this.#closed = true; this.#storage.close(); }
   }
-  snapshot(): Snapshot | undefined { this.#owned(); return this.#get<Snapshot>("snapshot"); }
+  snapshot(): Snapshot { this.#owned(); return this.#checkpoint(); }
   save(snapshot: Snapshot): void { this.#storage.transaction(() => { this.#owned(); this.#put("snapshot", snapshot); }); }
-  scan(): Scan | undefined { this.#owned(); return this.#get<Scan>("scan"); }
-  through(): number { this.#owned(); return this.#get<number>("through") ?? 0; }
+  scan(): Scan | undefined { this.#owned(); return this.#get<Scan | null>("scan") ?? undefined; }
+  through(): number { this.#owned(); return slotValue(this.#get<number>("through")!); }
   pending(): number { this.#owned(); return Number(this.#storage.db.prepare("SELECT COUNT(*) AS n FROM pending").get()!.n); }
   begin(upperSlot: number, programs: string[], cursors: Map<string, string>): void {
     this.#storage.transaction(() => {
-      this.#owned(); slotValue(upperSlot);
+      this.assertOwned(); slotValue(upperSlot);
       if (this.scan() || this.pending()) throw new Error("indexer scan already active");
       if (upperSlot < this.through()) throw new Error("indexer chain head regressed");
-      this.#put("scan", { upperSlot, programs, nextProgram: 0,
+      this.#put("scan", { upperSlot, programs, nextProgram: 0, counts: emptyCounts(),
         positions: Object.fromEntries(programs.map(p => [p, { until: cursors.get(p), done: false }])) } satisfies Scan);
     });
   }
   page(program: string, before: string | undefined, page: ConfirmedSignatureInfo[], limit: number): void {
     this.#storage.transaction(() => {
-      this.#owned(); const scan = this.scan();
+      this.assertOwned(); const scan = this.scan();
       if (!scan || scan.programs[scan.nextProgram] !== program) throw new Error("indexer scan changed");
       const position = scan.positions[program]!;
       if (position.before !== before || position.done || !Array.isArray(page) || page.length > limit) throw new Error("invalid indexer page boundary");
@@ -91,6 +146,7 @@ export class IndexerDatabase {
         if (this.#storage.db.prepare("SELECT 1 FROM scanned WHERE program=? AND signature=?").get(program, info.signature)) throw new Error("repeated indexer history");
         if (scannedCount++ >= this.maximumPending * 3) throw new Error("indexer scan history capacity exhausted");
         this.#storage.db.prepare("INSERT INTO scanned VALUES (?,?)").run(program, info.signature);
+        scan.counts.scanned++;
         // Keep pagination progress even for transactions newer than this cycle's fixed chain head.
         if (info.slot <= scan.upperSlot) {
           const prior = this.#storage.db.prepare("SELECT slot,failed FROM pending WHERE signature=?").get(info.signature);
@@ -98,9 +154,11 @@ export class IndexerDatabase {
           if (!prior) {
             if (pendingCount++ >= this.maximumPending) throw new Error("indexer pending history capacity exhausted");
             this.#storage.db.prepare("INSERT INTO pending VALUES (?,?,?)").run(info.signature, info.slot, info.err === null ? 0 : 1);
+            scan.counts.pending++;
           }
           this.#storage.db.prepare("INSERT INTO members VALUES (?,?)").run(program, info.signature);
-          if (previous?.slot === info.slot && previous.slot <= scan.upperSlot) this.#storage.db.prepare("INSERT OR IGNORE INTO edges VALUES (?,?)").run(info.signature, previous.signature);
+          scan.counts.members++;
+          if (previous?.slot === info.slot && previous.slot <= scan.upperSlot) scan.counts.edges += Number(this.#storage.db.prepare("INSERT OR IGNORE INTO edges VALUES (?,?)").run(info.signature, previous.signature).changes);
         }
         previous = { signature: info.signature, slot: info.slot };
       }
@@ -111,7 +169,7 @@ export class IndexerDatabase {
     });
   }
   oldest(): Pending[] {
-    this.#owned(); const scan = this.scan();
+    this.assertOwned(); const scan = this.scan();
     if (!scan || scan.nextProgram !== scan.programs.length) return [];
     const rows = this.#storage.db.prepare("SELECT signature,slot,failed FROM pending WHERE slot=(SELECT MIN(slot) FROM pending) ORDER BY signature LIMIT ?").all(this.maximumSlot + 1);
     if (rows.length > this.maximumSlot) throw new Error("indexer slot exceeds bounded ordering capacity");
@@ -129,17 +187,19 @@ export class IndexerDatabase {
   }
   complete(signature: string, snapshot: Snapshot): void {
     this.#storage.transaction(() => {
-      this.#owned(); if (!this.#storage.db.prepare("SELECT 1 FROM pending WHERE signature=?").get(signature)) throw new Error("indexer operation no longer pending");
+      this.assertOwned(); const scan = this.scan();
+      if (!scan || !this.#storage.db.prepare("SELECT 1 FROM pending WHERE signature=?").get(signature)) throw new Error("indexer operation no longer pending");
       this.#put("snapshot", snapshot);
-      this.#storage.db.prepare("DELETE FROM edges WHERE older=? OR newer=?").run(signature, signature);
-      this.#storage.db.prepare("DELETE FROM members WHERE signature=?").run(signature);
+      scan.counts.edges -= Number(this.#storage.db.prepare("DELETE FROM edges WHERE older=? OR newer=?").run(signature, signature).changes);
+      scan.counts.members -= Number(this.#storage.db.prepare("DELETE FROM members WHERE signature=?").run(signature).changes);
       this.#storage.db.prepare("DELETE FROM pending WHERE signature=?").run(signature);
+      scan.counts.pending--; this.#put("scan", scan);
     });
   }
   finish(): boolean {
     return this.#storage.transaction(() => {
-      this.#owned(); const scan = this.scan(); if (!scan || scan.nextProgram < scan.programs.length || this.pending()) return false;
-      this.#storage.db.prepare("DELETE FROM scanned").run(); this.#put("through", scan.upperSlot); this.#storage.db.prepare("DELETE FROM state WHERE name='scan'").run(); return true;
+      this.assertOwned(); const scan = this.scan(); if (!scan || scan.nextProgram < scan.programs.length || this.pending()) return false;
+      this.#storage.db.prepare("DELETE FROM scanned").run(); this.#put("through", scan.upperSlot); this.#put("scan", null); return true;
     });
   }
 }

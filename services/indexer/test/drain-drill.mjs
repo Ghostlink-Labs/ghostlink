@@ -18,6 +18,8 @@ if (process.platform === "win32") throw new Error("This drill requires real Unix
 const dir = mkdtempSync(join(tmpdir(), "indexer-drain-")), key = randomBytes(32), genesisHash = Keypair.generate().publicKey.toBase58();
 const keyPath = join(dir, "state.key"), path = join(dir, "indexer.db"), signature = bs58.encode(new Uint8Array(64).fill(7));
 writeFileSync(keyPath, key);
+const scope = JSON.stringify({ genesisHash, programs: [REGISTRY, CENSUS, POCKET].map(p => p.toBase58()), commitment: "finalized" });
+const initialized = new IndexerDatabase(path, key, scope), stateId = initialized.instanceId; initialized.close();
 const children = []; let held, transactionReads = 0;
 const provider = createServer(async (req, res) => {
   let raw = ""; for await (const chunk of req) raw += chunk;
@@ -38,7 +40,7 @@ async function start(rpcUrl) {
   const port = createServer(); port.listen(0, "127.0.0.1"); await once(port, "listening"); const n = port.address().port; await new Promise(resolve => port.close(resolve));
   const child = spawn(process.execPath, [fileURLToPath(new URL("../dist/index.js", import.meta.url))], { env: { ...process.env,
     PORT: String(n), RPC_URL: rpcUrl, RPC_ENDPOINTS_PATH: "", INDEXER_GENESIS_HASH: genesisHash, INDEXER_STATE_PATH: path,
-    INDEXER_STATE_KEY_PATH: keyPath, PERSIST_PATH: "", POLL_MS: "100", INDEXER_PACE_MS: "0", INGEST_COMMITMENT: "finalized" }, stdio: ["ignore", "pipe", "pipe"] });
+    INDEXER_STATE_KEY_PATH: keyPath, INDEXER_STATE_ID: stateId, PERSIST_PATH: "", POLL_MS: "100", INDEXER_PACE_MS: "0", INGEST_COMMITMENT: "finalized" }, stdio: ["ignore", "pipe", "pipe"] });
   const state = { child, output: "", url: `http://127.0.0.1:${n}` }; children.push(state);
   child.stdout.on("data", b => state.output += b); child.stderr.on("data", b => state.output += b); return state;
 }
@@ -47,7 +49,7 @@ try {
   const first = await start(rpcUrl); await until(() => Boolean(held), "indexer did not reach held transaction read");
   first.child.kill("SIGTERM"); await delay(150); assert.equal(first.child.exitCode, null, "indexer exited before in-flight transaction checkpoint");
   held(); await until(() => first.child.exitCode !== null, "indexer did not finish draining"); assert.equal(first.child.exitCode, 0, first.output);
-  const db = new IndexerDatabase(path, key, JSON.stringify({ genesisHash, programs: [REGISTRY, CENSUS, POCKET].map(p => p.toBase58()), commitment: "finalized" }));
+  const db = IndexerDatabase.openExisting(path, key, scope, stateId);
   assert.equal(db.snapshot().cursors[REGISTRY.toBase58()], signature); assert.equal(db.pending(), 0); db.close();
   const restarted = await start(rpcUrl);
   await until(async () => { try { return (await fetch(`${restarted.url}/ready`)).status === 200; } catch { return false; } }, "restarted indexer never became ready");

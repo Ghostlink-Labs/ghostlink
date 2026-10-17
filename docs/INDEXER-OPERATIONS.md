@@ -4,7 +4,7 @@ The hosted indexer rebuilds registry/census trees and derived Pocket history fro
 
 ## Catch-up and consistency
 
-Each tick admits a bounded number of signature pages and transactions. Pagination progress survives restart, including pages collected before an application checkpoint exists. A saved cursor must actually appear in the provider's history: a short page that omits it fails closed. Repeated pages/signatures, descending-order violations, conflicting slots/status, malformed boundaries and contradictory same-slot ordering are refused. Transactions shared by several programs are processed once with the merged ordering constraints.
+Each tick admits a bounded number of signature pages and transactions. Pagination progress survives restart, including pages collected before the first event is applied. A saved cursor must actually appear in the provider's history: a short page that omits it fails closed. Repeated pages/signatures, descending-order violations, conflicting slots/status, malformed boundaries and contradictory same-slot ordering are refused. Transactions shared by several programs are processed once with the merged ordering constraints.
 
 Scanning completes for every configured program before application starts. Within ascending slots, the indexer topologically orders constraints from the program lists; a tick can stop partway through that ordered work. Only one bounded slot group is loaded at a time. The whole backlog is not loaded into a JavaScript Map.
 
@@ -24,6 +24,7 @@ Use Node 22 and private paths outside version control:
 | `RPC_ENDPOINTS_PATH` or `RPC_URL` | Approved transport providers; see [RPC operations](RPC-OPERATIONS.md) |
 | `INDEXER_STATE_PATH` | Durable SQLite checkpoint and scan spool |
 | `INDEXER_STATE_KEY_PATH` | Exactly 32 raw random bytes from the operator's secret system |
+| `INDEXER_STATE_ID` | Independently pinned 64-character hexadecimal ID of this initialized database; required on every hosted start |
 | `POLL_MS` | Poll interval, default 5,000 ms; accepted range 50–30,000 |
 | `INDEXER_PAGES_PER_TICK` | Default 4, maximum 100 |
 | `INDEXER_TRANSACTIONS_PER_TICK` | Default 32, maximum 1,000 |
@@ -31,9 +32,22 @@ Use Node 22 and private paths outside version control:
 | `INDEXER_PACE_MS` | Delay before page/transaction reads, default 120 ms, range 0–1,000 |
 | `WEBHOOK_SECRET`, `PORT` | Optional authenticated polling hints; HTTP port defaults to 8787 |
 
-Hosted startup requires RPC and state configuration. It refuses legacy `PERSIST_PATH` and any `INGEST_COMMITMENT` other than `finalized`. This is a coordinated migration: preserve old state, rebuild/check the finalized roots and history independently, then switch clients. A JSON snapshot is not silently imported as a trusted production checkpoint. The existing V1 deployment is unchanged.
+Hosted startup opens an authenticated **existing** database and checks its encrypted instance ID against `INDEXER_STATE_ID` before acquiring ownership. Missing/empty/wrong-scope files, missing schema, identity, snapshot, progress floor or scan checkpoint are errors. It never creates replacement state. It also refuses legacy `PERSIST_PATH` and any `INGEST_COMMITMENT` other than `finalized`.
 
-State is scoped to the genesis, ordered program IDs and commitment. Checkpoint, scan-position and ownership records are authenticated/encrypted; public signatures, slots and ordering indexes are stored as SQLite metadata. Restrict the whole directory and its WAL files. This does not hide on-chain transaction metadata or provide an independently verifiable history archive. Wrong scope/key and marked backup-restoration epochs are refused.
+Provision an explicit new development rebuild separately, using an exclusive directory:
+
+```sh
+INDEXER_GENESIS_HASH=<approved-local-validator-genesis> \
+  node services/indexer/dist/initialize.js /private/new-indexer
+```
+
+The initializer writes a fresh key, database, scope and final `deployment.json` completion manifest. It makes no network calls and starts no service. Store the manifest's `stateId` independently in operator configuration; do not derive it from whichever database happens to be mounted at startup. Existing directories are refused. Preserve partial output after an interrupted initialization for inspection. Known devnet/mainnet genesis hashes are refused while this candidate has no verified public deployment.
+
+Older SQLite state without these records is also refused, rather than silently upgraded. This is a coordinated migration: preserve old state, rebuild/check the finalized roots and history independently, then switch clients. A JSON snapshot is not silently imported as a trusted production checkpoint. The existing V1 deployment is unchanged.
+
+State is scoped to the genesis, ordered program IDs and commitment. Checkpoint, scan-position and ownership records are authenticated/encrypted; public signatures, slots and ordering indexes are stored as SQLite metadata. An idle scan has an explicit null checkpoint, so deletion cannot masquerade as inactivity. Authenticated counts of pending transactions, program memberships, scanned signatures and ordering edges are updated atomically with spool changes and checked before admission, application, completion and readiness. Missing rows stop progress instead of silently skipping history. A missing snapshot can never be replaced by the poller's empty in-memory store.
+
+Restrict the whole directory and its WAL files. Counts detect missing rows; they are not cryptographic authentication of every public metadata value or proof of provider completeness. The instance pin detects replacement databases, not an authentic older copy of the same database. Wrong scope/key and marked backup-restoration epochs are refused; manual rollback still requires independent history reconciliation. This does not hide on-chain transaction metadata or provide an independently verifiable history archive.
 
 A fenced 90-second ownership lease permits one active worker. The entry point renews it every 15 seconds. Another worker is refused while it is valid; an expired worker cannot commit after takeover. Graceful shutdown releases it. After a crash, wait for lease expiry rather than deleting the database. Correct host time and local durable storage are prerequisites. Independent database copies do not coordinate ownership and are not a high-availability deployment.
 
@@ -41,7 +55,7 @@ The default envelope is 1,000,000 pending transactions, up to three times that m
 
 ## Readiness and shutdown
 
-`/health` preserves diagnostic liveness/polling status. `/ready` returns 200 only when this worker still owns state, its last scan completed without a polling error, and both successful ingestion and observed head advancement are less than 30 seconds old. Catch-up, stale/frozen head, lost ownership and drain return 503. No fresh head does not prove an RPC is dishonest, but it is insufficient readiness evidence. These checks do not independently verify provider history completeness or current root-ring membership.
+`/health` preserves diagnostic liveness/polling status. `/ready` returns 200 only when this worker still owns the pinned state with required checkpoint records and consistent spool counts, its last scan completed without a polling error, and both successful ingestion and observed head advancement are less than 30 seconds old. Missing state, catch-up, stale/frozen head, lost ownership and drain return 503. No fresh head does not prove an RPC is dishonest, but it is insufficient readiness evidence. These checks do not independently verify provider history completeness or current root-ring membership.
 
 SIGTERM/SIGINT stops new webhooks and polling admission. An already admitted page or transaction finishes and checkpoints; the service waits up to 30 seconds before forced termination. The durable checkpoint remains authoritative after either exit. The process does not save an unrelated final JSON snapshot while an asynchronous poll is still running.
 

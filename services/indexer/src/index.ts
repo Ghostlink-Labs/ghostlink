@@ -8,8 +8,8 @@ import { Poller } from "./poller.js";
 import { IndexerDatabase } from "./database.js";
 
 async function main() {
-  const genesisHash = process.env.INDEXER_GENESIS_HASH, path = process.env.INDEXER_STATE_PATH, keyPath = process.env.INDEXER_STATE_KEY_PATH;
-  if (!genesisHash || !path || !keyPath || (!process.env.RPC_URL && !process.env.RPC_ENDPOINTS_PATH)) throw new Error("approved indexer chain, RPC and state are required");
+  const genesisHash = process.env.INDEXER_GENESIS_HASH, path = process.env.INDEXER_STATE_PATH, keyPath = process.env.INDEXER_STATE_KEY_PATH, stateId = process.env.INDEXER_STATE_ID;
+  if (!genesisHash || !path || !keyPath || !stateId || (!process.env.RPC_URL && !process.env.RPC_ENDPOINTS_PATH)) throw new Error("approved indexer chain, RPC and pinned state are required");
   if (process.env.PERSIST_PATH) throw new Error("legacy indexer JSON requires an independently checked migration");
   if (process.env.INGEST_COMMITMENT && process.env.INGEST_COMMITMENT !== "finalized") throw new Error("hosted indexer requires finalized history");
   const port = Number(process.env.PORT ?? 8787), interval = Number(process.env.POLL_MS ?? 5000);
@@ -19,7 +19,7 @@ async function main() {
   try {
     await rpc.connection.getGenesisHash();
     const key = readFileSync(keyPath);
-    try { database = new IndexerDatabase(path, key, JSON.stringify({ genesisHash, programs: [REGISTRY, CENSUS, POCKET].map(p => p.toBase58()), commitment: "finalized" })); }
+    try { database = IndexerDatabase.openExisting(path, key, JSON.stringify({ genesisHash, programs: [REGISTRY, CENSUS, POCKET].map(p => p.toBase58()), commitment: "finalized" }), stateId); }
     finally { key.fill(0); }
     const store = new IndexerStore(undefined, snapshot => database!.save(snapshot));
     const poller = new Poller(rpc.connection, store, undefined, undefined, "finalized", { database,

@@ -14,6 +14,7 @@ import bs58 from "bs58";
 import { POCKET, REGISTRY, CENSUS, POCKET_ACCOUNT_SIZE, pocketPda } from "@ghostlink/service-kit";
 import { RelayerJournal } from "@ghostlink/relayer/journal";
 import { WatcherState } from "@ghostlink/watcher";
+import { IndexerDatabase } from "../../indexer/dist/database.js";
 
 const marker = "SYNTHETIC_SERVICE_RPC_SECRET";
 const genesis = Keypair.generate().publicKey.toBase58();
@@ -37,7 +38,10 @@ const initializedWatcher = new WatcherState(join(directory, "watcher.sqlite"), j
   receiver: createHash("sha256").update("").digest("hex"), threshold: "100000000",
 });
 const watcherStateId = initializedWatcher.instanceId;
-initializedWatcher.close(); journalKey.fill(0);
+initializedWatcher.close();
+const initializedIndexer = new IndexerDatabase(join(directory, "indexer.db"), journalKey,
+  JSON.stringify({ genesisHash: genesis, programs: [REGISTRY, CENSUS, POCKET].map(p => p.toBase58()), commitment: "finalized" }));
+const indexerStateId = initializedIndexer.instanceId; initializedIndexer.close(); journalKey.fill(0);
 const payerPath = join(directory, "payer.json");
 const configPath = join(directory, "providers.json");
 writeFileSync(payerPath, JSON.stringify([...payer.secretKey]));
@@ -92,7 +96,7 @@ async function start(name, extra = {}) {
   const listenPort = await port();
   let operationsPort = await port(); while (operationsPort === listenPort) operationsPort = await port();
   const env = { ...process.env, PORT: String(listenPort), OPERATIONS_PORT: String(operationsPort), NODE_ENV: "production", POLL_MS: "100",
-    ACTIONS_GENESIS_HASH: genesis, CLUSTER: "localnet", BASE_URL: `http://localhost:${listenPort}`, RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, RELAYER_GENESIS_HASH: genesis,
+    ACTIONS_GENESIS_HASH: genesis, CLUSTER: "localnet", BASE_URL: `http://localhost:${listenPort}`, RPC_URL: "", RPC_ENDPOINTS_PATH: configPath, INDEXER_GENESIS_HASH: genesis, INDEXER_STATE_ID: indexerStateId, RELAYER_GENESIS_HASH: genesis,
     GHOSTLINK_RELAYER_KEYPAIR: payerPath, PERSIST_PATH: "", INDEXER_STATE_PATH: join(directory, "indexer.db"), INDEXER_STATE_KEY_PATH: journalKeyPath, RELAYER_BUDGET_PATH: "", RELAYER_JOURNAL_PATH: join(directory, "relayer.db"), RELAYER_JOURNAL_KEY_PATH: journalKeyPath, RELAYER_JOURNAL_ID: relayerJournalId,
     WATCHER_GENESIS_HASH: genesis, WATCHER_STATE_PATH: join(directory, "watcher.sqlite"), WATCHER_STATE_KEY_PATH: journalKeyPath, WATCHER_STATE_ID: watcherStateId, LARGE_FILL_USD_E6: "100000000", WATCHER_PORT: String(listenPort), WATCHER_POLL_MS: "100", NOTIFY_WEBHOOK: "", GHOSTLINK_WATCHER_KEYPAIR: "", ...extra };
   const child = spawn(process.execPath, [fileURLToPath(new URL(`../../${name}/dist/index.js`, import.meta.url))], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });

@@ -206,7 +206,9 @@ async function main() {
   }
   const serviceConnection = serviceRpcFixture?.connection ?? connection;
   const store = new IndexerStore();
-  const poller = new Poller(serviceConnection, store);
+  const finalizedIndexer = process.env.INDEXER_FINALIZED_DRILL === "1";
+  const poller = new Poller(serviceConnection, store, undefined, undefined, finalizedIndexer ? "finalized" : "confirmed",
+    finalizedIndexer ? { maximumPages: 1, maximumTransactions: 1 } : {});
   const indexerUrl = await listen(buildIndexer(store, { poller: poller.status }), 8787);
   relayerFixture = await startRelayerFixture(serviceConnection, payer, keepRunning ? demoPortBase + 1 : 0);
   const relayerUrl = relayerFixture.url;
@@ -303,7 +305,19 @@ async function main() {
     await new Promise(resolve => setTimeout(resolve, 600)); // Let both bounded provider cooldowns expire.
     ok("indexer refused provider outage without advancing its saved cursors");
   }
-  await poller.tick();
+  if (finalizedIndexer) {
+    const target = await connection.getSlot("confirmed"), deadline = Date.now() + 60_000;
+    while (await connection.getSlot("finalized") < target) {
+      if (Date.now() > deadline) throw new Error("indexer fixture did not finalize");
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    for (let ticks = 0; ticks < 100; ticks++) {
+      await poller.tick();
+      if (!poller.status.catchingUp) break;
+      if (ticks === 99) throw new Error("bounded indexer backfill did not finish");
+    }
+    ok("finalized indexer caught up with one page/transaction per tick and preserved chronological roots");
+  } else await poller.tick();
   ok(`indexer ingested ${store.registryLeaves.length} registry + ${store.censusLeaves.length} census leaves`);
 
   // ---- prove login (SDK + indexer witness) ---------------------------------

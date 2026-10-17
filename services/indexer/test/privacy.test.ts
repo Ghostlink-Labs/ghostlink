@@ -8,7 +8,7 @@ import { IndexerStore } from "../src/store.js";
 
 it("keeps provider diagnostics out of public polling status and retains the cursor on failure", async () => {
   const marker = "SYNTHETIC_INDEXER_PROVIDER_SECRET";
-  const connection = { getSignaturesForAddress: vi.fn().mockRejectedValue(new Error(`RPC ${marker}`)) };
+  const connection = { getSlot: vi.fn(async () => 1), getSignaturesForAddress: vi.fn().mockRejectedValue(new Error(`RPC ${marker}`)) };
   const store = new IndexerStore();
   store.setCursor(REGISTRY.toBase58(), "existing-cursor");
   const poller = new Poller(connection as unknown as Connection, store, [REGISTRY]);
@@ -22,7 +22,7 @@ it("keeps provider diagnostics out of public polling status and retains the curs
     expect(JSON.stringify(health)).not.toContain(marker);
     expect(JSON.stringify(poller.status)).not.toContain(marker);
     expect(store.cursors.get(REGISTRY.toBase58())).toBe("existing-cursor");
-    connection.getSignaturesForAddress.mockResolvedValue([]);
+    connection.getSignaturesForAddress.mockResolvedValue([{ signature: "existing-cursor", slot: 1, err: null }]);
     await poller.tick();
     expect((await (await fetch(`http://127.0.0.1:${address.port}/health`)).json()).ok).toBe(true);
     expect(poller.status.lastError).toBeNull();

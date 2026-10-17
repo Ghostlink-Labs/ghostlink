@@ -1,171 +1,122 @@
-/**
- * RPC polling ingestion for localnet/devnet without webhooks.
- *
- * Each tick gathers every signature newer than the per-program cursor
- * (paginating backwards with `before`, so a fresh deploy can backfill a
- * history of any length), orders them chronologically across all three
- * programs, and applies their logs one transaction at a time. A cursor
- * only advances past a transaction once it has been applied, so an RPC
- * hiccup (429, not-yet-available) stops the tick and the same signature
- * is retried next time — nothing is ever skipped. Cursors live in the
- * store's snapshot, so a restart resumes instead of replaying history.
- */
-import type { ConfirmedSignatureInfo, Connection, PublicKey } from "@solana/web3.js";
-import { CENSUS, POCKET, REGISTRY, decodeLogs } from "@ghostlink/service-kit";
+/** Bounded durable pagination followed by chronological transaction application. */
+import { randomBytes } from "node:crypto";
+import type { Connection, PublicKey } from "@solana/web3.js";
+import { CENSUS, POCKET, REGISTRY, decodeLogs, decodeEventData } from "@ghostlink/service-kit";
+import { IndexerDatabase } from "./database.js";
 import type { IndexerStore } from "./store.js";
 
 export interface PollerStatus {
-  lastTickAt: string | null;
-  lastSuccessAt: string | null;
-  lastError: string | null;
-  appliedTotal: number;
-  inFlight: boolean;
+  lastTickAt: string | null; lastSuccessAt: string | null; lastError: string | null;
+  lastHeadAdvancedAt: string | null;
+  appliedTotal: number; inFlight: boolean; catchingUp: boolean; pendingTransactions: number; appliedThroughSlot: number;
 }
-
-interface Pending {
-  info: ConfirmedSignatureInfo;
-  programs: string[];
-  /** Immediate newer transactions in each RPC listing, within the same slot. */
-  newer: Set<string>;
-}
-
+export interface PollerOptions { database?: IndexerDatabase; maximumPages?: number; maximumTransactions?: number; maximumTickMs?: number; paceMs?: number }
 export class Poller {
-  readonly status: PollerStatus = {
-    lastTickAt: null,
-    lastSuccessAt: null,
-    lastError: null,
-    appliedTotal: 0,
-    inFlight: false,
-  };
-
-  constructor(
-    private readonly connection: Connection,
-    private readonly store: IndexerStore,
-    private readonly programs: PublicKey[] = [REGISTRY, CENSUS, POCKET],
-    private readonly pageSize = 1000,
-    /** `finalized` rules out ever ingesting a leaf from a skipped slot. */
-    private readonly commitment: "confirmed" | "finalized" = "confirmed",
-  ) {}
-
+  private head = -1;
+  readonly status: PollerStatus = { lastHeadAdvancedAt: null, lastTickAt: null, lastSuccessAt: null, lastError: null, appliedTotal: 0, inFlight: false,
+    catchingUp: true, pendingTransactions: 0, appliedThroughSlot: 0 };
+  readonly database: IndexerDatabase;
+  private draining = false;
+  private readonly maximumPages: number;
+  private readonly maximumTransactions: number;
+  private readonly maximumTickMs: number;
+  private readonly paceMs: number;
+  constructor(private readonly connection: Connection, private readonly store: IndexerStore,
+    private readonly programs: PublicKey[] = [REGISTRY, CENSUS, POCKET], private readonly pageSize = 1000,
+    private readonly commitment: "confirmed" | "finalized" = "confirmed", options: PollerOptions = {}) {
+    this.maximumPages = options.maximumPages ?? 4; this.maximumTransactions = options.maximumTransactions ?? 32;
+    this.maximumTickMs = options.maximumTickMs ?? 10_000; this.paceMs = options.paceMs ?? 120;
+    for (const n of [pageSize, this.maximumPages, this.maximumTransactions, this.maximumTickMs]) if (!Number.isSafeInteger(n) || n < 1) throw new Error("invalid indexer work limits");
+    if (this.maximumPages > 100 || this.maximumTransactions > 1000 || this.maximumTickMs > 30_000 || this.paceMs > 1000 || pageSize > 1000 || !programs.length || new Set(programs.map(p => p.toBase58())).size !== programs.length || !Number.isSafeInteger(this.paceMs) || this.paceMs < 0) throw new Error("invalid indexer scan configuration");
+    // In-process fixtures remain ephemeral; the hosted entry always supplies scoped persistent storage.
+    this.database = options.database ?? new IndexerDatabase(":memory:", randomBytes(32), JSON.stringify(["ephemeral", programs.map(p => p.toBase58()), commitment]));
+    const saved = this.database.snapshot(); if (saved) store.restore(saved); else this.database.save(store.snapshot());
+  }
+  drain(): void { this.draining = true; }
+  get idle(): boolean { return !this.status.inFlight; }
   async tick(): Promise<number> {
-    if (this.status.inFlight) return 0;
-    this.status.inFlight = true;
-    this.status.lastTickAt = new Date().toISOString();
+    if (this.status.inFlight || this.draining) return 0;
+    this.status.inFlight = true; this.status.lastTickAt = new Date().toISOString();
+    const deadline = Date.now() + this.maximumTickMs;
+    const available = () => !this.draining && Date.now() < deadline;
+    let applied = 0;
     try {
-      const batch = await this.gather();
-      let applied = 0;
-      for (const { info, programs } of batch) {
-        if (!info.err) {
-          const tx = await politely(() =>
-            this.connection.getTransaction(info.signature, {
-              maxSupportedTransactionVersion: 0,
-              commitment: this.commitment,
-            }),
-          );
-          if (!tx) throw new Error(`transaction ${info.signature} not available from RPC yet`);
-          if (!tx.meta) throw new Error(`transaction ${info.signature} metadata not available from RPC yet`);
-          if (!tx.meta.err) {
-            applied += this.store.applyTransaction(info.signature, decodeLogs(tx.meta.logMessages ?? []));
-          }
-        }
-        // Only now is this signature behind us.
-        for (const program of programs) this.store.setCursor(program, info.signature);
+      this.database.renew();
+      if (!this.database.scan()) {
+        const head = await this.connection.getSlot(this.commitment);
+        if (!available()) return 0;
+        if (head > this.head) { this.head = head; this.status.lastHeadAdvancedAt = new Date().toISOString(); }
+        this.database.begin(head, this.programs.map(p => p.toBase58()), this.store.cursors);
       }
-      this.status.appliedTotal += applied;
-      this.status.lastSuccessAt = new Date().toISOString();
+      let pages = 0;
+      while (pages < this.maximumPages && available()) {
+        const scan = this.database.scan()!;
+        if (scan.nextProgram === scan.programs.length) break;
+        const program = this.programs[scan.nextProgram]!;
+        const position = scan.positions[program.toBase58()]!;
+        await this.pace(); if (!available()) break;
+        // Deliberately include the saved cursor in the result so continuity can be checked.
+        const page = await this.connection.getSignaturesForAddress(program,
+          { limit: this.pageSize, before: position.before, minContextSlot: scan.upperSlot }, this.commitment);
+        this.database.page(program.toBase58(), position.before, page, this.pageSize); pages++;
+      }
+      let processed = 0;
+      while (processed < this.maximumTransactions && available()) {
+        const group = this.database.oldest(); if (!group.length) break;
+        for (const info of group) {
+          if (processed >= this.maximumTransactions || !available()) break;
+          let events: ReturnType<typeof decodeLogs> = [];
+          if (!info.failed) {
+            await this.pace(); if (!available()) break;
+            const tx = await this.connection.getTransaction(info.signature, { maxSupportedTransactionVersion: 0, commitment: this.commitment });
+            if (!tx?.meta) throw new Error("transaction metadata unavailable");
+            if (tx.slot !== info.slot || tx.transaction.signatures[0] !== info.signature) throw new Error("transaction identity or slot mismatch");
+            if (tx.meta.err === undefined) throw new Error("transaction execution status unavailable");
+            if (tx.meta.err !== null) throw new Error("transaction execution status contradicts the signature page");
+            if (tx.meta.err === null) {
+              if (!Array.isArray(tx.meta.logMessages) || tx.meta.logMessages.some(line => typeof line !== "string" || /log truncated/i.test(line))) throw new Error("transaction logs unavailable or truncated");
+              if (tx.meta.logMessages.length > 2048 || tx.meta.logMessages.reduce((n, line) => n + Buffer.byteLength(line), 0) > 64 * 1024) throw new Error("transaction logs exceed the ingestion work envelope");
+              completeLogs(tx.meta.logMessages);
+              events = decodeLogs(tx.meta.logMessages);
+              if (events.length > 256) throw new Error("transaction events exceed the ingestion work envelope");
+            }
+          }
+          // Checkpoint and dequeue are one FULL SQLite transaction; a crash cannot leave one ahead of the other.
+          applied += this.store.checkpointTransaction(info.signature, events, info.programs, snapshot => this.database.complete(info.signature, snapshot));
+          processed++;
+        }
+      }
+      const complete = this.database.finish();
+      this.status.pendingTransactions = this.database.pending(); this.status.catchingUp = !complete;
+      this.status.appliedThroughSlot = this.database.through();
+      if (complete) this.status.lastSuccessAt = new Date().toISOString();
       this.status.lastError = null;
       return applied;
-    } catch (e) {
-      this.status.lastError = "ingestion failed; retrying from the saved cursor";
-      throw e;
-    } finally {
-      this.status.inFlight = false;
-    }
+    } catch (error) { this.status.lastError = "ingestion failed; preserving the durable checkpoint"; this.status.catchingUp = true; throw error; }
+    finally { this.status.appliedTotal += applied; this.status.inFlight = false; }
   }
-
-  /** Every unprocessed signature across all programs, oldest first. */
-  private async gather(): Promise<Pending[]> {
-    const pending = new Map<string, Pending>();
-    for (const program of this.programs) {
-      const key = program.toBase58();
-      const until = this.store.cursors.get(key);
-      let before: string | undefined;
-      let newer: ConfirmedSignatureInfo | undefined;
-      for (;;) {
-        const page = await politely(() =>
-          this.connection.getSignaturesForAddress(
-            program,
-            { limit: this.pageSize, before, until },
-            this.commitment,
-          ),
-        );
-        for (const info of page) {
-          const existing = pending.get(info.signature);
-          if (existing) existing.programs.push(key);
-          else pending.set(info.signature, { info, programs: [key], newer: new Set() });
-          if (newer?.slot === info.slot) pending.get(info.signature)!.newer.add(newer.signature);
-          newer = info;
-        }
-        if (page.length < this.pageSize) break;
-        before = page[page.length - 1]!.signature;
-      }
-    }
-    // A global scan index is not a transaction index: a shared transaction
-    // may appear in several program lists. Merge their ordering constraints.
-    const bySlot = new Map<number, Pending[]>();
-    for (const item of pending.values()) {
-      const items = bySlot.get(item.info.slot) ?? [];
-      items.push(item);
-      bySlot.set(item.info.slot, items);
-    }
-    const sorted: Pending[] = [];
-    for (const [, items] of [...bySlot].sort(([a], [b]) => a - b)) {
-      const incoming = new Map(items.map((item) => [item.info.signature, 0]));
-      for (const item of items) for (const next of item.newer) incoming.set(next, incoming.get(next)! + 1);
-      const ready = items.filter((item) => incoming.get(item.info.signature) === 0);
-      let count = 0;
-      while (ready.length) {
-        const item = ready.pop()!;
-        sorted.push(item);
-        count += 1;
-        for (const next of item.newer) {
-          const left = incoming.get(next)! - 1;
-          incoming.set(next, left);
-          if (left === 0) ready.push(pending.get(next)!);
-        }
-      }
-      if (count !== items.length) throw new Error("RPC returned inconsistent transaction order; retrying without advancing cursors");
-    }
-    return sorted;
-  }
-
+  private async pace(): Promise<void> { if (this.paceMs) await new Promise(resolve => setTimeout(resolve, this.paceMs)); }
   start(intervalMs = 15_000): NodeJS.Timeout {
-    return setInterval(() => {
-      this.tick().catch(() => console.error("indexer poll failed; retrying from the saved cursor"));
-    }, intervalMs);
+    if (!Number.isSafeInteger(intervalMs) || intervalMs < 50 || intervalMs > 30_000) throw new Error("invalid polling interval");
+    return setInterval(() => { void this.tick().catch(() => console.error("indexer poll failed; retaining durable progress")); }, intervalMs);
   }
 }
 
-const PACE_MS = 120;
-const RATE_LIMIT_ATTEMPTS = 6;
-
-/**
- * Public RPC manners: a short pause before every call, and on a 429 an
- * exponential backoff (up to ~1 minute in total) before the SAME call is
- * retried. Anything else, or a limit that will not lift, propagates and
- * the tick stops where it is — the cursor never moves past it.
- */
-async function politely<T>(call: () => Promise<T>): Promise<T> {
-  let delay = 1_000;
-  for (let attempt = 1; ; attempt++) {
-    await new Promise((r) => setTimeout(r, PACE_MS));
-    try {
-      return await call();
-    } catch (e) {
-      const text = e instanceof Error ? e.message : String(e);
-      if (!/429|Too Many Requests/i.test(text) || attempt >= RATE_LIMIT_ATTEMPTS) throw e;
-      await new Promise((r) => setTimeout(r, delay));
-      delay = Math.min(delay * 2, 20_000);
+/** Truncated/inconsistent invocation framing must never be treated as an empty successful event list. */
+function completeLogs(logs: string[]): void {
+  const stack: string[] = [];
+  for (const line of logs) {
+    const invoke = /^Program ([1-9A-HJ-NP-Za-km-z]+) invoke \[(\d+)\]$/.exec(line);
+    if (invoke) {
+      if (Number(invoke[2]) !== stack.length + 1) throw new Error("transaction logs have inconsistent invocation depth");
+      stack.push(invoke[1]!); continue;
     }
+    if (stack.length === 1 && [REGISTRY, CENSUS, POCKET].some(program => program.toBase58() === stack[0]) && line.startsWith("Program data: ")) {
+      const encoded = line.slice("Program data: ".length), payload = Buffer.from(encoded, "base64");
+      if (payload.toString("base64") !== encoded || !decodeEventData(payload)) throw new Error("transaction logs contain an unknown or malformed protocol event");
+    }
+    const end = /^Program ([1-9A-HJ-NP-Za-km-z]+) (?:success|failed:.*)$/.exec(line);
+    if (end) { if (stack.pop() !== end[1]) throw new Error("transaction logs have inconsistent invocation boundaries"); }
   }
+  if (stack.length) throw new Error("transaction logs end before invocation completion");
 }

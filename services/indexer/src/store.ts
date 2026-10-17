@@ -47,7 +47,7 @@ export interface ActivityEntry {
   detail: Record<string, string>;
 }
 
-interface Snapshot {
+export interface Snapshot {
   registryLeaves: string[];
   censusLeaves: string[];
   bindings: Record<string, BindingEntry>;
@@ -81,7 +81,37 @@ export class IndexerStore {
 
   private persistTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly persistPath?: string) {}
+  constructor(private readonly persistPath?: string, private readonly saveCheckpoint?: (snapshot: Snapshot) => void) {}
+
+  snapshot(): Snapshot {
+    return { registryLeaves: this.registryLeaves, censusLeaves: this.censusLeaves,
+      bindings: Object.fromEntries(this.bindings), census: Object.fromEntries(this.latestCensus),
+      pockets: Object.fromEntries(this.pockets), activity: this.activity,
+      cursors: Object.fromEntries(this.cursors), processedTransactions: [...this.processedTransactions] };
+  }
+
+  restore(snap: Snapshot): void {
+    this.registry = new IncrementalTree(); this.census = new IncrementalTree();
+    this.registryLeaves = []; this.censusLeaves = []; this.registryRoots = []; this.censusRoots = [];
+    for (const leaf of snap.registryLeaves) { this.registry.append(BigInt(leaf)); this.registryLeaves.push(leaf); this.registryRoots.push(this.registry.root); }
+    for (const leaf of snap.censusLeaves) { this.census.append(BigInt(leaf)); this.censusLeaves.push(leaf); this.censusRoots.push(this.census.root); }
+    this.registryRoots = this.registryRoots.slice(-ROOT_HISTORY_SIZE); this.censusRoots = this.censusRoots.slice(-ROOT_HISTORY_SIZE);
+    this.bindings = new Map(Object.entries(snap.bindings)); this.latestCensus = new Map(Object.entries(snap.census));
+    this.pockets = new Map(Object.entries(snap.pockets ?? {})); this.activity = snap.activity ?? [];
+    this.cursors = new Map(Object.entries(snap.cursors ?? {})); this.processedTransactions = new Set(snap.processedTransactions ?? []);
+  }
+
+  /** One transaction's events and cursor updates commit together; failure restores the last complete state. */
+  checkpointTransaction(signature: string, events: GhostLinkEvent[], programs: string[], commit: (snapshot: Snapshot) => void): number {
+    const before = JSON.stringify(this.snapshot());
+    try {
+      const applied = this.applyTransaction(signature, events);
+      for (const program of programs) this.setCursor(program, signature);
+      commit(this.snapshot());
+      return applied;
+    } catch (error) { this.restore(JSON.parse(before) as Snapshot); throw error; }
+    finally { if (this.persistTimer) clearTimeout(this.persistTimer); this.persistTimer = null; }
+  }
 
   /** Deduplicate whole transactions across polling, webhook retries and restarts. */
   applyTransaction(signature: string, events: GhostLinkEvent[]): number {
@@ -250,7 +280,7 @@ export class IndexerStore {
 
   /** Debounced, atomic snapshot write (temp file + rename). */
   private persist(): void {
-    if (!this.persistPath || this.persistTimer) return;
+    if (this.saveCheckpoint || !this.persistPath || this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
       this.flush();
@@ -259,21 +289,13 @@ export class IndexerStore {
   }
 
   flush(): void {
+    if (this.saveCheckpoint) { this.saveCheckpoint(this.snapshot()); return; }
     if (!this.persistPath) return;
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
-    const snapshot: Snapshot = {
-      registryLeaves: this.registryLeaves,
-      censusLeaves: this.censusLeaves,
-      bindings: Object.fromEntries(this.bindings),
-      census: Object.fromEntries(this.latestCensus),
-      pockets: Object.fromEntries(this.pockets),
-      activity: this.activity,
-      cursors: Object.fromEntries(this.cursors),
-      processedTransactions: [...this.processedTransactions],
-    };
+    const snapshot = this.snapshot();
     mkdirSync(dirname(this.persistPath), { recursive: true });
     const tmp = `${this.persistPath}.tmp`;
     writeFileSync(tmp, JSON.stringify(snapshot));
@@ -289,24 +311,7 @@ export class IndexerStore {
     const store = new IndexerStore(persistPath);
     if (!persistPath || !existsSync(persistPath)) return store;
     const snap = JSON.parse(readFileSync(persistPath, "utf8")) as Snapshot;
-    for (const leaf of snap.registryLeaves) {
-      store.registry.append(BigInt(leaf));
-      store.registryLeaves.push(leaf);
-      store.registryRoots.push(store.registry.root);
-    }
-    for (const leaf of snap.censusLeaves) {
-      store.census.append(BigInt(leaf));
-      store.censusLeaves.push(leaf);
-      store.censusRoots.push(store.census.root);
-    }
-    store.registryRoots = store.registryRoots.slice(-ROOT_HISTORY_SIZE);
-    store.censusRoots = store.censusRoots.slice(-ROOT_HISTORY_SIZE);
-    store.bindings = new Map(Object.entries(snap.bindings));
-    store.latestCensus = new Map(Object.entries(snap.census));
-    store.pockets = new Map(Object.entries(snap.pockets ?? {}));
-    store.activity = snap.activity ?? [];
-    store.cursors = new Map(Object.entries(snap.cursors ?? {}));
-    store.processedTransactions = new Set(snap.processedTransactions ?? []);
+    store.restore(snap);
     return store;
   }
 }

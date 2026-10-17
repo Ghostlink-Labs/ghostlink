@@ -34,12 +34,12 @@ Use the same supported Node versions as the bot's SQLite store. This subpath is 
 | --- | --- | --- |
 | Solver | `SOLVER_GENESIS_HASH` | Approved pool for authorization, planning, signed submission and HTTP confirmation |
 | Relayer | `RELAYER_GENESIS_HASH` | Approved pool for registration/snapshot/session/owner-action preparation, signed sends and HTTP confirmation |
-| Indexer with `RPC_URL` or `RPC_ENDPOINTS_PATH` | `INDEXER_GENESIS_HASH` | Approved pool for polling and on-chain webhook root checks |
+| Hosted indexer | `INDEXER_GENESIS_HASH` | Approved pool for bounded finalized history; scoped state/key paths required; webhooks only trigger polling |
 | Watcher | `WATCHER_GENESIS_HASH` | Approved pool for event polling and timelock crank submission/confirmation; requires scoped `WATCHER_STATE_PATH`; funded execution also requires an encrypted journal and explicit cumulative fee cap |
 
 These services check the pool's approved chain before listening. Missing identity, unavailable providers or all providers returning a different genesis stop startup. Wrong-chain endpoints are quarantined before business RPC. Obtain the approved hash from the reviewed deployment configuration; do not copy a hash from an unverified provider merely to make startup pass. Configuring a hash does not approve the candidate for a public network.
 
-Keep indexer snapshots and relayer journals specific to their network, deployment and payer. An indexer without RPC remains available for offline/test data; it has no chain verification or ingestion guarantee. The indexer's existing `/health` reports polling failures using a fixed, non-sensitive message. It is **not** a freshness/readiness attestation. Indexer/relayer readiness, indexer draining, aggregate service budgets and alerts still need their own production acceptance.
+Keep indexer state and relayer journals specific to their approved deployments. The hosted indexer uses an atomic SQLite checkpoint and bounded scan spool, refuses unreviewed legacy JSON migration, fences worker ownership, drains active ingestion and exposes `/ready` for catch-up/head freshness. Its `/health` remains diagnostic liveness. See [indexer operations and finality/root-ring limitations](INDEXER-OPERATIONS.md). Relayer readiness, aggregate service budgets, installed alerts and hosted-provider/load acceptance remain open.
 
 The shared HTTP router now defaults to opaque unexpected-error responses and logs in every environment. Provider exceptions, request URLs, headers and bodies are not printed by its default logger. `exposeErrors: true` and a custom `onError` callback are explicit local debugging facilities; do not enable raw diagnostics in hosted services. Indexer startup/poll logs never print the configured RPC URL or provider exception text.
 

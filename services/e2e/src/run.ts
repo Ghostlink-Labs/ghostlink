@@ -79,11 +79,13 @@ import { startBotFixture } from "./bot-session.js";
 import { startSolverFixture } from "./solver-session.js";
 import { JupiterForkPlanner, loadJupiterFixture, syncNative } from "./jupiter-fixture.js";
 import { exerciseJupiterPocket } from "./jupiter-pocket.js";
+import { startRpcFaultFixture } from "./rpc-fault.js";
 
 const RPC = process.env.RPC_URL ?? "http://127.0.0.1:8899";
 const ROOT = process.env.REPO_ROOT ?? join(process.cwd(), "..", "..");
 let botFixture: Awaited<ReturnType<typeof startBotFixture>> | undefined;
 let solverFixture: Awaited<ReturnType<typeof startSolverFixture>> | undefined;
+let serviceRpcFixture: Awaited<ReturnType<typeof startRpcFaultFixture>> | undefined;
 
 const ok = (step: string) => console.log(`✓ ${step}`);
 
@@ -195,11 +197,16 @@ async function main() {
   ok("mints and balances");
 
   // ---- services (in-process, real HTTP) -----------------------------------
+  if (process.env.SERVICE_RPC_DRILL === "1") {
+    serviceRpcFixture = await startRpcFaultFixture(connection);
+    serviceRpcFixture.arm();
+  }
+  const serviceConnection = serviceRpcFixture?.connection ?? connection;
   const store = new IndexerStore();
-  const poller = new Poller(connection, store);
-  const indexerUrl = await listen(buildIndexer(store), 8787);
+  const poller = new Poller(serviceConnection, store);
+  const indexerUrl = await listen(buildIndexer(store, { poller: poller.status }), 8787);
   const relayerUrl = await listen(
-    buildRelayer({ connection, payer, minWalletLamports: 1n }), 8788,
+    buildRelayer({ connection: serviceConnection, payer, minWalletLamports: 1n }), 8788,
   );
   // Synthetic Pyth accounts loaded by this disposable validator's genesis.
   const priceAccounts: Record<string, string> = {
@@ -268,6 +275,10 @@ async function main() {
     }),
   });
   if (!regRes.ok) throw new Error(`register: ${await regRes.text()}`);
+  if (serviceRpcFixture) {
+    serviceRpcFixture.assertRecovered();
+    ok("relayer lost acceptance reply; fallback preserved exact signed bytes and confirmed over HTTP");
+  }
   ok("registered through the relayer");
 
   // ---- census snapshot -----------------------------------------------------
@@ -278,6 +289,18 @@ async function main() {
     body: JSON.stringify({ wallet: wallet.publicKey.toBase58(), holding: holding.toBase58() }),
   });
   if (!snapRes.ok) throw new Error(`snapshot: ${await snapRes.text()}`);
+  if (serviceRpcFixture) {
+    const before = JSON.stringify([...store.cursors]);
+    serviceRpcFixture.outage(true);
+    let refused = false;
+    try { await poller.tick(); } catch { refused = true; }
+    if (!refused || JSON.stringify([...store.cursors]) !== before || !poller.status.lastError) {
+      throw new Error("indexer outage changed cursors or failed to report refusal");
+    }
+    serviceRpcFixture.outage(false);
+    await new Promise(resolve => setTimeout(resolve, 600)); // Let both bounded provider cooldowns expire.
+    ok("indexer refused provider outage without advancing its saved cursors");
+  }
   await poller.tick();
   ok(`indexer ingested ${store.registryLeaves.length} registry + ${store.censusLeaves.length} census leaves`);
 
@@ -562,10 +585,12 @@ async function main() {
 main().then(async () => {
   await botFixture?.close();
   await solverFixture?.close();
+  await serviceRpcFixture?.close();
   process.exit(0);
 }).catch(async (e) => {
   console.error("E2E FAILED:", e);
   await botFixture?.close().catch(() => {});
   await solverFixture?.close().catch(() => {});
+  await serviceRpcFixture?.close().catch(() => {});
   process.exit(1);
 });

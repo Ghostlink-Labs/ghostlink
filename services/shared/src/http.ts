@@ -43,7 +43,7 @@ export interface RouterOptions {
   maxConnections?: number;
   /** `access-control-allow-origin`; default "*" (public read APIs). */
   allowOrigin?: string;
-  /** Include thrown error messages in 500 responses (default: outside production). */
+  /** Explicit local-debug opt-in only; provider errors can contain secrets. Default false in every environment. */
   exposeErrors?: boolean;
   /** Called for every unexpected (non-HttpError) failure. */
   onError?: (error: unknown, req: IncomingMessage) => void;
@@ -66,10 +66,10 @@ export class Router {
       if (!Number.isSafeInteger(n) || n < 1) throw new RangeError("HTTP limits must be positive integers");
     }
     this.allowOrigin = options.allowOrigin ?? "*";
-    this.exposeErrors = options.exposeErrors ?? process.env.NODE_ENV !== "production";
+    this.exposeErrors = options.exposeErrors ?? false;
     this.onError =
       options.onError ??
-      ((e, req) => console.error(`${req.method} ${req.url} failed:`, e instanceof Error ? e.message : e));
+      (() => console.error("HTTP request failed")); // Never log request URLs, headers, bodies or provider error text.
   }
 
   get(path: string, handler: Handler): this {

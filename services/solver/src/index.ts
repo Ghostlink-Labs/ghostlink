@@ -24,7 +24,7 @@
  */
 import { readFileSync, statSync } from "node:fs";
 import { Keypair } from "@solana/web3.js";
-import { createRpcPool } from "@ghostlink/service-kit/rpc";
+import { createRpcPool, loadRpcEndpoints } from "@ghostlink/service-kit/rpc";
 import { buildServer, MockPlanner } from "./server.js";
 import { SubmissionJournal } from "./journal.js";
 import { POCKET_PROGRAM_ID } from "@ghostlink/common";
@@ -44,12 +44,7 @@ if (!journalPath || !journalKeyPath || !genesisHash) throw new Error("SOLVER_JOU
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(readFileSync(keypairPath, "utf8"))),
 );
-function rpcEndpoints() {
-  if (!process.env.RPC_ENDPOINTS_PATH) return [{ url: process.env.RPC_URL ?? "http://127.0.0.1:8899" }];
-  try { return JSON.parse(privateText("RPC_ENDPOINTS_PATH", 16_384)); }
-  catch { throw new Error("RPC_ENDPOINTS_PATH must name a bounded valid JSON configuration file"); }
-}
-const rpc = createRpcPool({ genesisHash, endpoints: rpcEndpoints() });
+const rpc = createRpcPool({ genesisHash, endpoints: loadRpcEndpoints(process.env.RPC_ENDPOINTS_PATH, process.env.RPC_URL) });
 const connection = rpc.connection;
 if (await connection.getGenesisHash() !== genesisHash) throw new Error("RPC genesis differs from approved solver configuration");
 const router = process.env.SOLVER_ROUTER ?? "inventory";

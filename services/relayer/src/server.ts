@@ -106,23 +106,29 @@ export function buildServer(deps: RelayerDeps): Server {
       // Serialize and obtain the full fee (including signature precompiles)
       // before reserving. Nothing asynchronous sits between charge and send.
       const bytes = tx.serialize();
+      const signature = bs58.encode(tx.signature!);
       const fee = (await connection.getFeeForMessage(tx.compileMessage(), "confirmed")).value;
       if (fee === null) throw new HttpError(503, "transaction fee unavailable; try again later");
       charge(rent + BigInt(fee));
-      let signature: string;
       try {
-        signature = await connection.sendRawTransaction(bytes);
-      } catch (e) {
+        const acknowledged = await connection.sendRawTransaction(bytes, { maxRetries: 0 });
+        if (acknowledged !== signature) throw new Error("unexpected transaction acknowledgment");
+      } catch {
         // A timeout does not establish that the RPC failed to broadcast.
         // Keep the charge until it ages out rather than risk overspending.
-        throw new HttpError(502, `transaction rejected: ${firstLine(e)}`);
+        throw new HttpError(502, `transaction ${signature} outcome unknown; check the same transaction before retrying`);
       }
-      const status = await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        "confirmed",
-      );
+      let status;
+      try {
+        status = await connection.confirmTransaction(
+          { signature, blockhash, lastValidBlockHeight },
+          "confirmed",
+        );
+      } catch {
+        throw new HttpError(502, `transaction ${signature} outcome unknown; check the same transaction before retrying`);
+      }
       if (status.value.err) {
-        throw new HttpError(502, `transaction ${signature} failed on-chain: ${JSON.stringify(status.value.err)}`);
+        throw new HttpError(502, `transaction ${signature} failed on-chain`);
       }
       return { signature };
     });
@@ -312,11 +318,6 @@ function u64(value: unknown, field: string): bigint {
   const v = BigInt(value);
   if (v > 0xffffffffffffffffn) throw badRequest(`${field} exceeds u64`);
   return v;
-}
-
-function firstLine(e: unknown): string {
-  const text = e instanceof Error ? e.message : String(e);
-  return text.split("\n")[0] ?? text;
 }
 
 export { bs58 };

@@ -2,6 +2,8 @@
  * Entry point. Environment:
  *   PORT (default 8788)
  *   RPC_URL (default http://127.0.0.1:8899)
+ *   RPC_ENDPOINTS_PATH — private provider configuration, overrides RPC_URL
+ *   RELAYER_GENESIS_HASH — independently approved chain identity (required)
  *   GHOSTLINK_RELAYER_KEYPAIR — path to the fee payer keypair JSON
  *     (never in the repo; see docs/SETUP.md)
  *   RELAYER_DAILY_BUDGET_LAMPORTS — rolling 24 h spend ceiling (default 2 SOL)
@@ -11,7 +13,8 @@
  *   TRUST_PROXY=1 — honour X-Forwarded-For (only behind your own proxy)
  */
 import { readFileSync } from "node:fs";
-import { Connection, Keypair } from "@solana/web3.js";
+import { Keypair } from "@solana/web3.js";
+import { createRpcPool, loadRpcEndpoints } from "@ghostlink/service-kit/rpc";
 import { domainHash, fieldToBytes32 } from "@ghostlink/common";
 import { buildServer } from "./server.js";
 
@@ -23,7 +26,11 @@ if (!keypairPath) {
 const payer = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(readFileSync(keypairPath, "utf8"))),
 );
-const connection = new Connection(process.env.RPC_URL ?? "http://127.0.0.1:8899", "confirmed");
+const genesisHash = process.env.RELAYER_GENESIS_HASH;
+if (!genesisHash) throw new Error("RELAYER_GENESIS_HASH is required before paying for transactions");
+const rpc = createRpcPool({ genesisHash, endpoints: loadRpcEndpoints(process.env.RPC_ENDPOINTS_PATH, process.env.RPC_URL) });
+const connection = rpc.connection;
+await connection.getGenesisHash();
 const port = Number(process.env.PORT ?? 8788);
 if (!Number.isInteger(port) || port <= 0) throw new Error(`PORT must be a positive integer, got ${process.env.PORT}`);
 

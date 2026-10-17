@@ -76,7 +76,7 @@ export class Poller {
       this.status.lastError = null;
       return applied;
     } catch (e) {
-      this.status.lastError = e instanceof Error ? e.message : String(e);
+      this.status.lastError = "ingestion failed; retrying from the saved cursor";
       throw e;
     } finally {
       this.status.inFlight = false;
@@ -141,7 +141,7 @@ export class Poller {
 
   start(intervalMs = 15_000): NodeJS.Timeout {
     return setInterval(() => {
-      this.tick().catch((e) => console.error("poll error:", (e as Error).message?.slice(0, 160) ?? e));
+      this.tick().catch(() => console.error("indexer poll failed; retrying from the saved cursor"));
     }, intervalMs);
   }
 }

@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { Connection, Keypair, SystemProgram } from "@solana/web3.js";
+import { Connection, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
+import bs58 from "bs58";
 import { buildServer, type RelayerDeps } from "../src/server.js";
 
 const payer = Keypair.generate();
@@ -9,7 +10,7 @@ function rpc() {
     getAccountInfo: vi.fn(async () => ({ owner: SystemProgram.programId, data: Buffer.alloc(0), executable: false })),
     getLatestBlockhash: vi.fn(async () => ({ blockhash: SystemProgram.programId.toBase58(), lastValidBlockHeight: 100 })),
     getFeeForMessage: vi.fn(async () => ({ value: 10_000 })),
-    sendRawTransaction: vi.fn(async () => "signature"),
+    sendRawTransaction: vi.fn(async (bytes: Uint8Array) => bs58.encode(Transaction.from(bytes).signature!)),
     confirmTransaction: vi.fn(async () => ({ value: { err: null } })),
   };
 }
@@ -27,6 +28,41 @@ function post(base: string, path: string, body: unknown) {
 const snapshot = () => ({ wallet: Keypair.generate().publicKey.toBase58(), holding: payer.publicKey.toBase58() });
 
 describe("relayer fee and creation boundary", () => {
+  it("never echoes provider broadcast/confirmation diagnostics and keeps uncertain sends charged", async () => {
+    const marker = "SYNTHETIC_RELAYER_PROVIDER_SECRET";
+    const connection = rpc();
+    connection.sendRawTransaction.mockRejectedValueOnce(new Error(`provider ${marker}`));
+    connection.confirmTransaction.mockRejectedValueOnce(new Error(`confirmation ${marker}`))
+      .mockResolvedValueOnce({ value: { err: { InstructionError: [0, marker] } } } as never);
+    await withServer({ connection: connection as unknown as Connection }, async base => {
+      for (let i = 0; i < 3; i++) {
+        const response = await post(base, "snapshot", snapshot());
+        expect(response.status).toBe(502);
+        const body = await response.text();
+        expect(body).not.toContain(marker);
+        const signature = bs58.encode(Transaction.from(connection.sendRawTransaction.mock.calls[i]![0]).signature!);
+        expect(body).toContain(signature);
+      }
+      expect((await (await fetch(`${base}/health`)).json()).spentLamports24h).toBe("30000");
+    });
+  });
+
+  it("does not confirm a provider-substituted transaction signature", async () => {
+    const connection = rpc();
+    const substituted = bs58.encode(new Uint8Array(64).fill(7));
+    connection.sendRawTransaction.mockResolvedValueOnce(substituted);
+    await withServer({ connection: connection as unknown as Connection }, async base => {
+      const response = await post(base, "snapshot", snapshot());
+      expect(response.status).toBe(502);
+      const body = await response.text();
+      const expected = bs58.encode(Transaction.from(connection.sendRawTransaction.mock.calls[0]![0]).signature!);
+      expect(body).toContain(expected);
+      expect(body).not.toContain(substituted);
+      expect(connection.confirmTransaction).not.toHaveBeenCalled();
+      expect((await (await fetch(`${base}/health`)).json()).spentLamports24h).toBe("10000");
+    });
+  });
+
   it("does not let a prefunded system PDA bypass the partner allowlist", async () => {
     const connection = rpc();
     await withServer({ connection: connection as unknown as Connection, allowedDomainHashes: new Set() }, async (base) => {

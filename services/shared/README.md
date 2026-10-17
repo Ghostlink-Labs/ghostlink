@@ -1,6 +1,8 @@
 # GhostLink service kit
 
-The Node-only `@ghostlink/service-kit/rpc` subpath provides operator-approved HTTP failover with genesis checks, bounded requests, context floors and HTTP signature confirmation. The solver entry point uses it; Node bots can inject its connection. See the [RPC operations guide](../../docs/RPC-OPERATIONS.md) for configuration, exact-transaction retry semantics, supported methods and remaining operational gates.
+The Node-only `@ghostlink/service-kit/rpc` subpath provides operator-approved HTTP failover with genesis checks, bounded requests, context floors and HTTP signature confirmation. The solver, relayer and RPC-enabled indexer entry points use it; Node bots can inject its connection. Its `loadRpcEndpoints` helper reads a bounded private operator configuration without exposing file/parser diagnostics. See the [RPC operations guide](../../docs/RPC-OPERATIONS.md) for configuration, exact-transaction retry semantics, supported methods and remaining operational gates.
+
+The shared HTTP router keeps unexpected error responses and default logs opaque in every environment. `exposeErrors` and custom `onError` handlers are explicit debugging facilities; hosted applications must not expose raw provider errors, request values or credentials. Caller-authored `HttpError` messages are public API text and must contain only deliberately public information.
 
 Shared protocol encoders, account readers, token helpers and HTTP primitives for the experimental GhostLink services and Node bot package. Low-level helpers do not establish deployment trust or production readiness. The optional expected program passed to account readers must come from trusted deployment configuration.
 

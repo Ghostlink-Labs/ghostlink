@@ -1,5 +1,6 @@
 /** Node-only, operator-configured HTTP RPC failover. No wallet or key custody. */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { readFileSync, statSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { Connection, type Commitment, type FetchFn, type TransactionConfirmationStrategy } from "@solana/web3.js";
 import bs58 from "bs58";
@@ -9,6 +10,21 @@ type Reason = "transport" | "timeout" | "http" | "malformed" | "genesis" | "stal
 type Request = { jsonrpc: "2.0"; id: string | number; method: string; params?: unknown[] };
 type Reply = { jsonrpc: "2.0"; id: string | number; result?: unknown; error?: { code: number; message: string } };
 export interface RpcEndpoint { url: string; headers?: Readonly<Record<string, string>> }
+
+/** Operator-only file; never include its path, contents or parser diagnostics in errors. */
+export function loadRpcEndpoints(path?: string, fallbackUrl = "http://127.0.0.1:8899"): RpcEndpoint[] {
+  if (!path) return [{ url: fallbackUrl }];
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile() || stat.size > 16_384) throw new Error();
+    const text = readFileSync(path, "utf8");
+    if (Buffer.byteLength(text) > 16_384) throw new Error();
+    const value: unknown = JSON.parse(text);
+    if (!Array.isArray(value) || value.length < 1 || value.length > 4 ||
+      value.some(endpoint => !object(endpoint) || typeof endpoint.url !== "string")) throw new Error();
+    return value as RpcEndpoint[]; // createRpcPool validates URLs and headers before any request.
+  } catch { throw new Error("RPC_ENDPOINTS_PATH must name a bounded valid endpoint configuration file"); }
+}
 export interface RpcPoolOptions {
   endpoints: readonly RpcEndpoint[];
   genesisHash: string;

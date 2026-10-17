@@ -1,5 +1,5 @@
 /** The HTTP kit's hardening: bounded bodies, preflight, status mapping. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { once } from "node:events";
 import { request } from "node:http";
 import { HttpError, RateLimiter, Router, Semaphore, badRequest } from "../src/index.js";
@@ -18,6 +18,23 @@ async function withRouter<T>(router: Router, fn: (base: string) => Promise<T>): 
 }
 
 describe("router", () => {
+  it.each(["development", "production"])("keeps unexpected errors and request values private by default in %s", async (mode) => {
+    vi.stubEnv("NODE_ENV", mode);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const marker = "SYNTHETIC_PROVIDER_AND_REQUEST_SECRET";
+    try {
+      const guarded = new Router();
+      guarded.get("/rpc/:value", async () => { throw new Error(`provider https://example.invalid/${marker}?api-key=${marker}`); });
+      await withRouter(guarded, async (base) => {
+        const response = await fetch(`${base}/rpc/${marker}?token=${marker}`, { headers: { authorization: marker } });
+        expect(response.status).toBe(500);
+        expect(await response.json()).toEqual({ error: "internal error" });
+        expect(log).toHaveBeenCalled();
+        expect(JSON.stringify(log.mock.calls)).not.toContain(marker);
+      });
+    } finally { log.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
   it("bounds bodies before parsing and retains capacity until disconnected work actually finishes", async () => {
     let release!: () => void, entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });

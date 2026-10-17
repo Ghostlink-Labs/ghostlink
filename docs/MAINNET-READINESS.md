@@ -35,7 +35,7 @@ Support is an explicit contract per network, operation, token program, wallet, e
 | Mobile wallets / hardware wallets / passkeys | Wallet Standard/message-signing primitives; no exhaustive device certification | Real device tests, deterministic signature compatibility, rejected/changed account flows, lost-factor recovery |
 | Python / Rust / Go bot backends | Wire schema and some Rust encodings; no supported full client libraries | Published canonical vectors, language SDKs or a narrowly scoped local signing service; never upload owner identity for convenience |
 | EVM / other chains / bridges | Solana-specific protocol | Separate deployments, proof/domain separation and bridge risk model; not compatible by changing an RPC URL |
-| Offline / stale RPC / reorg / provider outage | Durable settlement states and approved HTTP failover for bot/solver; real local-validator lost-reply drill | Production provider outage/capacity evidence, remaining service transports and alerts; fail closed on stale or conflicting authorization data |
+| Offline / stale RPC / reorg / provider outage | Durable solver settlement states and approved HTTP failover for bot/solver/relayer/indexer; local-validator lost-reply and ingestion-outage drills | Production provider outage/capacity evidence, relayer durable reconciliation, remaining service transports/readiness and alerts; fail closed on stale or conflicting authorization data |
 
 ## Protocol decisions needed before sniper support
 
